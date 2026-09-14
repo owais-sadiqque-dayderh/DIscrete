@@ -36,6 +36,14 @@ retrieval designs of Zep, Hindsight and tada.
 | 3.11 | §4.2 | **The `sqlite-vec` trigger is reframed** from query latency to transactional coupling, with its pre-v1 status noted. | At prototype scale latency is never the problem. Index drift was (27/64 claims embedded). |
 | 3.12 | §4.1 | **BM25 field weights re-baselined** with verbatim text weighted up. The weights are a sweep target, not frozen constants. | Prior weights gave metadata a 12:1 advantage over content, and one metadata field (`app`) was typo-polluted. |
 
+### Rev 2 — 2026-09-14 (user decisions before implementation)
+
+| # | Section | Change | Why |
+|---|---|---|---|
+| 2.1 | §6.1 | **Rerank stays mandatory but is API-served.** The cascade is OpenRouter's `/rerank` endpoint (Cohere Rerank family) → LLM listwise through the utility tier → fused order. The Rev 1 local cross-encoder is removed. | User decision: no locally hosted models. OpenRouter serves Cohere Rerank models through one `/rerank` endpoint. The accepted cost is per-query API cost and network latency. |
+| 2.2 | §2, §13 | The on-device utility tier option (Apple Foundation Models / MLX) is removed. The utility tier is an API model. | Same decision. |
+| 2.3 | §4.1 | Query embeddings use the same embedding API model as Stage 2. | Same decision (`planS2.md` Rev 2). |
+
 ---
 
 ## 1. Purpose and scope
@@ -75,7 +83,7 @@ Raw query
 [4] Assembly: recency prior, claim↔evidence pairing, entity/claim redundancy suppression, MMR
    │
    ▼
-[5] Mandatory local cross-encoder rerank  (+ optional LLM listwise escalation)
+[5] Mandatory rerank (rerank API → LLM listwise → fused order)
    │
    ▼
 [6] Grounding decision (pure function of counts) → edit / grounded / thin / empty / continuation
@@ -118,10 +126,7 @@ A `QueryPlan` has these fields:
      `website`, …) to fill `entity_kind_filter`.
 2. **LLM plan**: one call to the utility model tier, returning the same shape.
    Its output is unioned with the structural plan; any failure falls back to
-   the structural plan alone. `[Rev 1]` The utility tier may be served on-device:
-   Apple's Foundation Models framework, callable from Python on macOS 26+ with
-   guided structured generation, or a small MLX model. The harness decides
-   whether on-device plan quality is sufficient (§13, open item 3).
+   the structural plan alone.
 
 No hardcoded synonym tables (retained): hand-written expansions only cover
 phrasings someone already anticipated.
@@ -161,8 +166,8 @@ nothing for it to act on: in the prototype, 86 % of entities had no page.
 Each kind runs three kinds of ranked list, all fused with **Reciprocal Rank
 Fusion** (`RRF_K = 60`):
 - one **field-weighted BM25** list per plan query string (SQLite FTS5);
-- one **dense** list from the query embedding, using the same local model as
-  Stage 2 §11;
+- one **dense** list from the query embedding, using the same embedding API
+  model as Stage 2 §11;
 - `[Rev 1]` when `interval` is set, candidates outside it are filtered out
   (episodes, observations, event claims), or down-weighted by distance for
   facts and preferences whose `occurred_from..occurred_to` does not intersect
@@ -253,7 +258,7 @@ even though no stored text contains the phrase "design tools".
 - `[Rev 1]` **Cold start:** while the corpus has fewer than `COLD_START_ROWS`
   (default **2000**) observations, the coverage floor is disabled. Hits are
   admitted on dense or BM25 presence, and strength is decided by the
-  cross-encoder score (§6) at ≥ `CE_STRONG` (calibrated by the harness). IDF
+  rerank relevance score (§6) at ≥ `RERANK_STRONG` (calibrated by the harness). IDF
   estimates on a tiny vocabulary are noise, and every user starts at cold
   start.
 
@@ -285,34 +290,37 @@ even though no stored text contains the phrase "design tools".
 
 ## 6. Reranking  `[Rev 1]`
 
-### 6.1 Mandatory local cross-encoder (retained)
+### 6.1 Mandatory rerank stage — API-served  `[Rev 2]`
 
-The pool surviving §5 (up to `CROSS_ENCODER_POOL` = **50** per kind) is scored by
-a small CPU-capable cross-encoder on every call. The score orders hits within
-the included set; the relevance floor still decides inclusion. If the
-cross-encoder fails, ordering falls back to coverage and evidence depth, and no
-hit is removed. The rationale is retained: the best precision per millisecond,
-offline, deterministic, with no per-query cost. The local-weights dependency is
-explicitly accepted.
+The pool surviving §5 (up to `RERANK_POOL` = **50** per kind) is reranked on
+every call. The rerank order decides order within the included set; the
+relevance floor still decides inclusion.
 
-`[Rev 1]` **Candidates**, chosen by the harness on this product's own golden set
-(not by public leaderboards):
-- `bge-reranker-v2-m3`;
-- `mxbai-rerank-base-v2`;
-- `Qwen3-Reranker-0.6B`. It accepts task instructions, which suits "is this
-  evidence about the user's activity" judgments.
+Provider cascade (the first available wins):
+1. **Rerank API:** OpenRouter's `/api/v1/rerank` (Cohere Rerank family;
+   default `cohere/rerank-4-fast`, configurable through `RERANK_LM_*`), or any
+   endpoint with the same request shape.
+2. **LLM listwise** through the utility tier (the §6.2 mechanism), when no
+   rerank API is configured.
+3. **No rerank:** the fused and coverage ordering, when both fail. A failure
+   here degrades order; it never removes a hit or blocks a result.
 
-**Bounded input:** each pair is the query plus the hit's unit text. For a claim
-that is its text plus its best quote. For an episode it is the title, summary
-and a best snippet. For an observation it is the caption plus a best
-`screen_text` window. The unit is truncated to `RERANK_MAX_TOKENS` (default
-**384**). Cross-encoders truncate long inputs silently, and Stage 2 now bounds
-claim length, which this relies on.
+**Bounded input (retained from Rev 1).** Each document sent is the hit's unit
+text, truncated to `RERANK_MAX_TOKENS` (default **384**, approximated as 4
+characters per token):
+- a claim: its text plus its best quote;
+- an episode: its title, summary and best snippet;
+- an observation: its caption plus the best `screen_text` window.
+
+**Accepted tradeoff (Rev 2):** the Rev 1 local cross-encoder is replaced by a
+per-query API cost and network latency (on the order of 100–300 ms), by user
+decision (no locally hosted models). Rerank is skipped for pools of 3 hits or
+fewer, where it cannot change much.
 
 ### 6.2 Optional LLM listwise rerank (retained, off by default)
 
 `LLM_RERANK` (default **false**) lets one utility-tier call reorder and demote
-within the cross-encoder-ordered pool. It can never add hits, and any failure
+within the reranked pool. It can never add hits, and any failure
 leaves the order unchanged.
 
 ---
@@ -459,9 +467,9 @@ metrics:
 - a verified `retrieval_miss` on any non-stale golden case.
 
 The same harness is the selection mechanism for every model or weight choice
-left open in any stage: the local VLM (`planS1.md` §13), the embedder and
-reranker (§6.1), the on-device utility tier (§2), consolidation's model tier,
-and the BM25 field weights (§4.1), swept and compared with `ranx`.
+left open in any stage: the API VLM (`planS1.md` §13), the embedding and
+rerank models (§6.1), the utility tier (§2), consolidation's model tier, and
+the BM25 field weights (§4.1), swept and compared with `ranx`.
 
 ### 10.7 BEIR (retained)
 
@@ -494,7 +502,7 @@ optional sanity check for a candidate embedder or reranker in isolation.
 | `RECENCY_HALF_LIFE_DAYS` | 30 | 5.4 |
 | `MMR_LAMBDA` | 0.7 | 5.4 |
 | `ENTITY_PROP_OVERLAP_THRESHOLD` | 0.6 | 5.4 |
-| `CROSS_ENCODER_POOL` | 50 | 6.1 |
+| `RERANK_POOL` | 50 | 6.1 |
 | `RERANK_MAX_TOKENS` | 384 | 6.1 |
 | `LLM_RERANK` / `LLM_RERANK_POOL` | false / 24 | 6.2 |
 | `EVAL_*` | see 10.8 | 10.8 |
@@ -512,8 +520,8 @@ which are always searched) and the `time_hint` enum (replaced by `interval`).
 3. The SQLite FTS5 + dense + RRF recall stack is retained. A vector-DB service,
    sparse-neural and late-interaction models remain rejected at this scale.
    `[Rev 1]` The `sqlite-vec` trigger is transactional coupling or p95 > 50 ms.
-4. The mandatory local cross-encoder is retained. `[Rev 1]` It is picked from
-   three named candidates by the harness, with bounded input.
+4. `[Rev 2]` Rerank stays mandatory but is API-served (OpenRouter rerank → LLM
+   listwise → fused order), with bounded input. No local model.
 5. `ranx` metrics are retained. `[Rev 1]` Significance gating applies only at
    ≥ 100 cases; golden sets are snapshot-versioned; there are category metrics,
    baselines and health checks.
@@ -527,10 +535,9 @@ which are always searched) and the `time_hint` enum (replaced by `interval`).
 1. **The exact aggregation-cue and entity-kind vocabulary** (§2). This is an
    implementation-time list, validated by the `aggregate` eval category.
 2. **Graph expansion** (§4.1) is enabled only on measured multi-episode gain.
-3. **Whether the on-device utility tier** (Apple Foundation Models / small MLX
-   model) is good enough for query planning and relation classification. This
-   is decided by the harness against a cloud utility model.
-4. **`CE_STRONG` calibration** for cold-start strength decisions (§5).
+3. **Which utility-tier API model** is good enough for query planning and
+   relation classification at the lowest cost. This is decided by the harness.
+4. **`RERANK_STRONG` calibration** for cold-start strength decisions (§5).
 
 ## 14. Out of scope
 
@@ -545,7 +552,7 @@ The core of the prior design is sound and retained:
 - a relevance floor with a dense bypass;
 - a grounding decision that is a pure function of counts;
 - first-class unanswerable cases;
-- a local cross-encoder;
+- a mandatory rerank stage;
 - declining heavyweight retrieval infrastructure at this scale.
 
 Rev 1 corrects what the real data exposed. The retrieval target now includes

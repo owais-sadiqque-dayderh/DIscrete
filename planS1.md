@@ -35,6 +35,15 @@ are in `audit.md`.
 | 1.12 | §12 | Audio is recommended as a Stage 1b component using Apple's on-device `SpeechAnalyzer`, **pending the user's scope decision**. | "What did I do this morning" (Stage 3) is incomplete without meetings. On English speech, `SpeechAnalyzer` benchmarks ahead of Whisper Small in accuracy and ~3× faster, fully on-device. |
 | 1.13 | §13 | A **build-versus-buy gate for the capture tier** is recorded: evaluate screenpipe as the capture substrate before writing custom capture code. | screenpipe already implements AX-first text, OCR fallback, event triggers, frame deduplication, PII redaction, audio, and SQLite FTS5 locally. |
 
+### Rev 2 — 2026-09-14 (user decisions before implementation)
+
+Two scope decisions by the user, applied before any code was written:
+
+| # | Section | Change | Why |
+|---|---|---|---|
+| 2.1 | §6.2, §11, §12, §13 | **No locally hosted models.** The VLM, and every other model call, goes through an OpenAI-compatible API (OpenRouter or similar). The Rev 1 "local VLM by default / cloud by opt-in" policy (`VLM_ALLOW_CLOUD`) is removed. Rev 1 row 1.12's on-device transcription is replaced by an API speech-to-text model, if audio is adopted. | User decision: running local models is not affordable for this product. Apple Vision OCR is **retained**. It is an operating-system API with no model to download or host, and it costs nothing per call. |
+| 2.2 | §1, §6, §8, §9, §11 | **The privacy tier is removed from Stage 1.** This covers the exclusion lists, secret scrubbing, PII detection, the secure-field check, the `sensitive` VLM field, and the related tunables. It supersedes Rev 1 row 1.7. | User decision: privacy is out of focus for now. Retained, because it is correctness rather than privacy: §9, which keeps the system from modelling itself, and §10, which treats screen text as untrusted input (memory-poisoning defence). |
+
 ---
 
 ## 1. Purpose and scope
@@ -42,8 +51,7 @@ are in `audit.md`.
 The Data Collection stage watches the user's screen and activity continuously
 and turns raw moments into structured, enriched **Observation** records — the
 raw material every later stage builds on. It decides *when something worth
-recording happened*, *records it faithfully and completely*, and *refuses to
-record what must never be stored*. It does not segment, form claims, extract
+recording happened* and *records it faithfully and completely*. It does not segment, form claims, extract
 long-term entities, or answer questions — those are later stages (§14).
 
 ### Pipeline, end to end  `[Rev 1]`
@@ -51,9 +59,6 @@ long-term entities, or answer questions — those are later stages (§14).
 ```
 Native OS event triggers (app switch / window focus / title change / click / scroll /
 typing pause / clipboard copy / content-driven heartbeat)
-        │
-        ▼
-   Privacy gate #1: exclusion list (app / site / private window)  → drop, record nothing
         │
         ▼
    Arm + debounce  (wait for the user to settle)
@@ -68,11 +73,8 @@ typing pause / clipboard copy / content-driven heartbeat)
   Ground-truth reads: AX metadata + URL source + AX text walk (OCR fallback, window-cropped)
         │
         ▼
-  Privacy gate #2: secret scrubbing + PII detection on screen_text
-        │
-        ▼
-  Semantic enrichment: VLM call (caption / entities / useful / sensitive), fed the
-  scrubbed text as delimited data
+  Semantic enrichment: VLM call via API (caption / entities / useful), fed
+  screen_text as delimited data
         │
         ▼
   Structured Observation draft (§8) → Stage 2
@@ -231,7 +233,7 @@ moment the user settled on.
      `ax+ocr` means the AX text was sparse and OCR supplemented it.
 
 4. **The result is stored verbatim as `screen_text`**, capped at
-   `SCREEN_TEXT_MAX_CHARS` (default **16 000**), *after* privacy gate #2 (§9).
+   `SCREEN_TEXT_MAX_CHARS` (default **16 000**).
    This is the primary text record of the moment. Nothing downstream may
    replace it with a model's paraphrase.
 
@@ -246,7 +248,7 @@ deterministically: by AX role filtering and by cropping to the window.
 One call to the configured vision-language model receives:
 - the before and after frames (cropped to the focused window, downscaled per §5),
 - the AX metadata and resolved URL, labelled as ground truth,
-- `screen_text`, scrubbed (§9), inside explicit data delimiters,
+- `screen_text`, inside explicit data delimiters,
 - the `interaction` summary (§8).
 
 The model returns strict structured output:
@@ -256,7 +258,6 @@ The model returns strict structured output:
 | `caption` | One or two sentences naming specifically what the user is doing, and with what document, page, repository or person. It states the change between the frames when there is one. No generic filler such as "The user is…". |
 | `entities` | Proper nouns *the user is working with* — the document, project, repository, person, tool. It explicitly excludes names that merely appear on screen in a list, gallery, feed or advertisement. |
 | `useful` | `false` if the screen shows nothing meaningful (lock screen, empty desktop, pure chrome). |
-| `sensitive` | `true` if the screen shows credentials, financial account data, health data, private messages, or an authentication or consent screen. This backs up the deterministic gates in §9. |
 
 The model does **not** return `app`, `url`, `window_title` or any transcription.
 Those are ground-truth reads (§6.1).
@@ -270,15 +271,11 @@ Those are ground-truth reads (§6.1).
   never literal sample values. Models copy literal example values; see
   `insights.md` §7.5.
 
-**Model placement policy** `[Rev 1]`: the enrichment call sends screen pixels
-and text to whatever model serves it. The default is a **local VLM** served
-through MLX (a small Qwen-VL-class or FastVLM-class model). A cloud VLM is
-allowed only with an explicit user opt-in setting (`VLM_ALLOW_CLOUD`, default
-**off**), and it always receives post-scrubbing text only (§9). Rationale:
-continuous screen capture is the most sensitive data stream a personal product
-can hold, and small local VLMs now fit this workload at roughly 1 capture per
-40–60 s. The exact local model is chosen by the Stage 3 evaluation harness
-(§13, open item 3), not by assertion.
+**Model placement policy** `[Rev 2]`: the enrichment call goes to a
+vision-capable model behind an OpenAI-compatible API (OpenRouter or similar),
+configured through `CAPTION_LM_*`. No model is hosted locally. The model is
+chosen by the Stage 3 evaluation harness (§13, open item 3), by caption
+specificity and entity precision per unit cost, not by assertion.
 
 ### 6.3 Ground-truth precedence and the URL source  `[Rev 1]`
 
@@ -297,9 +294,6 @@ can hold, and small local VLMs now fit this workload at roughly 1 capture per
 - `site` = the registrable domain of `url` (e.g. `logosystem.co`), computed
   deterministically (Public Suffix List; library: `tldextract`). If there is no
   URL, `site` is empty.
-- Private or incognito browser windows are detected from the browser scripting
-  interface or the extension where available. They are treated as excluded
-  (§9.1).
 
 *Why this is no longer deferred (the prior design deferred it):* the
 AX-empty-URL case let the model invent URLs and site names, which produced the
@@ -342,8 +336,6 @@ bounded and predictable anyway.
   model, so a model failure must not discard them. Raw error or exception text
   is never stored.
 - `useful: false` → dropped.
-- `sensitive: true` → dropped, and the app/site pair is counted toward a
-  suggested exclusion (§9.1).
 - A capture with `screen_text` under 40 characters **and** a caption under 5
   characters is dropped.
 - Every drop and every degrade is logged with its reason and counted. "How many
@@ -358,7 +350,7 @@ bounded and predictable anyway.
 The Accessibility API is also used, separately, by the product's
 text-completion feature to read the literal contents of the field the user is
 focused on. That feature is out of scope here. The one interaction that
-matters is §9.3: the completion feature's synthetic keystrokes must not be
+matters is §9: the completion feature's synthetic keystrokes must not be
 captured as user activity.
 
 ---
@@ -373,11 +365,11 @@ captured as user activity.
 | `session_id` | Shared session identifier (§3). |
 | `started_at` / `ended_at` | The capture interval: when the pending capture armed and when it fired. This is **event time**. |
 | `app` | Foreground application name. **AX only.** |
-| `bundle_id` | Foreground application bundle identifier (AX / NSRunningApplication). Stable across localization and renames; the key used for exclusion lists. |
+| `bundle_id` | Foreground application bundle identifier (AX / NSRunningApplication). Stable across localization and renames. |
 | `window_title` | AX window title. |
 | `url` | Resolved per §6.3; empty if there is no ground-truth source. |
 | `site` | Registrable domain of `url` (§6.3). |
-| `screen_text` | Verbatim on-screen text of the focused window, after scrubbing (§6.1, §9.2). |
+| `screen_text` | Verbatim on-screen text of the focused window (§6.1). |
 | `text_source` | `ax`, `ocr` or `ax+ocr`. |
 | `caption` | VLM caption (§6.2) or the deterministic `"{app}: {window_title}"`. |
 | `entities` | VLM-reported working entities (§6.2). Empty for light rows. |
@@ -391,48 +383,11 @@ after.
 
 ---
 
-## 9. Privacy tier  `[Rev 1 — new section]`
+## 9. Preventing the system from modeling itself
 
-A system that records the screen continuously will eventually capture
-passwords, keys, banking, health data and private conversations. The design
-goal is that such content is **never written to disk and never sent to any
-model**, not that it is cleaned up later.
-
-### 9.1 Gate #1 — exclusion (before capture)
-
-A capture is suppressed entirely, with no frame, no text and no row, when any
-of these hold:
-- the frontmost `bundle_id` is in `EXCLUDE_BUNDLE_IDS`. The default list
-  includes password managers, Keychain Access and banking apps. The user can
-  edit it.
-- `site` matches `EXCLUDE_SITE_PATTERNS` (user-editable, e.g. banking domains);
-- the browser window is private or incognito;
-- the focused element is a secure text field (AX subrole `AXSecureTextField`).
-
-Each suppression increments a counter (by reason) but records nothing
-identifying.
-
-### 9.2 Gate #2 — scrubbing (before storage and before any model call)
-
-`screen_text` passes through, in order:
-1. **Secret patterns**: API keys, tokens, private keys, connection strings, JWTs
-   and `.env`-style `KEY=value` lines, using a maintained rule set such as
-   `detect-secrets` or the `gitleaks` rules. Matches are replaced with typed
-   placeholders (`[SECRET:aws_key]`).
-2. **PII detection**: a local PII model (GLiNER2-PII class, or Presidio with a
-   GLiNER recognizer) for emails, phone numbers, card numbers, government IDs,
-   addresses and account numbers. Matches are replaced with typed placeholders.
-   The user's own name is allow-listed (it is the subject of the model, not a
-   leak). Their own email address is not allow-listed.
-3. If the placeholders cover more than `SCRUB_MAX_FRACTION` (default **0.3**) of
-   the text, the capture is treated as `sensitive` and dropped.
-
-The frame image itself cannot be scrubbed cheaply. Therefore:
-- (a) frames of captures dropped at gate #2 are never written, and
-- (b) frames sent to a cloud VLM (only when §6.2's opt-in is on) are sent only
-  when gate #2 found nothing to scrub.
-
-### 9.3 Preventing the system from modeling itself
+`[Rev 2]` The Rev 1 privacy tier (exclusion lists, secret scrubbing, PII
+detection) was removed by user decision; see the Revision log. This section
+keeps only the self-modelling rules, which are about correctness, not privacy.
 
 - **Suppression:** while the product's own completion feature is typing
   synthetic keystrokes, all armed triggers are dropped, and this continues for
@@ -485,10 +440,6 @@ text:
 | `HEARTBEAT_TEXT_CHANGE` | 0.5 | Text change that justifies a full capture. |
 | `HEARTBEAT_MIN_GAP_S` | 120 | Floor between heartbeat-forced full captures. |
 | `HEARTBEAT_MAX_GAP_S` | 600 | Ceiling: force a full capture at least this often. |
-| `VLM_ALLOW_CLOUD` | off | Whether screen content may be sent to a cloud VLM. |
-| `EXCLUDE_BUNDLE_IDS` | password managers, Keychain, banking | Apps never captured. |
-| `EXCLUDE_SITE_PATTERNS` | (user list) | Sites never captured. |
-| `SCRUB_MAX_FRACTION` | 0.3 | Scrubbed share above which a capture is dropped as sensitive. |
 | Screenshot max width / JPEG quality | 1600 px / 65 | See §12. |
 | Blank-frame stddev threshold | 2.0 | Warn that Screen Recording permission may be missing. |
 
@@ -510,8 +461,9 @@ text:
    model is never a URL source.**
 6. `[Rev 1]` **Multi-monitor:** capture the display containing the AX-focused
    window.
-7. `[Rev 1]` **Privacy gates run before storage and before any model call;
-   local VLM by default, cloud only by opt-in.**
+7. `[Rev 2]` **All model calls go through OpenAI-compatible APIs (OpenRouter or
+   similar); no locally hosted models.** There is no privacy tier in this stage
+   (user decision; see the Revision log).
 
 ---
 
@@ -519,26 +471,23 @@ text:
 
 1. **Audio (recommended: adopt as Stage 1b; needs the user's scope
    decision).** Meetings and calls are a large share of "what did I do today",
-   and nothing here captures them. Recommended shape: on-device transcription
-   with Apple `SpeechAnalyzer` (macOS 26+; more accurate than Whisper Small on
-   English and ~3× faster, fully local), off by default. It would be
+   and nothing here captures them. `[Rev 2]` Recommended shape: transcription
+   through an API speech-to-text model, off by default. It would be
    auto-enabled only while a meeting app holds the microphone, with transcripts
-   passed through the same §9.2 scrubbing and stored as `source="audio"`
-   observations. If the user declines, the Stage 3 product claim must
-   explicitly exclude meetings.
+   stored as `source="audio"` observations. If the user declines, the Stage 3
+   product claim must explicitly exclude meetings.
 2. **Build versus buy for the capture tier.** screenpipe (open source, local,
    SQLite/FTS5, REST API) already implements the text hierarchy, event
    triggers, frame dedup, PII redaction and audio specified here. Before
    writing custom capture code, a one-day spike should check whether Discrete
    can consume screenpipe's store as its Stage 1 and add only what is missing:
    the VLM caption, the `interaction` summary, the focus-drift abort, and the
-   exclusion and origin rules. Decision criteria: data completeness against
-   §8, how controllable the exclusion rules are, licence, and operational
-   weight.
-3. **Which local VLM.** It is chosen by running two or three candidates (a
-   ~3–4B Qwen-VL-class model and a FastVLM-class model, served through MLX)
-   against a fixed sample of real captures. The comparison scores caption
-   specificity and entity precision, measured by the Stage 3 harness.
+   origin rules. Decision criteria: data completeness against
+   §8, licence, and operational weight.
+3. **Which API VLM.** `[Rev 2]` It is chosen by running two or three
+   vision-capable models, available through OpenRouter, against a fixed sample
+   of real captures. The comparison scores caption specificity and entity
+   precision against cost per capture, measured by the Stage 3 harness.
 4. **Browser coverage of the URL source.** Scripting support must be verified
    for each browser the user actually runs (Arc first). Browsers without it
    fall back to a URL-reporting extension.
@@ -561,9 +510,8 @@ Stage 1 now records each moment with three independent, mostly deterministic
 readings: the OS's own metadata, the exact text the app exposes (or OCR where
 it exposes none), and a model's description of what the user is doing. Only
 the description is generated, and it can no longer overwrite the other two.
-Privacy is enforced before anything is written or transmitted, rather than
-cleaned up afterward. Rev 1's changes each trace to a measured failure in the
+Rev 1's changes each trace to a measured failure in the
 prototype's real data: thin corpus, typo-polluted app names, fused
-cross-app captures, a dedup key that could not match, and stored secrets.
+cross-app captures, and a dedup key that could not match.
 They do not trace to a hypothetical. The two genuinely open items are scope
 decisions (audio; build versus buy), not design gaps.

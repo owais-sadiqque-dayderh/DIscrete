@@ -45,6 +45,14 @@ to 80 of 89 observations. Rev 1 removes every link of that chain.
 | 2.12 | §3.3 | **Session summaries become episode summaries**, plus a daily digest produced in consolidation. | One summary covered 4 of 89 observations. Its app list repeated a model typo, and its text summarized the system's own error message as user activity. |
 | 2.13 | new §12 | **A retention policy is specified.** | The superseded-history table otherwise grows without bound; the prior plan left it out of scope. |
 
+### Rev 2 — 2026-09-14 (user decisions before implementation)
+
+| # | Section | Change | Why |
+|---|---|---|---|
+| 2.1 | §11 | **Embeddings come from an API** (OpenAI-compatible, e.g. OpenRouter `openai/text-embedding-3-small`), not a local model. The coverage invariant is kept by writing an **outbox row in the same transaction** as every live-row change. A worker drains the outbox through the API. This supersedes the Rev 1 row 2.10 mechanism. | User decision: no locally hosted models. A network call must never sit inside a database commit; the outbox keeps the "no live row silently lacks a vector" guarantee without that coupling. |
+| 2.2 | §10.2 | **Local NER (GLiNER) is removed.** Screen-text entity candidates come from a structural pass with no model: capitalized spans, internal-capital or digit tokens, domains, filenames, handles, and repository paths. Salience comes from the recurrence gate (§10.3). | Same decision. The recurrence gate already does the salience filtering the NER score was meant to add. |
+| 2.3 | §10.3 | The "scrubbed placeholders are never entities" rule is removed. | The Stage 1 privacy tier was removed (`planS1.md` Rev 2). |
+
 ---
 
 ## 1. Purpose and scope
@@ -88,7 +96,7 @@ Observation (Stage 1)
 [6] Entity extraction + resolution + mention recording (surface-form verified)
    │
    ▼
-[7] Index write (FTS + local embedding) in the same transaction / outbox
+[7] Index write: FTS in the same transaction; embedding via outbox → API (Rev 2)
    ═══════════════════════════════════════════════════════════════════
 [8] Consolidation (offline, periodic): cluster refine (N→set), fact/preference
     induction from events, entity pages, daily digest, lint + reconciliation
@@ -162,7 +170,8 @@ A new episode starts when any of these hold:
    embedding (caption + first 1000 characters of `screen_text`) and the running
    episode centroid falls below `EPISODE_SHIFT_SIM` (default **0.55**) for two
    consecutive observations, even within the same app (e.g. switching projects
-   in the same editor);
+   in the same editor). If the embedding API is unreachable, this rule is
+   skipped for that observation;
 4. the episode reached `EPISODE_MAX_S` (default **1800 s**): forced boundary.
 
 An episode **closes** at its boundary, or after `EPISODE_IDLE_CLOSE_S` (default
@@ -416,10 +425,11 @@ Candidate names come from three sources:
 1. the Stage 1 VLM's **working entities** per observation, meaning names the
    user is working with, not everything visible;
 2. the drafting call's claim entities (§5.1);
-3. a local zero-shot NER pass (GLiNER) over `screen_text`, with the label set
-   `{person, organization, project, software, website, file, repository,
-   product}` and score ≥ `NER_MIN_SCORE` (default **0.5**). The score is the
-   salience signal the prior design lacked.
+3. `[Rev 2]` a structural candidate pass over `screen_text`, with no model:
+   capitalized multi-word spans, internal-capital or digit-bearing tokens
+   (`OpenRouter`, `Qwen3`), domains, filenames, `@handles`, and repository
+   paths (`owner/repo`). These are candidates only. Salience comes from the
+   recurrence gate (§10.3), not from a model score.
 
 ### 10.3 Salience and recurrence gates
 
@@ -432,7 +442,6 @@ Candidate names come from three sources:
   common-dictionary words (word-frequency Zipf ≥ 5.0 without internal capitals
   or digits), generic category words (`tech`, `saas`, `ai`, `design`), and
   document-chrome names (`Untitled-1`, `Artboard 2`) are never promoted.
-- Scrubbed placeholders (`planS1.md` §9.2) are never entities.
 
 This is what keeps a gallery of logo names the user scrolled past out of the
 model of the user.
@@ -505,11 +514,13 @@ full-text index row and (b) exactly one embedding for the current embedding
 model.
 
 - Full-text rows are maintained by triggers, which are already transactional.
-- Embeddings are computed **in the write path by a local embedding model**
-  (a Qwen3-Embedding-0.6B- or EmbeddingGemma-300M-class model on CPU/MLX,
-  milliseconds per row) and written in the same transaction as the row. If the
-  embedder is unavailable, an `index_outbox(ref_kind, ref_id)` row is written in
-  the same transaction instead, and a worker drains it.
+- `[Rev 2]` Every insert, or text change, of a live row writes an
+  `index_outbox(ref_kind, ref_id)` row **in the same transaction**. A worker
+  drains the outbox in batches through the embedding API (OpenAI-compatible,
+  e.g. OpenRouter `openai/text-embedding-3-small`), retrying with backoff. The
+  invariant is: every live row either has an embedding or has an outbox entry.
+  Whenever the API is reachable, the oldest outbox entry must be younger than
+  `OUTBOX_MAX_AGE_S` (default **600 s**).
 - INVALIDATE and supersede remove the old row from the live dense index and add
   the new one in the same transaction.
 - A startup reconciliation plus the lint pass (§7.5) repair any drift. The
@@ -518,9 +529,10 @@ model.
 - The embedding model's identifier is stored per vector. Changing the model
   schedules a full re-embed; mixed-model vectors are never compared.
 
-Why a local embedder: it makes the transactional write possible (no network in
-the commit path), it removes a per-row API cost, and it keeps screen text from
-leaving the machine for indexing. Where the vectors live (plain BLOB plus a
+`[Rev 2]` Why an outbox rather than embedding inside the transaction: the
+embedder is a remote API, and a network call must never sit inside a database
+commit. The outbox gives the same guarantee (no live row can silently lack an
+embedding) without that coupling. Where the vectors live (plain BLOB plus a
 brute-force scan, or `sqlite-vec`) is a `planS3.md` §4 decision.
 
 ---
@@ -563,7 +575,7 @@ Every purge updates DF and mention accounting in the same transaction.
 | `CONFIDENCE_SCALE` | 3.0 | 8 |
 | `FACT_HALF_LIFE_DAYS` / `PREF_HALF_LIFE_DAYS` | 180 / 90 | 8 |
 | `EVIDENCE_MAX_SUPPORTS` | 12 | 9 |
-| `NER_MIN_SCORE` | 0.5 | 10.2 |
+| `OUTBOX_MAX_AGE_S` | 600 | 11 |
 | `ENTITY_MIN_EPISODES` | 2 | 10.3 |
 | Fuzzy auto-merge / adjudicate band | 96 / 88–96 | 10.4 |
 | Entity embedding candidate threshold | 0.80 | 10.4 |
@@ -594,7 +606,8 @@ usage-ordered refresh), the LLM `decay` field, and `SESSION_SUMMARIES`
    `decay`.
 7. Entities: salience and recurrence gates; the exact → normalized → fuzzy →
    semantic → LLM cascade; kind is not identity; surface-verified mentions.
-8. The index coverage invariant uses a local embedder and an outbox.
+8. The index coverage invariant uses an outbox drained through the embedding
+   API (Rev 2).
 9. Retained unchanged from the prior design: literal-substring quote
    verification with a computed-snippet fallback; non-destructive bi-temporal
    supersession with lineage and version; hybrid lexical + semantic + RRF
