@@ -44,6 +44,25 @@ retrieval designs of Zep, Hindsight and tada.
 | 2.2 | §2, §13 | The on-device utility tier option (Apple Foundation Models / MLX) is removed. The utility tier is an API model. | Same decision. |
 | 2.3 | §4.1 | Query embeddings use the same embedding API model as Stage 2. | Same decision (`planS2.md` Rev 2). |
 
+### Rev 3 — 2026-09-15 (first live run of the v1 build, and a WorkAA replay)
+
+| # | Section | Change | Why (evidence) |
+|---|---|---|---|
+| 3.1 | §2 | **The LLM plan is advisory.** It contributes query strings, entities and a kind filter. Its intent is accepted only from the closed set, and only when the structural plan found no edit, aggregate or interval intent. It can never set `needs_store = false` or supply an interval. | On the first live store the utility model returned free-text intents (`retrieve_reading_history`) with `needs_store: false`. "What was I reading on hacker news" came back **empty**, although observation 7 was literally Hacker News. |
+| 3.2 | §2 | **Relative time phrases are parsed in code** (today, yesterday, this morning/afternoon/evening, last night, this/last week, *N* days/hours ago). A `dateparser` match is accepted only if its matched span contains a temporal cue (a digit, a month or weekday name, or a relative word). | `dateparser.search_dates` turned "what was I reading **on hacker news**" into an interval six days in the past. |
+| 3.3 | §4.4 | **Exhaustive listings include episodes that are not yet drafted**, represented by their observations' captions. If the interval holds no activity, recall falls back to top-k. | "What did I do today" on the first live store: both of the day's episodes were undrafted, so an episode-summary-only listing was empty. |
+| 3.4 | §10.4 | **First real-data regression set:** `discrete replay-workaa` rebuilds a store from the WorkAA prototype's observations. `golden/workaa_replay.yaml` holds 13 hand-written cases against it, and each case file has its own baseline. | v1 shipped 3 cases, all unanswerable, compared against an empty baseline, so nothing was measured. |
+
+### Rev 4 — 2026-09-15 (Bubble brought into DIscrete)
+
+| # | Section | Change | Why (evidence) |
+|---|---|---|---|
+| 4.1 | §14, §16 | **Bubble, the Option+Tab inline assistant, is in scope** as the product layer over this retrieval stack. | User decision. Without a consumer, retrieval quality was only measured offline. |
+| 4.2 | §16.2 | **Single-pass retrieval replaces the research tool loop.** The field text becomes a query; one `retrieve()` runs (plan, hybrid recall, rerank, MMR); `evaluate()` picks the mode; one streamed writer call types the answer. | WorkAA's phase-1 loop re-queried a weaker retrieval 4–8 times, taking 5–15 s before the writer started. DIscrete's retrieval is already hybrid, reranked and grounded. Measured on the live store: 2.8–4.9 s end to end, with the first words about 1 s after retrieval. |
+| 4.3 | §2, §3 | **The query plan and the query embedding run concurrently.** The LLM plan is capped at `PLAN_TIMEOUT_S` (4 s) and falls back to the structural plan. The rerank HTTP connection is kept alive. | These are independent API calls that were awaited in sequence, and each rerank paid a fresh TLS handshake (`insights.md` §7.29). |
+| 4.4 | §16.3 | **Progress goes to a separate overlay pill, never into the field.** The field is untouched until the answer's first word. | The typed spinner and its cleanup backspaces were the source of WorkA's text-eating race. |
+| 4.5 | §16.4 | **`empty` inserts nothing.** The pill says "Nothing on file about that" and the gap check runs in the background. `thin` writes one honest sentence and also runs the gap check. | Typing a refusal into someone's document is worse than typing nothing. |
+
 ---
 
 ## 1. Purpose and scope
@@ -126,7 +145,15 @@ A `QueryPlan` has these fields:
      `website`, …) to fill `entity_kind_filter`.
 2. **LLM plan**: one call to the utility model tier, returning the same shape.
    Its output is unioned with the structural plan; any failure falls back to
-   the structural plan alone.
+   the structural plan alone. `[Rev 3]` The union is asymmetric:
+   - The LLM adds `queries`, `entities` and a `entity_kind_filter` from the kind
+     vocabulary.
+   - Its `intent` is taken only from the closed set above, and only if the
+     structural plan's intent is plain `recall`.
+   - It never sets `needs_store = false` (only a structural `edit` does).
+   - It never supplies an interval: intervals come from the code-side parser.
+     That parser handles fixed relative phrases itself and accepts a
+     `dateparser` match only when the matched span contains a temporal cue.
 
 No hardcoded synonym tables (retained): hand-written expansions only cover
 phrasings someone already anticipated.
@@ -227,6 +254,11 @@ summary and top claims, plus the digest if the day is closed. Ranking is
 skipped. For listing questions, completeness is the correct objective, and
 the total fits in a few thousand tokens. Beyond one day, digests are listed
 exhaustively and episodes are retrieved top-k.
+
+`[Rev 3]` An episode in the interval that is not yet drafted (`open`,
+`ready`, `failed`) is listed with its observations' captions in place of a
+summary, so the current day is answerable before drafting catches up. If the
+interval holds no activity at all, recall falls back to ordinary top-k.
 
 ### 4.5 Aggregate lookup  `[Rev 1]`
 
@@ -541,8 +573,9 @@ which are always searched) and the `time_hint` enum (replaced by `interval`).
 
 ## 14. Out of scope
 
-- The product and UI layer: the hotkey, the tool-calling research loop,
-  streaming writing, field insertion, and how gaps are surfaced to the user.
+- ~~The product and UI layer~~ `[Rev 4]` Bubble is now in scope (§16). Still
+  out of scope: a chat or history UI, and surfacing gaps anywhere except
+  `discrete gaps`.
 - Capture (`planS1.md`) and processing (`planS2.md`).
 
 ## 15. Overall assessment
@@ -562,3 +595,78 @@ Term statistics measure the world, not the prompt. The system can tell its own
 recall failures apart from genuine ignorance. And the evaluation now measures
 per category, against baselines, on snapshot-stable golden sets, with health
 checks that would have caught every prototype failure listed in `audit.md`.
+
+## 16. Bubble: inline retrieval on Option+Tab  `[Rev 4]`
+
+### 16.1 Trigger and field read
+A `CGEventTap` swallows the chord, so the host app never sees it. On the tap
+thread, `capture_focus()` records a snapshot in one pass of about 2–5 ms:
+- pid, app, window title and URL;
+- the focused element, its `AXValue`, and the caret index;
+- the caret rect, taken from `AXBoundsForRange`, else the field's
+  `AXPosition` and `AXSize`.
+
+The request is the text up to the caret. If a field hides its text from AX,
+the fallback is one vision call on the window-cropped frame
+(`BUBBLE_VISION_LM` → `CAPTION_LM`).
+
+### 16.2 Pipeline
+`field_query()` takes the field's last paragraph, trimmed to a sentence
+boundary at `BUBBLE_QUERY_CHARS`. Then:
+
+1. `retrieve()` runs as in §2–6, with plan and embedding concurrent.
+2. `evaluate()` picks the mode (§7).
+3. `render_records()` builds a typed, time-stamped, id-tagged evidence pack
+   within `BUBBLE_CONTEXT_CHARS`: screen excerpts use their best window over
+   the query terms, and claims carry kind and modality.
+4. One streamed writer call (`BUBBLE_LM` → `INSIGHT_LM`) writes the answer.
+
+The chunks it types:
+- break on word boundaries;
+- get a leading space only when the field needs one;
+- are each inserted as one `CGEventKeyboardSetUnicodeString` event posted to
+  the target pid.
+
+Capture is held off for the whole run (`suppress.hold`), and the typed text is
+registered as agent output (§9 of `planS1.md`).
+
+### 16.3 Progress pill
+A separate AppKit process, spawned at start and kept warm, draws a
+non-activating HUD capsule under the caret. Its parts:
+- **Left:** a conic-gradient ring that spins around a breathing core.
+- **Centre:** the status line, with a light band sweeping across its glyphs
+  ("Understanding" → "Searching your memory" → "Ranking N moments" →
+  "Writing from N sources").
+- **Right:** a monospaced timer.
+
+On success the ring settles to green and the capsule fades.
+`discrete overlay-demo` previews it. If the pill is missing, the user loses the
+animation, never the answer.
+
+### 16.4 Cancellation and outcomes
+- **Esc** cancels the run, and the key is swallowed.
+- **Any other key** cancels the run and passes through to the app.
+- **The front app changing** aborts the run.
+
+| mode | behaviour |
+|---|---|
+| grounded | answer from the records |
+| continuation | continue the draft; records optional |
+| edit | operate on the field text; no retrieval |
+| thin | one honest sentence; gap check in the background |
+| empty | nothing is typed; the pill says so; gap check in the background |
+
+`discrete ask "<text>" [--records] [--overlay]` runs the same pipeline
+headlessly, with stage timings.
+
+### 16.5 Tunables
+`BUBBLE_HOTKEY` (`<alt>+<tab>`), `BUBBLE_QUERY_CHARS` 600,
+`BUBBLE_CONTEXT_CHARS` 9000, `BUBBLE_MIN_CHUNK` 12,
+`BUBBLE_WRITER_MAX_TOKENS` 600, `BUBBLE_FOCUS_POLL_S` 0.15,
+`BUBBLE_OVERLAY` on, `BUBBLE_CANCEL_ON_TYPE` on, `PLAN_TIMEOUT_S` 4.
+
+### 16.6 Open
+- Streaming the answer *into the pill* first for apps where posted keys do
+  not land (some Electron fields), with a click to insert.
+- A second retrieval round only when `thin` and the planner produced
+  unexplored queries. This needs eval evidence that recall improves.

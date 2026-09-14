@@ -432,3 +432,235 @@ WorkAA source, as of the 2026-09-14 audit (details in `audit.md`).
 - **Rule:** the tokenizer strips possessives (`'s`, `’s`) and leading or
   trailing quotes. Unit tests cover straight and curly quotes.
 
+---
+
+*Entries 7.11–7.26 come from the review of the v1 build (commit `a235668`,
+generated from the plans in another tool) and its first live run, 2026-09-14.
+Each entry is pinned by a test in `tests/test_pipeline.py` where one is
+feasible.*
+
+### 7.11 One missing pyobjc constant disabled all of Accessibility
+
+- **Symptom:** `app`, `window_title`, `url` and `site` were empty on 17/17
+  observations of the first live run.
+- **Evidence:** `from ApplicationServices import kAXManualAccessibilityAttribute, …`
+  raises `ImportError` (pyobjc does not export it). The module-level
+  `except ImportError: _HAS_AX = False` then made every AX function return
+  empty, silently.
+- **Root cause:** a batch import guarded by a single capability flag. An
+  optional attribute took down a mandatory capability.
+- **Rule:** AX attribute names are plain strings. Window identity comes from the
+  Quartz window list, which needs neither AX nor a run loop. `doctor` prints the
+  live window context, and a test asserts that it resolves.
+
+### 7.12 OCR ran in *fast* mode; `text_source` was mislabeled
+
+- **Symptom:** garbled text on every capture ("Ed￿* View Swes Tab$ Archfve",
+  "news.ycofflbinalor.com").
+- **Evidence:** `setRecognitionLevel_(1)  # accurate`. But
+  `VNRequestTextRecognitionLevelAccurate = 0` and `Fast = 1`. The same frame
+  read cleanly at level 0 with language correction (1.2 s vs 0.24 s). Rows with
+  no AX text were also labeled `ax+ocr`.
+- **Rule:** use named constants and never trust comments on magic numbers. A test
+  OCRs a rendered string.
+
+### 7.13 Frames were full-screen; the window crop was never implemented
+
+- **Symptom:** OCR and captions included the menu bar, the dock and the
+  overlapping terminal that was running the daemon (observations 1, 2 and 5
+  summarized its own log).
+- **Root cause:** `planS1.md` §5/§6.1 specify a crop to the focused window. The
+  frame loop grabbed `monitors[1]`.
+- **Rule:** `capture/frames.py` grabs the window's bounds on its own display.
+  Self-windows are classified by title (`planS1.md` Rev 3.4).
+
+### 7.14 Interaction counts were wrong in three ways
+
+- **Symptom:** `clicks` up to 3652 per capture, `keys = 0` on keyboard
+  captures, `clipboard` always 0. Every observation was therefore "engaged",
+  and the modality signal carried nothing.
+- **Root causes:**
+  - Mouse *moves* were counted as clicks and armed captures.
+  - Counts were snapshotted when the capture armed, not over its interval.
+  - Clipboard triggers never incremented a counter.
+  - A drift abort skipped the counter reset.
+- **Rule:** counting happens on the event-loop thread, inside the pending
+  capture it describes. Moves are neither triggers nor interaction.
+
+### 7.15 Idle transitions captured the screen
+
+- **Symptom:** the user going away produced a capture of an unattended screen.
+- **Root cause:** the idle poller fired an ordinary trigger. `planS1.md` §2.7
+  says idle affects sessions only.
+- **Rule:** idle has its own callback. It rotates the session, closes the
+  episode, and suspends heartbeats.
+
+### 7.16 Episodes were never drafted
+
+- **Symptom:** 2/2 episodes of the first run stayed `open`, and 0 claims
+  existed.
+- **Root causes:**
+  - Tracker state lived only in memory, nothing closed the current episode on
+    shutdown, and `discrete process` handled only `ready`.
+  - The switch rule closed on the *first* observation of a new app whenever the
+    old app had lasted ≥ 90 s, and assigned that observation to the old episode.
+  - Each observation was embedded twice, double-weighting the centroid.
+  - Idle close stamped `ended_at = now`, adding 300 s to every episode.
+  - Drafting ran inline in the ingest loop and in the draft loop, with no guard
+    against doing it twice.
+- **Rule:** an explicit lifecycle with an atomic `ready → drafting` claim
+  (`planS2.md` Rev 3.1). Tests cover alt-tab absorption, the retroactive split
+  and orphan recovery.
+
+### 7.17 Quote verification could be bypassed
+
+- **Symptom (code):** a claim with no `quote_obs_id` was stored with no
+  evidence at all. The fallback check compared an observation's text against
+  its *own* tokens, which says nothing about the claim.
+- **Rule:** a claim needs ≥ 1 verified evidence link, or it is dropped. A
+  substitute quote is the best window *per field* for the claim's content
+  words, so it never spans two fields.
+
+### 7.18 Batch-level mentions came back (a repeat of §2)
+
+- **Symptom (code):**
+  - `_attach_entities` extracted names from every observation in the episode and
+    linked them to every claim.
+  - It created entities immediately, with no recurrence gate.
+  - It never checked that the name occurred in the claim.
+  - Every capitalized OCR word became a candidate, at one embedding call each.
+- **Rule:** a mention requires the alias in the claim text or a verified quote.
+  Entities come only from promotion (≥ 2 episodes). Promotion back-fills
+  mentions. A test pins all three.
+
+### 7.19 Confidence was off-scale and reset on reinforcement
+
+- **Symptom (code):**
+  - `create_claim` defaulted to `len(evidence) × 0.5`, capped at 10.
+  - Reinforcement *replaced* confidence with a one-episode value.
+  - Superseding set 0.5 or 0.3.
+  - The formula summed *unique* modalities rather than one term per episode.
+- **Rule:** confidence is recomputed from evidence rows inside the transaction
+  on every evidence change. A test asserts it rises monotonically across
+  reinforcements.
+
+### 7.20 Consolidation kept only the first output
+
+- **Symptom (code):** `apply_consolidation` looped over outputs and `break`-ed
+  after the first. It superseded every cluster member, so splits were lost. No
+  output validation ran.
+- **Rule:** one transaction. Each output inherits evidence from its own inputs,
+  inputs no output uses stay live, and a call that fails validation changes
+  nothing. A test pins it.
+
+### 7.21 Retention deleted rows, and evidence cascaded away
+
+- **Symptom (code):** `purge_old_observations` deleted observations older than
+  90 days. `ON DELETE CASCADE` removed their evidence, and the
+  unsupported-claim lint then superseded the claims. Retention would have erased
+  the memory it was retaining.
+- **Root cause:** `planS2.md` §12 says *clear* `screen_text`. The code deleted
+  the row.
+- **Rule:** retention blanks text and frames only, and decrements DF. A test
+  asserts that evidence survives.
+
+### 7.22 The outbox never embedded episodes or entities
+
+- **Symptom:** an episode outbox row sat forever, and coverage never reached 100%.
+- **Root cause:** the text builder handled only observations and claims.
+  Failures were not counted, and dead references were never discarded.
+- **Rule:** all four kinds are handled, dead or non-live references are
+  discarded, and failures count toward `OUTBOX_MAX_ATTEMPTS`. A test asserts
+  coverage = 1.0 for every kind.
+
+### 7.23 Retrieval ranking was mostly unranked
+
+- **Symptom (code):**
+  - Dense candidates were kept in insertion order, not by similarity.
+  - `Hit.score` was never set, so recency and MMR multiplied zero.
+  - `_filter_interval` returned its input.
+  - BM25 field weights were not applied.
+  - Claim materialization reloaded all live claims per hit (O(N²)).
+  - `brute_verify` could never mark a hit strong, so every thin query became a
+    "knowledge gap".
+- **Rule:** a cached normalized matrix per kind with argsort, fused RRF as the
+  base score, field-weighted `bm25()`, and batch materialization. Tests cover
+  dense ranking and an end-to-end retrieve.
+
+### 7.24 The query planner trusted the model and dateparser
+
+- **Symptom:** on the live store, three of four real questions returned
+  **empty**. The utility model returned `needs_store: false` and free-text
+  intents, and `dateparser` turned "on hacker news" into a date six days back.
+- **Rule:** tests pin both. The design change is `planS3.md` Rev 3.1–3.2.
+
+### 7.25 A junk digest was generated at startup
+
+- **Symptom:** today's digest read "Sure! Please provide the details or
+  summaries of the episodes…".
+- **Root cause:** consolidation ran immediately on start. The digest prompt was
+  built from zero episode summaries, and the stored row then blocked the day.
+- **Rule:** consolidation runs on its persisted interval, no digest is written
+  without summaries, and digests track the episode count (`planS2.md` Rev 3.2).
+
+### 7.26 The tests passed while nothing worked end to end
+
+- **Symptom:** 9/9 tests passed on a build that stored no claims, no entities,
+  and no app names.
+- **Root cause:** the tests exercised helpers (hashing, a store round-trip),
+  never the pipeline. There was no fake model backend. The eval set was 3
+  unanswerable cases compared against an empty baseline.
+- **Rule:** every guard a plan relies on has a behavioural test over a fake
+  backend (`tests/conftest.py`). A stage counts as done only after a real-data
+  run: `discrete replay-workaa` plus `discrete eval --cases
+  golden/workaa_replay.yaml`, and `discrete doctor` plus a short live `run`.
+  This extends §6's addendum: tests must exercise the *pipeline*, not only its
+  parts.
+
+
+### 7.27 UI chrome became entities
+
+- **Symptom:** a 4-observation live run promoted 18 entities, among them
+  "Dashboard\nHome", "Projects\nFilter", "Unnamed Unnamed" and
+  "Users/owaissadiqque".
+- **Root cause:** the Title-Case pattern matched `\s+`, so spans crossed line
+  breaks between separate AX labels. An app's sidebar and menu labels recur in
+  every episode, so they pass the ≥2-episode recurrence gate by construction.
+  Filesystem path fragments matched the repo pattern.
+- **Rule:** the structural pass works line by line and keeps only
+  identifier-shaped patterns (inner caps, files, domains, handles, repos).
+  Multi-word proper names come from the VLM and claim sources. `promotable`
+  rejects multi-line names, repeated-token echoes, and paths under
+  filesystem roots.
+
+### 7.28 An agent chat on screen was modelled as the user's own work
+
+- **Symptom:** the live run's claims read "The user is improving OCR accuracy
+  with language correction" and similar. That was the coding agent's
+  transcript in Conductor, which the user was only watching.
+- **Root cause:** `classify_origin` recognises DIscrete's own output, not
+  other agents' output. The claims were tagged `passive`, which is correct but
+  does not stop them from being retrieved as the user's activity.
+- **Rule (open):** see `planS1.md` open items. Until an agent-transcript
+  classifier exists, `SELF_APPS` / `SELF_WINDOW_PATTERNS` let a user exclude
+  agent chat windows, and retrieval surfaces modality so the writer can say
+  "viewed".
+
+### 7.29 A new TLS handshake on every rerank
+
+- **Symptom:** each rerank call cost roughly 150–300 ms of connection setup.
+- **Root cause:** `OpenAIBackend.rerank` opened a fresh `httpx.AsyncClient`
+  per call.
+- **Rule:** keep a persistent client per backend. Latency-critical paths also
+  never await independent API calls in sequence: the query plan and the query
+  embedding now run concurrently.
+
+### 7.30 PyObjC turned the overlay's Python helpers into selectors
+
+- **Symptom:** the overlay process died at import with `BadPrototypeError:
+  '_layout' expects 0 arguments`.
+- **Root cause:** every method defined on an `NSObject` subclass is converted
+  to an Objective-C selector, and a name without a trailing underscore
+  declares zero arguments.
+- **Rule:** UI state lives in a plain Python class. Only the minimal
+  callback target (the `tick:` timer target) subclasses `NSObject`.

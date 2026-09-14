@@ -53,6 +53,22 @@ to 80 of 89 observations. Rev 1 removes every link of that chain.
 | 2.2 | §10.2 | **Local NER (GLiNER) is removed.** Screen-text entity candidates come from a structural pass with no model: capitalized spans, internal-capital or digit tokens, domains, filenames, handles, and repository paths. Salience comes from the recurrence gate (§10.3). | Same decision. The recurrence gate already does the salience filtering the NER score was meant to add. |
 | 2.3 | §10.3 | The "scrubbed placeholders are never entities" rule is removed. | The Stage 1 privacy tier was removed (`planS1.md` Rev 2). |
 
+### Rev 3 — 2026-09-15 (first live run of the v1 build, and a WorkAA replay)
+
+Evidence:
+- the first live run: 17 observations, 2 episodes both stuck `open`, **0 claims**;
+- `discrete replay-workaa`: the 88 WorkAA observations replayed through the fixed
+  pipeline, giving 69 observations, 7 episodes, 34 claims and 4 entities;
+- a code review. Implementation bugs are in `insights.md` §7.11–7.26.
+
+| # | Section | Change | Why (evidence) |
+|---|---|---|---|
+| 3.1 | §3.2 | **Episode lifecycle is explicit and recoverable:** `open → ready → drafting → closed`, or `failed` after `DRAFT_MAX_ATTEMPTS` (default **3**). Drafting runs off the ingest path. Startup turns orphaned `open` episodes (whose tracker died with its process) into `ready`, and shutdown closes the current one. An episode's interval is its observations' span. | In the first live run both episodes stayed `open` forever. Tracker state lived only in memory, nothing closed it on exit, and `process` only looked at `ready`. Nothing was ever drafted. |
+| 3.2 | §7.4 | **The digest is (re)written whenever the number of summarized episodes for a day changes.** A day with no episode summaries gets no digest. | "At day end" assumes the daemon is running at midnight. v1 also wrote a digest at startup from zero summaries ("Sure! Please provide the details…"), and that row blocked the day's real digest. |
+| 3.3 | §7.5 | **`stated` claims are exempt from the unsupported-claim rule.** | User testimony has no observation evidence. Under the Rev 1 rule, every answered knowledge gap would have been superseded after 14 days. |
+| 3.4 | §10.2 | **The structural candidate pass runs on AX-sourced text only**, never on OCR output. **The ground-truth `app` and `site` of observations with user input are added as candidate source 4.** | OCR errors recur: menu-bar misreadings such as "Tab$ Archfve" appeared on every capture of the first run and would pass a recurrence gate. In the replay, `logosystem.co` appeared in the sites of 3 episodes but reached the candidate table from only 1, because ground-truth sites were not a source. |
+| 3.5 | §6.1 | **One relation call per draft classifies all of its top `RELATE_CANDIDATES` (default **5**) candidates together**, not one call per candidate. | v1 made up to 8 sequential calls per durable draft. |
+
 ---
 
 ## 1. Purpose and scope
@@ -176,6 +192,13 @@ A new episode starts when any of these hold:
 
 An episode **closes** at its boundary, or after `EPISODE_IDLE_CLOSE_S` (default
 **300 s**) with no new observation. Closing triggers drafting (§5) exactly once.
+
+`[Rev 3]` **Lifecycle:** `open → ready → drafting → closed`, or `failed` after
+`DRAFT_MAX_ATTEMPTS` (default **3**). Claiming an episode for drafting is an
+atomic `ready → drafting` update, so no episode is drafted twice. Tracker state
+is in memory only. On startup, `open` episodes left by a dead process become
+`ready`, and on shutdown the current episode closes. The episode's interval is
+its observations' span, never the close time.
 
 ### 3.3 Episode record
 
@@ -344,8 +367,10 @@ See §10.6.
 
 ### 7.4 Daily digest
 
-At day end, a short narrative over the day's episode titles and summaries,
-stored as a `digest` row keyed by date. Stage 3 uses it for "what did I do
+A short narrative over the day's episode titles and summaries, stored as a
+`digest` row keyed by date. `[Rev 3]` It is (re)written in consolidation
+whenever the number of summarized episodes for that day has changed since the
+last digest. A day with no episode summaries gets none. Stage 3 uses it for "what did I do
 yesterday"-style questions.
 
 ### 7.5 Lint and reconciliation
@@ -356,7 +381,8 @@ only where a judgment is needed, following tada's memory-lint pattern:
 - entity duplicate sweep: re-runs resolution (§10.4) pairwise over entities
   created since the last run;
 - claims with zero verified supports older than `UNSUPPORTED_TTL_DAYS` (default
-  **14**) → `status = superseded` with reason `unsupported`;
+  **14**) → `status = superseded` with reason `unsupported`. `[Rev 3]` `stated`
+  claims are exempt: user testimony is their evidence;
 - lineage ceiling anomalies (§7.1);
 - backlog report: episodes not yet drafted, outbox depth, failed calls by type.
 
@@ -425,11 +451,15 @@ Candidate names come from three sources:
 1. the Stage 1 VLM's **working entities** per observation, meaning names the
    user is working with, not everything visible;
 2. the drafting call's claim entities (§5.1);
-3. `[Rev 2]` a structural candidate pass over `screen_text`, with no model:
+3. `[Rev 2]` a structural candidate pass over `screen_text` (`[Rev 3]`
+   AX-sourced text only, never OCR output, whose recognition errors recur), with
+   no model:
    capitalized multi-word spans, internal-capital or digit-bearing tokens
    (`OpenRouter`, `Qwen3`), domains, filenames, `@handles`, and repository
    paths (`owner/repo`). These are candidates only. Salience comes from the
    recurrence gate (§10.3), not from a model score.
+4. `[Rev 3]` the ground-truth `app` and `site` of observations with user input.
+   These are the most reliable names in the store.
 
 ### 10.3 Salience and recurrence gates
 

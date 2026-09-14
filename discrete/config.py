@@ -112,6 +112,16 @@ def rerank_endpoint() -> Endpoint:
     return _ep("rerank", "RERANK_LM", model_fallback=False)
 
 
+def writer_endpoint() -> Endpoint:
+    """Bubble's streamed writer (planS3 §16); a fast chat model."""
+    return _ep("writer", "BUBBLE_LM", "INSIGHT_LM")
+
+
+def bubble_vision_endpoint() -> Endpoint:
+    """Bubble's field read when the focused field hides its text from AX."""
+    return _ep("bubble_vision", "BUBBLE_VISION_LM", "CAPTION_LM")
+
+
 def all_endpoints() -> list[Endpoint]:
     return [
         caption_endpoint(),
@@ -120,6 +130,7 @@ def all_endpoints() -> list[Endpoint]:
         utility_endpoint(),
         embedding_endpoint(),
         rerank_endpoint(),
+        writer_endpoint(),
     ]
 
 
@@ -169,7 +180,11 @@ class T:
     FRAME_MAX_WIDTH = _typed("FRAME_MAX_WIDTH", 1600)
     FRAME_JPEG_QUALITY = _typed("FRAME_JPEG_QUALITY", 65)
     POLL_S = _typed("POLL_S", 0.5)
+    FRAME_CACHE_S = _typed("FRAME_CACHE_S", 0.5)
+    VLM_MAX_WIDTH = _typed("VLM_MAX_WIDTH", 1024)
+    VLM_IMAGE_DETAIL = _typed("VLM_IMAGE_DETAIL", "low")
     SELF_APPS = [s.lower() for s in _typed("SELF_APPS", [])]
+    SELF_WINDOW_PATTERNS = [s.lower() for s in _typed("SELF_WINDOW_PATTERNS", ["bin/discrete", "discrete run"])]
     CANVAS_APPS = [s.lower() for s in _typed(
         "CANVAS_APPS",
         ["figma", "illustrator", "photoshop", "sketch", "screen sharing", "remote desktop", "affinity"],
@@ -190,6 +205,9 @@ class T:
     DRAFT_MAX_DURABLE = _typed("DRAFT_MAX_DURABLE", 5)
     DRAFT_MAX_OBS = _typed("DRAFT_MAX_OBS", 40)
     EVIDENCE_MIN_OVERLAP = _typed("EVIDENCE_MIN_OVERLAP", 0.2)
+    DRAFT_MAX_ATTEMPTS = _typed("DRAFT_MAX_ATTEMPTS", 3)
+    RELATE_CANDIDATES = _typed("RELATE_CANDIDATES", 5)
+    OUTBOX_MAX_ATTEMPTS = _typed("OUTBOX_MAX_ATTEMPTS", 5)
     CANDIDATE_LIMIT = _typed("CANDIDATE_LIMIT", 8)
     RRF_K = _typed("RRF_K", 60.0)
     CONSOLIDATION_INTERVAL_S = _typed("CONSOLIDATION_INTERVAL_S", 3600.0)
@@ -237,3 +255,14 @@ class T:
     EVAL_MIN_CASES_FOR_SIG = _typed("EVAL_MIN_CASES_FOR_SIG", 100)
     EVAL_TOLERANCE = _typed("EVAL_TOLERANCE", 0.05)
     STORE_CARD_TTL_S = _typed("STORE_CARD_TTL_S", 120.0)
+    PLAN_TIMEOUT_S = _typed("PLAN_TIMEOUT_S", 4.0)
+
+    # ---- Bubble (planS3 §16)
+    BUBBLE_HOTKEY = _typed("BUBBLE_HOTKEY", "<alt>+<tab>")
+    BUBBLE_QUERY_CHARS = _typed("BUBBLE_QUERY_CHARS", 600)
+    BUBBLE_CONTEXT_CHARS = _typed("BUBBLE_CONTEXT_CHARS", 9000)
+    BUBBLE_MIN_CHUNK = _typed("BUBBLE_MIN_CHUNK", 12)
+    BUBBLE_WRITER_MAX_TOKENS = _typed("BUBBLE_WRITER_MAX_TOKENS", 600)
+    BUBBLE_FOCUS_POLL_S = _typed("BUBBLE_FOCUS_POLL_S", 0.15)
+    BUBBLE_OVERLAY = _typed("BUBBLE_OVERLAY", True)
+    BUBBLE_CANCEL_ON_TYPE = _typed("BUBBLE_CANCEL_ON_TYPE", True)

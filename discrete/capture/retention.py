@@ -1,9 +1,8 @@
-"""Frame and observation retention (planS2 §12)."""
+"""Frame and screen-text retention (planS2 §12)."""
 
 from __future__ import annotations
 
 import logging
-import os
 import time
 
 from ..config import T, frames_dir
@@ -11,27 +10,25 @@ from ..config import T, frames_dir
 log = logging.getLogger("discrete.capture.retention")
 
 
-def purge_frames(*, ttl_days: float | None = None) -> dict:
+def purge_frames(*, ttl_days: float | None = None) -> int:
     ttl = T.FRAME_TTL_DAYS if ttl_days is None else ttl_days
-    d = frames_dir()
-    if ttl <= 0 or not d.is_dir():
-        return {"removed": 0, "bytes": 0}
+    if ttl <= 0:
+        return 0
     cutoff = time.time() - ttl * 86400
-    removed = freed = 0
-    for path in d.glob("*.jpg"):
+    removed = 0
+    for path in frames_dir().glob("*.jpg"):
         try:
-            st = path.stat()
-            if st.st_mtime < cutoff:
-                freed += st.st_size
+            if path.stat().st_mtime < cutoff:
                 path.unlink()
                 removed += 1
         except OSError:
             continue
-    return {"removed": removed, "bytes": freed}
+    return removed
 
 
-async def run_retention(store, *, screen_text_ttl_days: float | None = None) -> dict:
-    shots = purge_frames()
-    ttl = T.SCREEN_TEXT_TTL_DAYS if screen_text_ttl_days is None else screen_text_ttl_days
-    purged = await store.purge_old_observations(ttl_days=ttl)
-    return {"frames": shots, "observations_purged": purged}
+async def run_retention(store) -> dict:
+    """Rows are never deleted: evidence must outlive the text (insights.md §7.21)."""
+    return {
+        "frames_removed": purge_frames(),
+        "screen_text_cleared": await store.clear_old_screen_text(ttl_days=T.SCREEN_TEXT_TTL_DAYS),
+    }

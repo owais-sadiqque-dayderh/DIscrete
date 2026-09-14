@@ -43,6 +43,7 @@ class OpenAIBackend:
 
     def __init__(self) -> None:
         self._clients: dict[tuple[str | None, str | None], AsyncOpenAI] = {}
+        self._http: httpx.AsyncClient | None = None  # kept alive: one TLS handshake, not one per rerank
 
     def _client(self, ep: Endpoint) -> AsyncOpenAI:
         key = (ep.base_url, ep.api_key)
@@ -66,20 +67,36 @@ class OpenAIBackend:
             raise LLMError(f"{ep.name}: empty choices")
         return (rsp.choices[0].message.content or "").strip()
 
+    async def stream(self, ep: Endpoint, messages: list[dict], *, temperature: float | None,
+                     max_tokens: int | None):
+        payload: dict[str, Any] = {"model": ep.model, "messages": messages, "stream": True}
+        if temperature is not None:
+            payload["temperature"] = temperature
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        rsp = await self._client(ep).chat.completions.create(**payload)
+        try:
+            async for chunk in rsp:
+                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+        finally:
+            await rsp.close()  # an abandoned stream otherwise errors when the loop shuts down
+
     async def embed(self, ep: Endpoint, texts: list[str]) -> list[list[float]]:
         rsp = await self._client(ep).embeddings.create(model=ep.model, input=texts)
         return [d.embedding for d in rsp.data]
 
     async def rerank(self, ep: Endpoint, query: str, docs: list[str], top_n: int) -> list[tuple[int, float]]:
         url = (ep.base_url or "https://openrouter.ai/api/v1").rstrip("/") + "/rerank"
-        async with httpx.AsyncClient(timeout=T.LLM_TIMEOUT_S) as c:
-            r = await c.post(
-                url,
-                headers={"Authorization": f"Bearer {ep.api_key}"},
-                json={"model": ep.model, "query": query, "documents": docs, "top_n": top_n},
-            )
-            r.raise_for_status()
-            data = r.json()
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=T.LLM_TIMEOUT_S)
+        r = await self._http.post(
+            url,
+            headers={"Authorization": f"Bearer {ep.api_key}"},
+            json={"model": ep.model, "query": query, "documents": docs, "top_n": top_n},
+        )
+        r.raise_for_status()
+        data = r.json()
         return [(int(x["index"]), float(x["relevance_score"])) for x in data.get("results", [])]
 
 
@@ -142,8 +159,22 @@ async def complete_json(ep: Endpoint, messages: list[dict], *, temperature: floa
     return parsed
 
 
-def image_part(jpeg: bytes) -> dict:
-    return {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()}}
+async def stream(ep: Endpoint, messages: list[dict], *, temperature: float | None = 0.2,
+                 max_tokens: int | None = None):
+    """Yield text deltas. Backends without streaming yield one whole reply."""
+    if not ep.configured:
+        raise NotConfigured(f"{ep.name} endpoint not configured")
+    fn = getattr(_backend, "stream", None)
+    if fn is None:
+        yield await _backend.chat(ep, messages, temperature=temperature, max_tokens=max_tokens, json_mode=False)
+        return
+    async for piece in fn(ep, messages, temperature=temperature, max_tokens=max_tokens):
+        yield piece
+
+
+def image_part(jpeg: bytes, *, detail: str = "auto") -> dict:
+    url = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()
+    return {"type": "image_url", "image_url": {"url": url, "detail": detail}}
 
 
 async def embed(texts: list[str]) -> list[list[float]]:

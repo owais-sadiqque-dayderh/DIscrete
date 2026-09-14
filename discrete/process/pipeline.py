@@ -2,29 +2,34 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .. import textkit as tk
 from ..config import T, insight_endpoint
-from ..llm import EXPECTED_ERRORS, complete_json
-from ..process.confidence import compute_confidence
-from ..process.entities import extract_from_text, resolve_entity
-from ..process.validation import atomic, injection_drop, modality_from_obs, subject_ok, verify_quote
-from ..retrieval.search import fts_hits, fuse_rankings
+from ..llm import EXPECTED_ERRORS, NotConfigured, complete_json, embed
 from ..store import ClaimDraft, Store
-from ..timeutil import day_key
+from ..timeutil import to_local
+from .entities import attach_claim_mentions, note_candidates, structural_candidates
 from .prompts import DRAFT_EPISODE_PROMPT, RELATE_PROMPT
+from .validation import atomic, injection_drop, subject_ok, verify_evidence
 
 log = logging.getLogger("discrete.process.pipeline")
 
+_KINDS = ("event", "fact", "preference")
+
 
 @dataclass
-class BatchOutcome:
+class DraftOutcome:
     episode_id: int
-    claims_added: int = 0
-    claims_reinforced: int = 0
-    claims_invalidated: int = 0
+    added: int = 0
+    reinforced: int = 0
+    invalidated: int = 0
+    rejected: dict = field(default_factory=dict)
+
+    def reject(self, reason: str) -> None:
+        self.rejected[reason] = self.rejected.get(reason, 0) + 1
 
 
 class ProcessPipeline:
@@ -32,202 +37,220 @@ class ProcessPipeline:
         self.store = store
         self.ep = insight_endpoint()
 
-    async def draft_episode(self, episode_id: int) -> BatchOutcome | None:
-        obs_rows = await self._observations_for_episode(episode_id)
-        if not obs_rows:
+    async def process_ready(self, *, limit: int = 5) -> list[DraftOutcome]:
+        out = []
+        for ep in await self.store.episodes_ready_for_draft(limit=limit):
+            res = await self.draft_episode(ep["id"])
+            if res:
+                out.append(res)
+        return out
+
+    async def draft_episode(self, episode_id: int) -> DraftOutcome | None:
+        if not await self.store.begin_draft(episode_id):
+            return None  # someone else is drafting it, or it is not ready
+        try:
+            return await self._draft(episode_id)
+        except EXPECTED_ERRORS as exc:
+            log.warning("episode %s draft failed: %s", episode_id, exc)
+            await self.store.draft_failed(episode_id)
+            await self.store.bump_metric("draft_failed")
             return None
-        outcome = BatchOutcome(episode_id=episode_id)
-        if not self.ep.configured:
-            apps = sorted({r["app"] for r in obs_rows if r["app"]})
-            sites = sorted({r["site"] for r in obs_rows if r["site"]})
-            await self.store.close_episode(episode_id, title="Untitled", summary="", apps=apps, sites=sites)
+        except BaseException:
+            await self.store.draft_failed(episode_id)
+            raise
+
+    async def _draft(self, episode_id: int) -> DraftOutcome:
+        outcome = DraftOutcome(episode_id=episode_id)
+        rows = await self.store.observations_for_episode(episode_id)
+        apps = sorted({r["app"] for r in rows if r["app"]})
+        sites = sorted({r["site"] for r in rows if r["site"]})
+        engaged = sum(1 for r in rows if r["keys"] or r["clicks"] or r["clipboard"]) / max(1, len(rows))
+        if not rows or not self.ep.configured:
+            title = " / ".join(apps)[:80] or "(no user activity)"
+            await self.store.close_episode(episode_id, title=title, summary="", apps=apps, sites=sites,
+                                           engaged_fraction=engaged)
             return outcome
 
-        draft = await self._draft_episode(obs_rows)
-        if not draft:
-            return outcome
-        apps = sorted({r["app"] for r in obs_rows if r["app"]})
-        sites = sorted({r["site"] for r in obs_rows if r["site"]})
+        data = await self._call_draft(rows)
+        by_id = {r["id"]: r for r in rows}
         await self.store.close_episode(
-            episode_id,
-            title=str(draft.get("title") or "")[:80],
-            summary=str(draft.get("summary") or "")[:600],
-            apps=apps,
-            sites=sites,
+            episode_id, title=tk.truncate(str(data.get("title") or ""), 80),
+            summary=tk.truncate(str(data.get("summary") or ""), 600), apps=apps, sites=sites,
+            engaged_fraction=engaged,
         )
-        t0 = min(r["started_at"] for r in obs_rows)
-        t1 = max(r["ended_at"] for r in obs_rows)
-        by_id = {r["id"]: r for r in obs_rows}
+        t0 = min(r["started_at"] for r in rows)
+        t1 = max(r["ended_at"] for r in rows)
+        counts = {"event": 0, "durable": 0}
+        names_seen: list[str] = []
+        for item in data.get("claims") or []:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind") or "").lower()
+            if kind not in _KINDS:
+                outcome.reject("bad_kind")
+                continue
+            bucket = "event" if kind == "event" else "durable"
+            cap = T.DRAFT_MAX_EVENTS if bucket == "event" else T.DRAFT_MAX_DURABLE
+            if counts[bucket] >= cap:
+                outcome.reject("over_cap")
+                continue
+            cd = self._validate(item, kind, by_id, episode_id, t0, t1, outcome)
+            if cd is None:
+                continue
+            counts[bucket] += 1
+            names_seen += cd.entities
+            if kind == "event":
+                cid = await self.store.create_claim(cd)
+                await self._mentions(cid, cd)
+                outcome.added += 1
+            else:
+                op = await self._merge(cd)
+                setattr(outcome, op, getattr(outcome, op) + 1)
 
-        for kind_key, claim_kind in (("events", "event"), ("facts", "fact"), ("preferences", "preference")):
-            for item in (draft.get(kind_key) or [])[: T.DRAFT_MAX_EVENTS if claim_kind == "event" else T.DRAFT_MAX_DURABLE]:
-                cd = self._validated_claim(item, claim_kind, by_id, episode_id, t0, t1)
-                if not cd:
-                    continue
-                if claim_kind == "event":
-                    cid = await self.store.create_claim(cd, confidence=compute_confidence([cd.modality], 1))
-                    await self._link_evidence(cid, cd, by_id)
-                    await self._attach_entities(cid, cd, obs_rows)
-                    outcome.claims_added += 1
-                else:
-                    action = await self._merge_or_add(cd, by_id)
-                    if action == "add":
-                        outcome.claims_added += 1
-                    elif action == "reinforce":
-                        outcome.claims_reinforced += 1
-                    elif action == "invalidate":
-                        outcome.claims_invalidated += 1
-
-        for obs in obs_rows:
-            for name in extract_from_text(obs["screen_text"] + " " + obs["caption"]):
-                await self.store.bump_entity_candidate(name, episode_id)
+        # Entity candidates (planS2 §10.2): VLM working entities, claim entities, the
+        # structural pass on AX text, and ground-truth app/site where the user acted.
+        for r in rows:
+            names_seen += tk.parse_json_list(r["entities"])
+            if r["text_source"] == "ax":
+                names_seen += structural_candidates(r["screen_text"])
+            if r["keys"] or r["clicks"] or r["clipboard"]:
+                names_seen += [x for x in (r["app"], r["site"]) if x]
+        await note_candidates(self.store, names_seen, episode_id)
+        for reason, n in outcome.rejected.items():
+            await self.store.bump_metric(f"claims_rejected_{reason}", n)
         return outcome
 
-    async def _observations_for_episode(self, episode_id: int) -> list:
-        def _get():
-            return self.store.conn.execute(
-                "SELECT * FROM observations WHERE episode_id=? ORDER BY started_at", (episode_id,)
-            ).fetchall()
-
-        return await self.store._call(_get)
-
-    async def _draft_episode(self, obs_rows) -> dict | None:
-        lines = []
-        seen_excerpt: set[str] = set()
-        for r in obs_rows[-T.DRAFT_MAX_OBS :]:
-            excerpt = tk.truncate(r["screen_text"], T.DRAFT_TEXT_CHARS_PER_OBS)
-            if excerpt in seen_excerpt:
-                excerpt = ""
-            else:
-                seen_excerpt.add(excerpt)
-            lines.append(
-                f"#{r['id']} t={r['started_at']} app={r['app']} site={r['site']}\n"
-                f"caption: {r['caption']}\n"
-                f"interaction: keys={r['keys']} clicks={r['clicks']}\n"
-                f"<<<DATA>>>\n{excerpt}\n<<<END>>>"
+    async def _call_draft(self, rows) -> dict:
+        seen_lines: set[str] = set()
+        blocks = []
+        for r in rows[-T.DRAFT_MAX_OBS:]:
+            kept = []
+            for line in (r["screen_text"] or "").splitlines():
+                k = tk.norm_key(line)
+                if k and k not in seen_lines:
+                    seen_lines.add(k)
+                    kept.append(line)
+            excerpt = tk.truncate("\n".join(kept), T.DRAFT_TEXT_CHARS_PER_OBS)
+            acted = "acted" if (r["keys"] or r["clicks"] or r["clipboard"]) else "viewed only"
+            blocks.append(
+                f"[observation_id={r['id']}] {to_local(r['started_at']):%H:%M} app={r['app']} site={r['site']} "
+                f"window={r['window_title']!r} ({acted}: keys={r['keys']} clicks={r['clicks']} "
+                f"scrolls={r['scrolls']} copies={r['clipboard']})\n"
+                f"caption: {r['caption']}\n<<<DATA>>>\n{excerpt}\n<<<END>>>"
             )
-        prompt = DRAFT_EPISODE_PROMPT.format(observations="\n---\n".join(lines))
-        try:
-            data = await complete_json(self.ep, [{"role": "user", "content": prompt}], max_tokens=2500)
-            return data if isinstance(data, dict) else None
-        except EXPECTED_ERRORS as exc:
-            log.warning("episode draft failed: %s", exc)
-            return None
+        prompt = DRAFT_EPISODE_PROMPT.format(
+            observations="\n\n".join(blocks), max_events=T.DRAFT_MAX_EVENTS, max_durable=T.DRAFT_MAX_DURABLE
+        )
+        data = await complete_json(self.ep, [{"role": "user", "content": prompt}], max_tokens=2500)
+        if not isinstance(data, dict):
+            from ..llm import LLMError
 
-    def _validated_claim(self, item, kind, by_id, episode_id, t0, t1) -> ClaimDraft | None:
+            raise LLMError("draft: not an object")
+        return data
+
+    def _validate(self, item: dict, kind: str, by_id: dict, episode_id: int, t0: float, t1: float,
+                  outcome: DraftOutcome) -> ClaimDraft | None:
         text = str(item.get("text") or "").strip()
-        entities = [str(e) for e in (item.get("entities") or [])]
-        if not atomic(text, entities) or not subject_ok(text):
+        entities = [str(e).strip() for e in (item.get("entities") or []) if str(e).strip()]
+        if not atomic(text, entities):
+            outcome.reject("not_atomic")
             return None
-        oid = int(item.get("quote_obs_id") or item.get("observation_id") or 0)
-        quote = str(item.get("quote") or "")
-        obs = by_id.get(oid)
-        evidence = []
-        modality = "passive"
-        if obs:
-            quote, ok = verify_quote(quote, obs["screen_text"], obs["caption"])
-            if not ok:
-                return None
-            modality = modality_from_obs(obs)
-            evidence = [{"observation_id": oid, "quote": quote}]
-            ev_texts = [obs["screen_text"]]
-            if injection_drop(text, ev_texts):
-                return None
-        return ClaimDraft(
-            kind=kind,
-            text=text,
-            context=str(item.get("context") or ""),
-            reasoning=str(item.get("reasoning") or ""),
-            modality=modality,
-            episode_id=episode_id,
-            occurred_from=t0,
-            occurred_to=t1,
-            entities=entities,
-            evidence=evidence,
-        )
-
-    async def _merge_or_add(self, draft: ClaimDraft, by_id) -> str:
-        candidates = await self._candidates(draft)
-        for row in candidates:
-            if row["kind"] != draft.kind:
+        if not subject_ok(text):
+            outcome.reject("third_party_subject")
+            return None
+        evidence, cited = [], []
+        for ev in item.get("evidence") or []:
+            if not isinstance(ev, dict):
                 continue
-            rel = await self._relate(draft, row)
-            if rel == "same":
-                await self.store.reinforce_claim(row["id"], occurred_to=draft.occurred_to)
-                await self._link_evidence(row["id"], draft, by_id)
-                conf = compute_confidence([draft.modality], len({day_key(draft.occurred_from)}))
-                await self.store.update_claim_confidence(row["id"], conf)
-                return "reinforce"
-            if rel == "contradicts":
-                if draft.modality == "passive" and row["modality"] in ("engaged", "stated"):
-                    cid = await self.store.create_claim(draft)
-                    await self._link_evidence(cid, draft, by_id)
-                    return "add"
-                new_id = await self.store.create_claim(draft)
-                await self._link_evidence(new_id, draft, by_id)
-                await self.store.invalidate_claim(row["id"], new_id=new_id)
-                return "invalidate"
-            if rel == "refines":
-                cid = await self.store.create_claim(draft, refines_id=row["id"])
-                await self._link_evidence(cid, draft, by_id)
-                return "add"
-        cid = await self.store.create_claim(draft, confidence=compute_confidence([draft.modality], 1))
-        await self._link_evidence(cid, draft, by_id)
-        await self._attach_entities(cid, draft, list(by_id.values()))
-        return "add"
-
-    async def _candidates(self, draft: ClaimDraft):
-        bm25 = await fts_hits(self.store, "claim", draft.text, limit=T.CANDIDATE_LIMIT)
-        dense_ids: list[int] = []
-        try:
-            from ..llm import embed
-
-            qv = (await embed([draft.text]))[0]
-            for rid, vec in await self.store.all_embeddings("claim"):
-                if tk.cosine(qv, vec) >= T.DENSE_HIT_THRESHOLD:
-                    dense_ids.append(rid)
-        except EXPECTED_ERRORS:
-            pass
-        fused = fuse_rankings([bm25, dense_ids], limit=T.CANDIDATE_LIMIT)
-        live = await self.store.live_claims(kind=draft.kind)
-        by_id = {r["id"]: r for r in live}
-        return [by_id[i] for i in fused if i in by_id]
-
-    async def _relate(self, draft: ClaimDraft, existing) -> str:
-        prompt = RELATE_PROMPT.format(
-            new_kind=draft.kind,
-            new_text=draft.text,
-            old_kind=existing["kind"],
-            old_text=existing["text"],
-        )
-        try:
-            data = await complete_json(self.ep, [{"role": "user", "content": prompt}], max_tokens=100)
-            rel = str((data or {}).get("relation") or "unrelated")
-            return rel if rel in ("same", "contradicts", "refines", "unrelated") else "unrelated"
-        except EXPECTED_ERRORS:
-            return "unrelated"
-
-    async def _link_evidence(self, claim_id: int, draft: ClaimDraft, by_id) -> None:
-        supports = 0
-        for ev in draft.evidence:
-            oid = int(ev.get("observation_id") or 0)
-            quote = str(ev.get("quote") or "")
+            try:
+                oid = int(ev.get("observation_id"))
+            except (TypeError, ValueError):
+                continue
             obs = by_id.get(oid)
-            if not obs:
+            if obs is None:
                 continue
-            relation = "supports" if quote else "cooccurs"
-            await self.store.link_evidence(claim_id, oid, relation, quote)
-            if relation == "supports":
-                supports += 1
-                if supports >= T.EVIDENCE_MAX_SUPPORTS:
-                    break
+            quote, ok = verify_evidence(text, str(ev.get("quote") or ""), obs)
+            if ok:
+                evidence.append({"observation_id": oid, "quote": quote})
+                cited.append(obs)
+        if not evidence:
+            outcome.reject("unsupported")
+            return None
+        if injection_drop(text, [o["screen_text"] for o in cited]):
+            outcome.reject("injection")
+            return None
+        engaged = any(o["keys"] or o["clicks"] or o["clipboard"] for o in cited)
+        times = [o["started_at"] for o in cited]
+        return ClaimDraft(
+            kind=kind, text=text, context=str(item.get("context") or "")[:200],
+            modality="engaged" if engaged else "passive", episode_id=episode_id,
+            occurred_from=t0 if kind == "event" else min(times),
+            occurred_to=t1 if kind == "event" else max(o["ended_at"] for o in cited),
+            entities=entities, evidence=evidence,
+        )
 
-    async def _attach_entities(self, claim_id: int, draft: ClaimDraft, obs_rows) -> None:
-        names = set(draft.entities)
-        for obs in obs_rows:
-            names.update(extract_from_text(obs["screen_text"]))
-        for name in names:
-            if not name.strip():
+    async def _mentions(self, claim_id: int, cd: ClaimDraft) -> None:
+        await attach_claim_mentions(self.store, claim_id, cd.text, [e["quote"] for e in cd.evidence], cd.entities)
+
+    # ----------------------------------------------------------- online merge
+
+    async def _candidates(self, cd: ClaimDraft) -> list:
+        from ..retrieval.search import fts_ids
+
+        bm25 = await fts_ids(self.store, "claim", cd.text, limit=T.CANDIDATE_LIMIT * 3)
+        rankings = [bm25]
+        try:
+            qv = (await embed([cd.text]))[0]
+            rankings.append([i for i, _ in await self.store.dense_search("claim", qv, limit=T.CANDIDATE_LIMIT * 3)])
+        except (NotConfigured, *EXPECTED_ERRORS):
+            pass
+        fused = sorted(tk.rrf(rankings, k=T.RRF_K).items(), key=lambda x: -x[1])
+        rows = {r["id"]: r for r in await self.store.get_claims([i for i, _ in fused])}
+        out = [rows[i] for i, _ in fused if i in rows and rows[i]["status"] == "live" and rows[i]["kind"] == cd.kind]
+        return out[: T.RELATE_CANDIDATES]
+
+    async def _relate(self, cd: ClaimDraft, candidates: list) -> dict[int, str]:
+        listing = "\n".join(f"[id={c['id']}] {c['text']}" for c in candidates)
+        prompt = RELATE_PROMPT.format(kind=cd.kind, text=cd.text, candidates=listing)
+        try:
+            data = await complete_json(self.ep, [{"role": "user", "content": prompt}], max_tokens=300)
+        except EXPECTED_ERRORS:
+            return {}
+        rels: dict[int, str] = {}
+        for r in (data or {}).get("relations") or []:
+            try:
+                rid, rel = int(r.get("id")), str(r.get("relation") or "")
+            except (TypeError, ValueError, AttributeError):
                 continue
-            eid = await resolve_entity(self.store, name)
-            await self.store.record_mention(eid, "claim", claim_id)
+            if rel in ("same", "refines", "contradicts", "unrelated"):
+                rels[rid] = rel
+        return rels
+
+    async def _merge(self, cd: ClaimDraft) -> str:
+        """planS2 §6.2: ADD / REINFORCE / INVALIDATE. Never rewrites claim text."""
+        candidates = await self._candidates(cd)
+        rels = await self._relate(cd, candidates) if candidates else {}
+        by_rel = {rel: [c for c in candidates if rels.get(c["id"]) == rel] for rel in ("same", "contradicts", "refines")}
+        if by_rel["same"]:
+            target = by_rel["same"][0]
+            await self.store.reinforce_claim(target["id"], cd)
+            return "reinforced"
+        if by_rel["contradicts"]:
+            old = by_rel["contradicts"][0]
+            if cd.modality == "passive" and old["modality"] in ("engaged", "stated"):
+                cid = await self.store.create_claim(cd)
+                await self.store.flag_claims([cid, old["id"]], "contested")
+                await self._mentions(cid, cd)
+                return "added"
+            cid = await self.store.create_claim(cd, invalidates_id=old["id"])
+            await self.store.invalidate_claim(old["id"], by_id=cid, at=cd.occurred_from)
+            await self._mentions(cid, cd)
+            return "invalidated"
+        refines = by_rel["refines"][0]["id"] if by_rel["refines"] else None
+        cid = await self.store.create_claim(cd, refines_id=refines)
+        await self._mentions(cid, cd)
+        return "added"
+
+
+def dumps(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False)

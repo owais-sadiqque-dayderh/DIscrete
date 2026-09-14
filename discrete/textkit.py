@@ -210,6 +210,40 @@ def parse_json_list(raw: str) -> list:
         return []
 
 
+_DOMAINISH = re.compile(r"^(?:https?://)?(?:[\w-]+\.)+[a-z]{2,}(?:[/:?#].*)?$")
+_FILE_EXT = re.compile(r"\.(?:py|js|ts|tsx|jsx|md|json|ya?ml|txt|csv|pdf|png|jpe?g|svg|ai|psd|fig)$")
+_GENERIC_SUFFIXES = frozenset("font fonts app inc ltd llc".split())
+
+
+def entity_key(name: str) -> str:
+    """Normalized identity key (planS2 §10.4 step 2): web addresses reduce to the
+    registrable domain's label, file extensions and generic suffixes drop, then
+    only alphanumerics remain."""
+    s = norm_key(name).strip(_EDGE + " \"()[]{}")
+    if _DOMAINISH.match(s):
+        try:
+            import tldextract
+
+            label = tldextract.extract(s).domain
+            if label:
+                s = label
+        except Exception:
+            pass
+    s = _FILE_EXT.sub("", s)
+    parts = re.findall(r"[a-z0-9]+", s)
+    while len(parts) > 1 and parts[-1] in _GENERIC_SUFFIXES:
+        parts.pop()
+    return "".join(parts)
+
+
+def contains_phrase(haystack: str, phrase: str) -> bool:
+    """Normalized, word-bounded containment."""
+    p = norm_key(phrase)
+    if not p:
+        return False
+    return re.search(r"(?<![\w])" + re.escape(p) + r"(?![\w])", norm_key(haystack)) is not None
+
+
 def site_from_url(url: str) -> str:
     if not url:
         return ""

@@ -1,8 +1,14 @@
-"""Golden-set evaluation (planS3 §10)."""
+"""Golden-set evaluation (planS3 §10).
+
+A case file is either a list of cases or {snapshot: <store snapshot id>, cases: [...]}.
+A case whose file snapshot differs from the store's is reported as stale
+rather than scored as a regression (insights.md §4).
+"""
 
 from __future__ import annotations
 
 import json
+import statistics
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,127 +33,129 @@ class Case:
 @dataclass
 class CaseResult:
     case: Case
-    hit: bool
+    rank: int | None  # 1-based rank of the first hit containing an expected string
     mode: str
     latency_ms: float
     contaminated: bool = False
+
+    @property
+    def correct(self) -> bool:
+        if self.case.unanswerable:
+            return self.mode in ("thin", "empty")
+        return self.rank is not None and self.rank <= T.EVAL_K
 
 
 @dataclass
 class SuiteResult:
     cases: list[CaseResult] = field(default_factory=list)
     health: dict = field(default_factory=dict)
+    stale: bool = False
+    snapshot: str = ""
 
-    @property
-    def hit_at_k(self) -> float:
-        if not self.cases:
-            return 0.0
-        return sum(1 for c in self.cases if c.hit) / len(self.cases)
-
-    @property
-    def refusal_accuracy(self) -> float:
+    def metrics(self) -> dict:
+        ans = [c for c in self.cases if not c.case.unanswerable]
         unans = [c for c in self.cases if c.case.unanswerable]
-        if not unans:
-            return 1.0
-        return sum(1 for c in unans if c.mode in ("empty", "thin")) / len(unans)
+        by_cat: dict[str, list[bool]] = {}
+        for c in self.cases:
+            by_cat.setdefault(c.case.category, []).append(c.correct)
+        return {
+            "n": len(self.cases),
+            "hit_at_k": round(sum(c.correct for c in ans) / len(ans), 3) if ans else None,
+            "mrr": round(sum(1 / c.rank for c in ans if c.rank) / len(ans), 3) if ans else None,
+            "refusal_accuracy": round(sum(c.correct for c in unans) / len(unans), 3) if unans else None,
+            "grounded_rate_answerable": round(sum(c.mode == "grounded" for c in ans) / len(ans), 3) if ans else None,
+            "contamination": sum(c.contaminated for c in self.cases),
+            "latency_ms_p50": round(statistics.median(c.latency_ms for c in self.cases)) if self.cases else None,
+            "by_category": {k: round(sum(v) / len(v), 3) for k, v in by_cat.items()},
+        }
 
-    def by_category(self) -> dict[str, float]:
-        buckets: dict[str, list[bool]] = {}
-        for cr in self.cases:
-            buckets.setdefault(cr.case.category, []).append(cr.hit)
-        return {k: sum(v) / len(v) for k, v in buckets.items()}
 
-
-def load_cases(path: Path | None = None) -> list[Case]:
-    path = path or golden_dir() / "cases.yaml"
+def load_cases(path: Path) -> tuple[list[Case], str]:
     if not path.exists():
-        return []
+        return [], ""
     raw = yaml.safe_load(path.read_text()) or []
-    out: list[Case] = []
-    for item in raw:
-        out.append(
-            Case(
-                question=str(item["question"]),
-                category=str(item.get("category") or "recall"),
-                expect_any=list(item.get("expect_any") or []),
-                expect_none=list(item.get("expect_none") or []),
-                unanswerable=bool(item.get("unanswerable")),
-            )
+    snapshot = ""
+    if isinstance(raw, dict):
+        snapshot = str(raw.get("snapshot") or "")
+        raw = raw.get("cases") or []
+    cases = [
+        Case(
+            question=str(item["question"]),
+            category=str(item.get("category") or "recall"),
+            expect_any=[str(x) for x in item.get("expect_any") or []],
+            expect_none=[str(x) for x in item.get("expect_none") or []],
+            unanswerable=bool(item.get("unanswerable")),
         )
-    return out
+        for item in raw
+    ]
+    return cases, snapshot
 
 
 async def health_checks(store: Store) -> dict:
-    stats = await store.stats()
-    obs, embeds, outbox = stats["observations"], stats["embeddings"], stats["outbox_pending"]
-    coverage = 1.0 if obs == 0 else min(1.0, embeds / max(obs, 1))
-    claims = await store.live_claims()
-    conf_values = [r["confidence"] for r in claims]
-    top_conf = max((conf_values.count(v) for v in set(conf_values)), default=0)
-    conf_degen = (top_conf / len(conf_values)) if conf_values else 0.0
+    s = await store.stats()
+    confs = await store.q("SELECT ROUND(confidence, 3) c, COUNT(*) n FROM claims WHERE status='live' GROUP BY c")
+    top_share = max((r["n"] for r in confs), default=0) / max(1, s["claims_live"])
     return {
-        "index_coverage_ok": outbox == 0 and coverage >= 0.95,
-        "embedding_coverage": coverage,
-        "outbox_pending": outbox,
-        "confidence_degenerate": conf_degen > 0.5,
-        "observations": obs,
+        "index_coverage": s["index_coverage"],
+        "index_coverage_ok": all(v >= 1.0 for v in s["index_coverage"].values()),
+        "outbox_pending": s["outbox_pending"],
+        "confidence_top_share": round(top_share, 3),
+        "confidence_degenerate": s["claims_live"] >= 10 and top_share > 0.5,
+        "lineage_anomalies": await store.lineage_anomalies(),
+        "episodes_backlog": {k: v for k, v in s["episodes_by_status"].items() if k != "closed"},
     }
 
 
 async def run_case(store: Store, case: Case) -> CaseResult:
     t0 = time.perf_counter()
     result = await retrieve(store, case.question)
-    decision = evaluate(result, intent=result.plan.intent)
+    decision = evaluate(result)
     latency = (time.perf_counter() - t0) * 1000
-    blob = "\n".join(h.body.lower() for h in result.hits)
-    hit = any(exp.lower() in blob for exp in case.expect_any) if case.expect_any else bool(result.hits)
+    rank = None
+    for i, h in enumerate(result.hits, 1):
+        text = h.text.lower()
+        if any(e.lower() in text for e in case.expect_any):
+            rank = i
+            break
+    blob = "\n".join(h.text.lower() for h in result.hits)
     contaminated = any(bad.lower() in blob for bad in case.expect_none)
-    if case.unanswerable:
-        hit = decision.mode in ("empty", "thin")
-    return CaseResult(case=case, hit=hit, mode=decision.mode, latency_ms=latency, contaminated=contaminated)
+    return CaseResult(case=case, rank=rank, mode=decision.mode, latency_ms=latency, contaminated=contaminated)
 
 
-async def run_suite(store: Store, cases: list[Case] | None = None) -> SuiteResult:
-    cases = cases or load_cases()
+async def run_suite(store: Store, path: Path) -> SuiteResult:
+    cases, snapshot = load_cases(path)
+    current = await store.snapshot_id()
     results = [await run_case(store, c) for c in cases]
-    health = await health_checks(store)
-    return SuiteResult(cases=results, health=health)
+    return SuiteResult(cases=results, health=await health_checks(store),
+                       stale=bool(snapshot) and snapshot != current, snapshot=current)
 
 
-def compare(current: SuiteResult, baseline: SuiteResult, *, tolerance: float | None = None) -> dict:
-    tol = tolerance if tolerance is not None else T.EVAL_TOLERANCE
-    delta = current.hit_at_k - baseline.hit_at_k
-    ok = delta >= -tol and current.health.get("index_coverage_ok", True)
-    out = {
-        "ok": ok,
-        "delta_hit_at_k": delta,
-        "current": current.hit_at_k,
-        "baseline": baseline.hit_at_k,
-        "health": current.health,
-        "by_category": current.by_category(),
-    }
-    if len(current.cases) >= T.EVAL_MIN_CASES_FOR_SIG:
-        try:
-            from ranx import Qrels, Run, evaluate as ranx_eval
-
-            qrels = Qrels()
-            run = Run()
-            for i, cr in enumerate(current.cases):
-                qid = str(i)
-                qrels.add_qrel(qid, "0", 1 if cr.hit else 0)
-                run.add_score(qid, "0", 1.0 if cr.hit else 0.0)
-            out["ndcg@8"] = ranx_eval(qrels, run, "ndcg@8")
-        except Exception:
-            pass
-    return out
+def baseline_path(cases_path: Path) -> Path:
+    return cases_path.with_suffix(".baseline.json")
 
 
-def save_baseline(result: SuiteResult, path: Path | None = None) -> None:
-    path = path or golden_dir() / "baseline.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {"hit_at_k": result.hit_at_k, "refusal_accuracy": result.refusal_accuracy, "health": result.health},
-            indent=2,
-        )
-    )
+def save_baseline(result: SuiteResult, cases_path: Path) -> None:
+    baseline_path(cases_path).write_text(json.dumps({"snapshot": result.snapshot, **result.metrics()}, indent=2))
+
+
+def compare(result: SuiteResult, cases_path: Path) -> dict:
+    """Regression = a tracked metric dropped by more than EVAL_TOLERANCE."""
+    path = baseline_path(cases_path)
+    if not path.exists():
+        return {"baseline": None, "regressions": []}
+    base = json.loads(path.read_text())
+    cur = result.metrics()
+    regressions = []
+    for m in ("hit_at_k", "mrr", "refusal_accuracy"):
+        if base.get(m) is not None and cur.get(m) is not None and cur[m] < base[m] - T.EVAL_TOLERANCE:
+            regressions.append(f"{m}: {base[m]} → {cur[m]}")
+    if len(result.cases) < T.EVAL_MIN_CASES_FOR_SIG:
+        note = f"n={len(result.cases)} < {T.EVAL_MIN_CASES_FOR_SIG}: trend only, not significance-gated"
+    else:
+        note = ""
+    return {"baseline": base, "regressions": regressions, "note": note,
+            "baseline_snapshot_matches": base.get("snapshot") == result.snapshot}
+
+
+def default_cases() -> Path:
+    return golden_dir() / "cases.yaml"

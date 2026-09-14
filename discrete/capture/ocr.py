@@ -1,22 +1,36 @@
-"""Apple Vision OCR fallback when AX text is sparse."""
+"""Apple Vision OCR fallback when AX text is sparse (planS1 §6.1)."""
 
 from __future__ import annotations
 
+import io
 import logging
 
 log = logging.getLogger("discrete.capture.ocr")
+
+# VNRequestTextRecognitionLevel: Accurate = 0, Fast = 1 (insights.md §7.12).
+_ACCURATE = 0
+
+
+def ocr_image(img) -> str:
+    """OCR a PIL image; returns lines in Vision's reading order."""
+    if img is None:
+        return ""
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, "JPEG", quality=90)
+    return ocr_jpeg(buf.getvalue())
 
 
 def ocr_jpeg(jpeg: bytes) -> str:
     if not jpeg:
         return ""
     try:
-        from Vision import VNRecognizeTextRequest, VNImageRequestHandler
         from Foundation import NSData
+        from Vision import VNImageRequestHandler, VNRecognizeTextRequest
 
         handler = VNImageRequestHandler.alloc().initWithData_options_(NSData.dataWithBytes_length_(jpeg, len(jpeg)), None)
         req = VNRecognizeTextRequest.alloc().init()
-        req.setRecognitionLevel_(1)  # accurate
+        req.setRecognitionLevel_(_ACCURATE)
+        req.setUsesLanguageCorrection_(True)
         ok, err = handler.performRequests_error_([req], None)
         if not ok:
             log.debug("OCR failed: %s", err)

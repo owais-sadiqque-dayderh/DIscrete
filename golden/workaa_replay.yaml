@@ -1,0 +1,44 @@
+# Cases against the store built by `discrete replay-workaa` from the WorkAA
+# prototype session (2026-09-12 21:08-22:18 UTC). Hand-written from the known
+# session content; regenerate the baseline, never overwrite cases in place.
+snapshot: obs69-max69-claims31
+cases:
+  - question: "what design tools have I used"
+    category: aggregate
+    expect_any: ["Illustrator"]
+  - question: "which website was I browsing for logo inspiration"
+    category: recall
+    expect_any: ["logosystem"]
+  - question: "what gradient tool did I look at"
+    category: recall
+    expect_any: ["Grainient", "gradient"]
+  - question: "did I use an ASCII art generator"
+    category: recall
+    expect_any: ["ASCII"]
+  - question: "how did I try to identify a font"
+    category: recall
+    expect_any: ["WhatTheFont"]
+  - question: "which font sites did I visit"
+    category: aggregate
+    expect_any: ["MyFonts", "Adobe Fonts", "dafont"]
+  - question: "what was I working on in Adobe Illustrator"
+    category: recall
+    expect_any: ["logo", "artboard", "Artboard"]
+  - question: "what logos did I save on logosystem"
+    category: recall
+    expect_any: ["saved", "Dooran", "Lore"]
+  - question: "what did I do on September 13"
+    category: temporal
+    expect_any: ["logo"]
+  - question: "what flight did I book"
+    category: unanswerable
+    unanswerable: true
+  - question: "what is my salary"
+    category: unanswerable
+    unanswerable: true
+  - question: "which python library was I debugging"
+    category: unanswerable
+    unanswerable: true
+  - question: "what did I discuss with my manager on Zoom"
+    category: unanswerable
+    unanswerable: true

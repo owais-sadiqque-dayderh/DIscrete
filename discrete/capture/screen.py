@@ -1,31 +1,33 @@
-"""Screen observer — debounced before/after capture with AX-first text."""
+"""Screen observer: debounced before/after capture of the focused window (planS1 §4-6).
+
+Interaction counting happens on the event loop thread inside `arm()`, so the
+counts always describe exactly the pending capture's interval (insights.md §7.14).
+"""
 
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
-import os
 import time
-from pathlib import Path
 
 import imagehash
-import mss
-import numpy as np
 from PIL import Image
 
 from .. import textkit as tk
 from ..config import T, caption_endpoint, frames_dir
-from ..llm import EXPECTED_ERRORS, LLMError, complete_json, image_part
+from ..llm import EXPECTED_ERRORS, complete_json, image_part
 from ..store import ObservationDraft
 from . import accessibility as ax
 from . import ocr
 from .browser import browser_url
+from .frames import FrameGrabber, downscale, is_blank
 from .prompts import CAPTURE_PROMPT
 from .session import SessionTracker
 from .suppress import classify_origin, is_suppressed
 
 log = logging.getLogger("discrete.capture.screen")
+
+_COUNTED = {"click": "clicks", "scroll": "scrolls", "keyboard": "keys", "clipboard": "clipboard"}
 
 
 class ScreenObserver:
@@ -34,57 +36,40 @@ class ScreenObserver:
         self.session = session or SessionTracker()
         self.dir = frames_dir()
         self.ep = caption_endpoint()
+        self.grabber = FrameGrabber()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._listeners: list = []
         self._pending: dict | None = None
         self._timer: asyncio.TimerHandle | None = None
-        self._before_ctx: ax.WindowContext | None = None
-        self._before_path: str | None = None
-        self._last_event_ts = 0.0
-        self._stats = {"captured": 0, "dropped_failed": 0, "dropped_useless": 0, "degraded": 0, "suppressed": 0, "aborted_drift": 0}
-        self._warned_blank = False
         self._capture_lock = asyncio.Lock()
-        self._latest_frame = None
         self._frame_task: asyncio.Task | None = None
-        self._interaction = {"keys": 0, "clicks": 0, "scrolls": 0, "clipboard": 0}
-        self._last_phash: str = ""
+        self._latest: tuple[Image.Image, ax.WindowContext] | None = None
+        self._last_event_mono = time.monotonic()
+        self._last_kept: dict[tuple, str] = {}  # (app, title, url) -> phash of last kept frame
         self._last_full_capture = 0.0
-        self._last_screen_text = ""
+        self._last_full_text = ""
+        self._warned_blank = False
+        self.away = False
+        self.stats = {k: 0 for k in ("captured", "light", "frame_dup", "dropped_failed", "dropped_useless",
+                                     "degraded", "suppressed", "aborted_drift", "self")}
+
+    # ------------------------------------------------------------ lifecycle
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
         ax.warn_permissions()
         from pynput import keyboard, mouse
 
-        def bump(kind: str) -> None:
-            if kind == "keyboard":
-                self._interaction["keys"] += 1
-            elif kind == "mouse":
-                self._interaction["clicks"] += 1
-            elif kind == "scroll":
-                self._interaction["scrolls"] += 1
-            elif kind == "clipboard":
-                self._interaction["clipboard"] += 1
-
-        def on_mouse(*_a, **_k):
-            bump("mouse")
-            self._schedule("mouse")
-
-        def on_scroll(*_a, **_k):
-            bump("scroll")
-            self._schedule("mouse")
-
-        def on_key(*_a, **_k):
-            if T.KEYBOARD_CAPTURE:
-                bump("keyboard")
-                self._schedule("keyboard")
-
-        ml = mouse.Listener(on_move=lambda x, y: on_mouse(), on_click=lambda x, y, b, p: on_mouse() if p else None, on_scroll=lambda x, y, dx, dy: on_scroll())
+        # Mouse *moves* are neither triggers nor interaction (insights.md §7.14).
+        ml = mouse.Listener(
+            on_click=lambda x, y, b, pressed: self.trigger("click") if pressed else None,
+            on_scroll=lambda x, y, dx, dy: self.trigger("scroll"),
+        )
         ml.daemon = True
         ml.start()
         self._listeners.append(ml)
         if T.KEYBOARD_CAPTURE:
-            kl = keyboard.Listener(on_press=lambda k: on_key())
+            kl = keyboard.Listener(on_press=lambda k: self.trigger("keyboard"))
             kl.daemon = True
             kl.start()
             self._listeners.append(kl)
@@ -94,260 +79,203 @@ class ScreenObserver:
     async def stop(self) -> None:
         if self._frame_task:
             self._frame_task.cancel()
+            await asyncio.gather(self._frame_task, return_exceptions=True)
+        for listener in self._listeners:
             try:
-                await self._frame_task
-            except asyncio.CancelledError:
-                pass
-        for l in self._listeners:
-            try:
-                l.stop()
+                listener.stop()
             except Exception:
                 pass
         self._listeners.clear()
         if self._timer:
             self._timer.cancel()
+        self.grabber.close()
 
-    @property
-    def stats(self) -> dict:
-        return dict(self._stats)
+    # -------------------------------------------------------------- triggers
 
-    def _schedule(self, kind: str) -> None:
+    def trigger(self, kind: str) -> None:
+        """Thread-safe entry point for every trigger source."""
         if self._loop:
-            self._loop.call_soon_threadsafe(self._arm, kind)
+            self._loop.call_soon_threadsafe(self.arm, kind)
 
-    def _arm(self, kind: str) -> None:
-        now = time.monotonic()
-        if now - self._last_event_ts > T.SESSION_GAP_S:
+    def arm(self, kind: str) -> None:
+        mono = time.monotonic()
+        if mono - self._last_event_mono > T.SESSION_GAP_S:
             self.session.new_session()
-        self._last_event_ts = now
+        self._last_event_mono = mono
         if is_suppressed():
-            self._stats["suppressed"] += 1
+            self.stats["suppressed"] += 1
             return
-        delay = T.KEY_IDLE_DEBOUNCE_S if kind == "keyboard" else T.MOUSE_DEBOUNCE_S
         if self._pending is None:
-            self._before_ctx = ax.window_context()
-            self._before_path = self._save_frame(self._latest_frame, "before")
-            self._pending = {"kind": kind, "started": time.time(), "interaction": dict(self._interaction)}
-        else:
-            self._pending["kind"] = "keyboard" if kind == "keyboard" else self._pending["kind"]
+            before = self._latest
+            self._pending = {
+                "kind": kind,
+                "started": time.time(),
+                "before_img": before[0] if before else None,
+                "before_ctx": before[1] if before else ax.window_context(),
+                "counts": {"keys": 0, "clicks": 0, "scrolls": 0, "clipboard": 0},
+            }
+        elif kind == "keyboard":
+            self._pending["kind"] = "keyboard"
+        field = _COUNTED.get(kind)
+        if field:
+            self._pending["counts"][field] += 1
+        delay = T.KEY_IDLE_DEBOUNCE_S if self._pending["kind"] == "keyboard" else T.MOUSE_DEBOUNCE_S
         if self._timer:
             self._timer.cancel()
         self._timer = self._loop.call_later(delay, lambda: asyncio.create_task(self._flush()))
 
-    async def _flush(self) -> None:
-        async with self._capture_lock:
-            pending = self._pending
-            self._pending = None
-            if not pending:
-                return
-            after_ctx = ax.window_context()
-            if self._before_ctx and after_ctx.app and self._before_ctx.app and after_ctx.app != self._before_ctx.app:
-                self._stats["aborted_drift"] += 1
-                return
-            after_path = self._save_frame(self._latest_frame, "after")
-            paths = [p for p in (self._before_path, after_path) if p]
-            await self._process_capture(pending, after_ctx, paths)
-            self._interaction = {"keys": 0, "clicks": 0, "scrolls": 0, "clipboard": 0}
+    # ---------------------------------------------------------------- frames
 
     async def _frame_loop(self) -> None:
-        with mss.mss() as sct:
-            while True:
-                try:
-                    shot = sct.grab(sct.monitors[1])
-                    img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-                    if img.width > T.FRAME_MAX_WIDTH:
-                        h = int(img.height * T.FRAME_MAX_WIDTH / img.width)
-                        img = img.resize((T.FRAME_MAX_WIDTH, h), Image.Resampling.LANCZOS)
-                    self._latest_frame = img
-                except Exception as exc:
-                    log.debug("frame loop: %s", exc)
-                await asyncio.sleep(0.2)
+        while True:
+            try:
+                ctx = await asyncio.to_thread(ax.window_context)
+                img = await asyncio.to_thread(self.grabber.grab, ctx.bounds, max_width=T.FRAME_MAX_WIDTH)
+                if img is not None:
+                    self._latest = (img, ctx)
+                    if not self._warned_blank and is_blank(img):
+                        self._warned_blank = True
+                        log.warning("near-flat frame — check Screen Recording permission")
+            except Exception as exc:
+                log.debug("frame loop: %s", exc)
+            await asyncio.sleep(T.FRAME_CACHE_S)
 
-    def _save_frame(self, img: Image.Image | None, tag: str) -> str | None:
+    def _save(self, img: Image.Image | None, tag: str) -> str:
         if img is None:
-            return None
-        arr = np.array(img.convert("L"))
-        if arr.std() < 2.0 and not self._warned_blank:
-            self._warned_blank = True
-            log.warning("near-flat frame — check Screen Recording permission")
-        ts = int(time.time() * 1000)
-        path = self.dir / f"{ts}_{tag}.jpg"
+            return ""
+        path = self.dir / f"{int(time.time() * 1000)}_{tag}.jpg"
         img.save(path, "JPEG", quality=T.FRAME_JPEG_QUALITY)
         return str(path)
 
-    async def heartbeat_tick(self) -> None:
-        if is_suppressed():
+    # ----------------------------------------------------------------- flush
+
+    async def _flush(self) -> None:
+        async with self._capture_lock:
+            pending, self._pending = self._pending, None
+            if not pending:
+                return
+            ctx = await asyncio.to_thread(ax.window_context)
+            before_ctx: ax.WindowContext = pending["before_ctx"]
+            if before_ctx.pid and ctx.pid and before_ctx.pid != ctx.pid:
+                # Focus drift: a pair spanning two apps is not one moment (planS1 §5).
+                self.stats["aborted_drift"] += 1
+                self.arm("app")
+                return
+            after = await asyncio.to_thread(self.grabber.grab, ctx.bounds, max_width=T.FRAME_MAX_WIDTH)
+            await self._capture(pending, ctx, pending["before_img"], after)
+
+    async def _capture(self, pending: dict, ctx: ax.WindowContext, before, after, *, heartbeat: bool = False) -> None:
+        url = await asyncio.to_thread(browser_url, ctx.app) or ctx.url
+        counts = pending["counts"]
+        started, ended = pending["started"], time.time()
+        phash = str(imagehash.phash(after)) if after is not None else ""
+        sig = (ctx.app, ctx.window_title, url)
+        prev = self._last_kept.get(sig)
+        if phash and prev and imagehash.hex_to_hash(phash) - imagehash.hex_to_hash(prev) <= T.FRAME_PHASH_MAX_DIST:
+            self.stats["frame_dup"] += 1
+            await self.queue.put(ObservationDraft(
+                source="screen", event_kind=pending["kind"], session_id=self.session.session_id,
+                started_at=started, ended_at=ended, app=ctx.app, bundle_id=ctx.bundle_id,
+                window_title=ctx.window_title, url=url, frame_duplicate=True, **counts,
+            ))
             return
-        ctx = ax.window_context()
-        screen_text = ax.read_screen_text(max_nodes=T.AX_WALK_MAX_NODES, timeout_ms=T.AX_WALK_TIMEOUT_MS)
-        text_change = 1.0 - tk.jaccard(tk.trigrams(screen_text), tk.trigrams(self._last_screen_text))
+        self._last_kept[sig] = phash
+
+        screen_text, text_source = await asyncio.to_thread(self._screen_text, ctx, after)
+        origin = classify_origin(ctx.app, ctx.window_title, screen_text)
+        base = dict(
+            origin=origin, event_kind=pending["kind"], session_id=self.session.session_id,
+            started_at=started, ended_at=ended, app=ctx.app, bundle_id=ctx.bundle_id,
+            window_title=ctx.window_title, url=url, site=tk.site_from_url(url),
+            screen_text=screen_text, text_source=text_source, frame_phash=phash, **counts,
+        )
+        light_caption = f"{ctx.app}: {ctx.window_title}".strip(": ")
+        if origin != "user":
+            # The system's own output is stored for audit only; no model call.
+            self.stats["self"] += 1
+            await self.queue.put(ObservationDraft(source="screen", caption=light_caption, **base))
+            return
+
+        text_change = 1.0 - tk.jaccard(tk.trigrams(screen_text), tk.trigrams(self._last_full_text))
         since_full = time.time() - self._last_full_capture
-        force_full = (
-            text_change >= T.HEARTBEAT_TEXT_CHANGE and since_full >= T.HEARTBEAT_MIN_GAP_S
-        ) or since_full >= T.HEARTBEAT_MAX_GAP_S
-        if force_full:
-            self._schedule("heartbeat")
+        if heartbeat and not (
+            (text_change >= T.HEARTBEAT_TEXT_CHANGE and since_full >= T.HEARTBEAT_MIN_GAP_S)
+            or since_full >= T.HEARTBEAT_MAX_GAP_S
+        ):
+            self.stats["light"] += 1
+            await self.queue.put(ObservationDraft(source="heartbeat", caption=light_caption, **base))
             return
-        if screen_text and screen_text != self._last_screen_text:
-            draft = ObservationDraft(
-                source="heartbeat",
-                origin=classify_origin(ctx.app, screen_text),
-                event_kind="heartbeat",
-                session_id=self.session.session_id,
-                started_at=time.time(),
-                ended_at=time.time(),
-                app=ctx.app,
-                bundle_id=ctx.bundle_id,
-                window_title=ctx.window_title,
-                url=self._resolve_url(ctx),
-                site=tk.site_from_url(self._resolve_url(ctx)),
-                screen_text=screen_text,
-                text_source="ax",
-                caption=f"{ctx.app}: {ctx.window_title}".strip(": "),
-            )
-            await self.queue.put(draft)
-        self._last_screen_text = screen_text
 
-    def _resolve_url(self, ctx: ax.WindowContext) -> str:
-        return browser_url(ctx.app) or ctx.url or ""
-
-    async def _process_capture(self, pending: dict, ctx: ax.WindowContext, paths: list[str]) -> None:
-        ctx_url = self._resolve_url(ctx)
-        if ctx_url:
-            ctx = ax.WindowContext(
-                app=ctx.app,
-                bundle_id=ctx.bundle_id,
-                window_title=ctx.window_title,
-                url=ctx_url,
-                pid=ctx.pid,
-            )
-        started = pending["started"]
-        ended = time.time()
-        screen_text = ax.read_screen_text(max_nodes=T.AX_WALK_MAX_NODES, timeout_ms=T.AX_WALK_TIMEOUT_MS)
-        text_source = "ax"
-        after_jpeg = b""
-        if paths:
-            with open(paths[-1], "rb") as f:
-                after_jpeg = f.read()
-        app_l = (ctx.app or "").lower()
-        if len(screen_text) < T.AX_TEXT_MIN_CHARS or any(c in app_l for c in T.CANVAS_APPS):
-            ocr_text = ocr.ocr_jpeg(after_jpeg)
-            if ocr_text:
-                screen_text = tk.truncate(f"{screen_text}\n{ocr_text}".strip(), T.SCREEN_TEXT_MAX_CHARS)
-                text_source = "ax+ocr" if text_source == "ax" else "ocr"
-        screen_text = tk.truncate(screen_text, T.SCREEN_TEXT_MAX_CHARS)
-        phash = ""
-        if after_jpeg:
-            try:
-                phash = str(imagehash.phash(Image.open(io.BytesIO(after_jpeg))))
-                if self._last_phash and phash:
-                    dist = imagehash.hex_to_hash(phash) - imagehash.hex_to_hash(self._last_phash)
-                    if dist <= T.FRAME_PHASH_MAX_DIST and ctx.app == (self._before_ctx.app if self._before_ctx else ctx.app):
-                        log.debug("phash duplicate, skipping VLM")
-                        draft = self._light_draft(pending, ctx, screen_text, text_source, phash, paths, started, ended)
-                        await self.queue.put(draft)
-                        return
-                self._last_phash = phash
-            except Exception:
-                pass
-        inter = pending.get("interaction", {})
-        vlm = await self._vlm(paths, ctx, screen_text, inter)
+        after_path = self._save(after, "after")
+        vlm = await self._vlm([before, after], ctx, url, screen_text, counts)
+        self._last_full_capture = time.time()
+        self._last_full_text = screen_text
         if vlm is None:
-            self._stats["degraded"] += 1
-            draft = self._light_draft(pending, ctx, screen_text, text_source, phash, paths, started, ended)
-            await self.queue.put(draft)
-            return
-        if not vlm.get("useful", True):
-            self._stats["dropped_useless"] += 1
+            self.stats["degraded"] += 1
+            await self.queue.put(ObservationDraft(source="degraded", caption=light_caption, frame_path=after_path, **base))
             return
         caption = str(vlm.get("caption") or "").strip()
-        if len(screen_text) < 40 and len(caption) < 5:
-            self._stats["dropped_useless"] += 1
+        if not vlm.get("useful", True) or (len(screen_text) < 40 and len(caption) < 5):
+            self.stats["dropped_useless"] += 1
             return
-        entities = [str(e) for e in (vlm.get("entities") or []) if str(e).strip()]
-        origin = classify_origin(ctx.app, screen_text)
-        draft = ObservationDraft(
-            source="screen",
-            origin=origin,
-            event_kind=pending["kind"],
-            session_id=self.session.session_id,
-            started_at=started,
-            ended_at=ended,
-            app=ctx.app,
-            bundle_id=ctx.bundle_id,
-            window_title=ctx.window_title,
-            url=ctx.url,
-            site=tk.site_from_url(ctx.url),
-            screen_text=screen_text,
-            text_source=text_source,
-            caption=caption,
-            entities=entities,
-            keys=inter.get("keys", 0),
-            clicks=inter.get("clicks", 0),
-            scrolls=inter.get("scrolls", 0),
-            clipboard=inter.get("clipboard", 0),
-            frame_phash=phash,
-            frame_path=paths[-1] if paths else "",
-        )
-        self._stats["captured"] += 1
-        self._last_full_capture = time.time()
-        self._last_screen_text = screen_text
-        await self.queue.put(draft)
+        self.stats["captured"] += 1
+        await self.queue.put(ObservationDraft(
+            source="screen", caption=caption or light_caption,
+            entities=[str(e).strip() for e in (vlm.get("entities") or []) if str(e).strip()],
+            frame_path=after_path, **base,
+        ))
 
-    def _light_draft(self, pending, ctx, screen_text, text_source, phash, paths, started, ended) -> ObservationDraft:
-        url = self._resolve_url(ctx)
-        caption = f"{ctx.app}: {ctx.window_title}".strip(": ")
-        return ObservationDraft(
-            source="screen",
-            origin=classify_origin(ctx.app, screen_text),
-            event_kind=pending["kind"],
-            session_id=self.session.session_id,
-            started_at=started,
-            ended_at=ended,
-            app=ctx.app,
-            bundle_id=ctx.bundle_id,
-            window_title=ctx.window_title,
-            url=url,
-            site=tk.site_from_url(url),
-            screen_text=screen_text,
-            text_source=text_source,
-            caption=caption,
-            frame_phash=phash,
-            frame_path=paths[-1] if paths else "",
-            keys=pending.get("interaction", {}).get("keys", 0),
-            clicks=pending.get("interaction", {}).get("clicks", 0),
-            scrolls=pending.get("interaction", {}).get("scrolls", 0),
-            clipboard=pending.get("interaction", {}).get("clipboard", 0),
-        )
+    def _screen_text(self, ctx: ax.WindowContext, after) -> tuple[str, str]:
+        text = ax.read_screen_text(ctx.pid, max_nodes=T.AX_WALK_MAX_NODES, timeout_ms=T.AX_WALK_TIMEOUT_MS,
+                                   max_chars=T.SCREEN_TEXT_MAX_CHARS)
+        source = "ax" if text else ""
+        canvas = any(c in (ctx.app or "").lower() for c in T.CANVAS_APPS)
+        if len(text) < T.AX_TEXT_MIN_CHARS or canvas:
+            ocr_text = ocr.ocr_image(after)
+            if ocr_text:
+                text = f"{text}\n{ocr_text}".strip()
+                source = "ax+ocr" if source else "ocr"
+        return tk.truncate(text, T.SCREEN_TEXT_MAX_CHARS), source
 
-    async def _vlm(self, paths: list[str], ctx: ax.WindowContext, screen_text: str, inter: dict) -> dict | None:
+    async def _vlm(self, frames: list, ctx: ax.WindowContext, url: str, screen_text: str, counts: dict) -> dict | None:
         if not self.ep.configured:
             return None
-        imgs: list[dict] = []
-        for p in paths[-2:]:
-            try:
-                with open(p, "rb") as f:
-                    imgs.append(image_part(f.read()))
-            except OSError:
-                pass
+        imgs = [image_part(_jpeg(downscale(f, T.VLM_MAX_WIDTH)), detail=T.VLM_IMAGE_DETAIL) for f in frames if f is not None]
         prompt = CAPTURE_PROMPT.format(
-            app=ctx.app,
-            window_title=ctx.window_title,
-            url=ctx.url,
-            screen_text=tk.truncate(screen_text, 4000),
-            keys=inter.get("keys", 0),
-            clicks=inter.get("clicks", 0),
-            scrolls=inter.get("scrolls", 0),
-            clipboard=inter.get("clipboard", 0),
+            app=ctx.app, window_title=ctx.window_title, url=url,
+            screen_text=tk.truncate(screen_text, 4000), **counts,
         )
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}, *imgs]}]
         for attempt in range(T.CAPTURE_MAX_RETRIES):
             try:
-                data = await complete_json(self.ep, messages, max_tokens=800)
+                data = await complete_json(self.ep, messages, max_tokens=400)
                 if isinstance(data, dict):
                     return data
             except EXPECTED_ERRORS as exc:
                 log.warning("VLM attempt %s failed: %s", attempt + 1, exc)
-                await asyncio.sleep(T.CAPTURE_RETRY_BASE_S * (2**attempt))
-        self._stats["dropped_failed"] += 1
+            await asyncio.sleep(T.CAPTURE_RETRY_BASE_S * (2**attempt))
+        self.stats["dropped_failed"] += 1
         return None
+
+    # ------------------------------------------------------------- heartbeat
+
+    async def heartbeat_tick(self) -> None:
+        """Passive-session coverage (planS1 §6.4). Skipped while away or mid-capture."""
+        if self.away or is_suppressed() or self._pending is not None or self._capture_lock.locked():
+            return
+        async with self._capture_lock:
+            ctx = await asyncio.to_thread(ax.window_context)
+            img = await asyncio.to_thread(self.grabber.grab, ctx.bounds, max_width=T.FRAME_MAX_WIDTH)
+            if img is None:
+                return
+            pending = {"kind": "heartbeat", "started": time.time(),
+                       "counts": {"keys": 0, "clicks": 0, "scrolls": 0, "clipboard": 0}}
+            await self._capture(pending, ctx, None, img, heartbeat=True)
+
+
+def _jpeg(img: Image.Image) -> bytes:
+    import io
+
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, "JPEG", quality=T.FRAME_JPEG_QUALITY)
+    return buf.getvalue()

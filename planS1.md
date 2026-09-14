@@ -44,6 +44,20 @@ Two scope decisions by the user, applied before any code was written:
 | 2.1 | §6.2, §11, §12, §13 | **No locally hosted models.** The VLM, and every other model call, goes through an OpenAI-compatible API (OpenRouter or similar). The Rev 1 "local VLM by default / cloud by opt-in" policy (`VLM_ALLOW_CLOUD`) is removed. Rev 1 row 1.12's on-device transcription is replaced by an API speech-to-text model, if audio is adopted. | User decision: running local models is not affordable for this product. Apple Vision OCR is **retained**. It is an operating-system API with no model to download or host, and it costs nothing per call. |
 | 2.2 | §1, §6, §8, §9, §11 | **The privacy tier is removed from Stage 1.** This covers the exclusion lists, secret scrubbing, PII detection, the secure-field check, the `sensitive` VLM field, and the related tunables. It supersedes Rev 1 row 1.7. | User decision: privacy is out of focus for now. Retained, because it is correctness rather than privacy: §9, which keeps the system from modelling itself, and §10, which treats screen text as untrusted input (memory-poisoning defence). |
 
+### Rev 3 — 2026-09-15 (first live run of the v1 build)
+
+Evidence: the first `discrete run` session (37 frames → 17 observations, stored in
+`~/.cache/discrete`), a code review of the v1 build, and a re-run after fixes.
+Implementation bugs from the same review are in `insights.md` §7.11–7.26.
+
+| # | Section | Change | Why (evidence) |
+|---|---|---|---|
+| 3.1 | §2.2, §2.3 | **App, window and title changes are detected by a poller** (`POLL_S` = 0.5 s) over the Quartz window list, not by `NSWorkspace` or AX notifications. | Those notifications are delivered on a Cocoa run loop. The asyncio daemon runs none, and in v1 they never fired. One poll costs about 1 ms. |
+| 3.2 | §6.1 | **Window identity comes from the Quartz window list**: app, pid and frame, plus the title when AX is not granted. AX adds the title, document/URL and the text walk only when the process is trusted. | Identity must not depend on one permission. In v1 a failed AX import blanked `app`, `window_title`, `url` and `site` on 17/17 rows. `NSWorkspace.frontmostApplication` also goes stale without a run loop. |
+| 3.3 | §6.2 | **VLM image budget:** frames sent to the VLM are downscaled to `VLM_MAX_WIDTH` (default **1024**) with `VLM_IMAGE_DETAIL` = `low`. The harness may raise it if caption specificity suffers. | The first run used ~305K tokens in ~15 minutes with two full-screen images per call. On-screen text reaches the model through AX/OCR, so the images only need to carry layout and change. |
+| 3.4 | §9 | **Self-observation is also detected by window title** (`SELF_WINDOW_PATTERNS`, default `bin/discrete`, `discrete run`). Agent-origin captures are stored for audit with no VLM call, and are excluded from Stage 2 and 3. | Observations 1, 2 and 5 of the first run were the daemon's own terminal log, summarized as user activity. The terminal is an ordinary app, so `SELF_APPS` (app names) cannot catch it. |
+| 3.5 | §5 | **`doctor` verifies Screen Recording by grabbing a frame**, not only through `CGPreflightScreenCaptureAccess`. | The preflight reported "missing" for a terminal-launched Python whose captures worked. |
+
 ---
 
 ## 1. Purpose and scope
@@ -92,16 +106,17 @@ and key presses. Keyboard arming can be switched off (`KEYBOARD_CAPTURE`,
 default **on**). Key *contents* are never recorded — only counts (§8
 `interaction`).
 
-**2.2 App activation.** The OS notification for "a different application
-became frontmost" (`NSWorkspace.didActivateApplicationNotification`) arms a
-capture immediately. No polling.
+**2.2 App activation.** `[Rev 3]` A poller reads the frontmost normal-layer
+window from the Quartz window list every `POLL_S` (default **0.5 s**). A change
+of owning process arms an `app_switch` capture. (Rev 1 specified the
+`NSWorkspace` activation notification. It needs a Cocoa run loop, which the
+daemon does not run, so it never fired.)
 
-**2.3 Focused-window and title change.** An AX observer on the frontmost
-application listens for focused-window change and window-title change
-(`kAXFocusedWindowChangedNotification`, `kAXTitleChangedNotification`). This
-catches passive context switches with no input at all — a new video
-autoplaying, a new tab, a document switched by shortcut — and it catches them
-instantly. The observer is re-attached whenever the frontmost app changes.
+**2.3 Focused-window and title change.** `[Rev 3]` The same poller arms a
+`window_change` capture when the front window's title changes within the same
+process. This catches passive context switches with no input at all (a new
+video autoplaying, a new tab, a document switched by shortcut) within half a
+second. It replaces the Rev 1 AX observers, for the same run-loop reason.
 
 **2.4 Typing pause.** A burst of key presses followed by
 `KEY_IDLE_DEBOUNCE_S` of silence arms a capture. This is the moment the text
@@ -277,6 +292,10 @@ configured through `CAPTION_LM_*`. No model is hosted locally. The model is
 chosen by the Stage 3 evaluation harness (§13, open item 3), by caption
 specificity and entity precision per unit cost, not by assertion.
 
+**Image budget** `[Rev 3]`: images are downscaled to `VLM_MAX_WIDTH` (default
+**1024 px**) and sent at `VLM_IMAGE_DETAIL = low`. Text reaches the model as
+`screen_text`, so the images only need to carry layout and change.
+
 ### 6.3 Ground-truth precedence and the URL source  `[Rev 1]`
 
 - `app` and `window_title` come **only** from AX. The model never writes them.
@@ -397,6 +416,13 @@ keeps only the self-modelling rules, which are about correctness, not privacy.
   text the completion feature typed in the last ~3 minutes. `agent` rows are
   excluded from every later stage.
 
+`[Rev 3]` **Self-window detection.** A capture whose window title matches
+`SELF_WINDOW_PATTERNS` (default `bin/discrete`, `discrete run`) is
+`origin = agent`, as is one whose app is in `SELF_APPS`. Agent-origin captures
+are stored for audit without a VLM call. Stage 2 never drafts from them, and
+Stage 3 never returns them. A terminal showing the daemon's own log is an
+ordinary app, and only its title identifies it.
+
 ---
 
 ## 10. Screen text is untrusted input  `[Rev 1 — new section]`
@@ -491,6 +517,17 @@ text:
 4. **Browser coverage of the URL source.** Scripting support must be verified
    for each browser the user actually runs (Arc first). Browsers without it
    fall back to a URL-reporting extension.
+5. `[Rev 4]` **Other agents' output on screen.** A coding agent's transcript
+   (Conductor, Cursor, a Claude chat) is not the user's own work, but §9 only
+   recognises DIscrete's own output. The live run turned the agent's
+   narration into claims like "the user is improving OCR accuracy"
+   (`insights.md` §7.28).
+   - **Proposed:** a third origin, `agent_view`, for known agent-chat
+     windows, detected by app plus pane structure. These observations are
+     kept and searchable, but excluded from claim drafting, except for the
+     user's own typed prompts, which are high-value intent.
+   - **Until then:** users can list such windows in `SELF_APPS` or
+     `SELF_WINDOW_PATTERNS`.
 
 ---
 

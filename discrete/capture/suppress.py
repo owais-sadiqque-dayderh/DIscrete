@@ -1,22 +1,37 @@
-"""Prevent the system from modelling its own output."""
+"""Prevent the system from modelling its own output (planS1 §9)."""
 
 from __future__ import annotations
 
 import time
 
+from .. import textkit as tk
 from ..config import T
 
 _suppressed_until = 0.0
+_holds = 0
 _recent_agent_text: list[str] = []
 
 
 def suppress(seconds: float = 3.0) -> None:
     global _suppressed_until
-    _suppressed_until = time.monotonic() + seconds
+    _suppressed_until = max(_suppressed_until, time.monotonic() + seconds)
+
+
+def hold() -> None:
+    """Suppress capture until the matching release(); Bubble holds it for a whole run."""
+    global _holds
+    _holds += 1
+
+
+def release(tail_s: float = 2.0) -> None:
+    """End a hold; keep suppressing briefly so the app's reaction to our typing is not captured."""
+    global _holds
+    _holds = max(0, _holds - 1)
+    suppress(tail_s)
 
 
 def is_suppressed() -> bool:
-    return time.monotonic() < _suppressed_until
+    return _holds > 0 or time.monotonic() < _suppressed_until
 
 
 def note_agent_output(text: str) -> None:
@@ -24,17 +39,16 @@ def note_agent_output(text: str) -> None:
     _recent_agent_text = ([text] + _recent_agent_text)[:8]
 
 
-def classify_origin(app: str, screen_text: str) -> str:
+def classify_origin(app: str, window_title: str, screen_text: str) -> str:
     app_l = (app or "").lower()
-    if any(s in app_l for s in T.SELF_APPS):
+    title_l = (window_title or "").lower()
+    if any(s and s in app_l for s in T.SELF_APPS):
         return "agent"
+    # A terminal running the daemon is an ordinary app; its window title is the tell.
+    if any(p and p in title_l for p in T.SELF_WINDOW_PATTERNS):
+        return "agent"
+    grams = tk.trigrams(screen_text)
     for prior in _recent_agent_text:
-        if prior and tk_overlap(prior, screen_text) >= 0.6:
+        if prior and tk.containment(tk.trigrams(prior), grams) >= 0.6:
             return "agent"
     return "user"
-
-
-def tk_overlap(a: str, b: str) -> float:
-    from .. import textkit as tk
-
-    return tk.jaccard(tk.trigrams(a), tk.trigrams(b))

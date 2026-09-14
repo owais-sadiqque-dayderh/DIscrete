@@ -1,4 +1,4 @@
-"""Grounding posture (planS3 §7)."""
+"""Grounding posture (planS3 §7): a pure function of counts."""
 
 from __future__ import annotations
 
@@ -14,19 +14,14 @@ class GroundingDecision:
     weak: int
 
 
-def evaluate(result: RetrievalResult, *, intent: str = "recall") -> GroundingDecision:
+def evaluate(result: RetrievalResult) -> GroundingDecision:
+    intent = result.plan.intent
     if intent == "edit":
-        return GroundingDecision(mode="edit", strong=0, weak=0)
-    if intent == "continuation":
-        return GroundingDecision(mode="continuation", strong=len(result.hits), weak=0)
+        return GroundingDecision("edit", 0, 0)
     strong = sum(1 for h in result.hits if h.strong)
     weak = len(result.hits) - strong
-    if result.exhaustive and result.episodes:
-        return GroundingDecision(mode="grounded", strong=max(1, strong), weak=weak)
-    if strong >= 1 or any(h.ref_kind == "entity" and h.strong for h in result.hits):
-        mode = "grounded"
-    elif weak:
-        mode = "thin"
-    else:
-        mode = "empty"
-    return GroundingDecision(mode=mode, strong=strong, weak=weak)
+    if intent == "continuation":
+        return GroundingDecision("continuation", strong, weak)
+    if strong or (result.exhaustive and result.hits):
+        return GroundingDecision("grounded", strong, weak)
+    return GroundingDecision("thin" if weak else "empty", strong, weak)

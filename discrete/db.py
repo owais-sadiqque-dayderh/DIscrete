@@ -230,6 +230,22 @@ CREATE TABLE IF NOT EXISTS retrieval_misses(
 """
 
 
+# Columns added after v1; applied to existing stores on connect.
+_ADDED_COLUMNS = [
+    ("episodes", "draft_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("digests", "n_episodes", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    for table, col, decl in _ADDED_COLUMNS:
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if col not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_obs_app_site ON observations(app, site, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_mentions_entity ON mentions(entity_id)")
+
+
 def connect(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -237,5 +253,6 @@ def connect(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
     return conn

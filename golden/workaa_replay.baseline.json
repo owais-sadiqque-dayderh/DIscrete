@@ -1,0 +1,16 @@
+{
+  "snapshot": "obs69-max69-claims31",
+  "n": 13,
+  "hit_at_k": 1.0,
+  "mrr": 0.944,
+  "refusal_accuracy": 1.0,
+  "grounded_rate_answerable": 1.0,
+  "contamination": 0,
+  "latency_ms_p50": 2030,
+  "by_category": {
+    "aggregate": 1.0,
+    "recall": 1.0,
+    "temporal": 1.0,
+    "unanswerable": 1.0
+  }
+}
