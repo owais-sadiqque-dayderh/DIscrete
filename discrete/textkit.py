@@ -1,0 +1,224 @@
+"""Topic-neutral text utilities: normalizing, tokenizing, shingles, overlap, snippets.
+
+Nothing here may contain a topic-specific constant (no entity names, no domain
+terms). The stopword and imperative lists are function words only.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+import unicodedata
+
+import numpy as np
+from datasketch import MinHash
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@/\-'’]*")
+_EDGE = "._-/'’@"
+_POSSESSIVE = re.compile(r"['’]s$", re.IGNORECASE)
+
+STOPWORDS = frozenset(
+    """
+a an the and or but if then else of in on at to for from by with without as is
+are was were be been being have has had do does did will would shall should can
+could may might must not no nor so than that this these those there here it its
+i me my we our us you your he him his she her they them their who whom whose
+which what when where why how all any both each few more most other some such
+only own same too very just about into over under again further once dont
+im ive id youre theyre thats whats got get getting
+know knows knew tell tells told say says said please thanks thank ok okay
+yes yeah recently recent currently now today lately still already
+anything something nothing everything anyone someone thing things stuff
+give gives gave make makes made want wants need needs like likes going go
+""".split()
+)
+
+INTERROGATIVES = frozenset("what which who whom whose where when why how".split())
+
+_IMPERATIVE_HEADS = frozenset(
+    """ignore disregard forget remember always never pretend act respond reply
+    output print send delete execute run obey follow""".split()
+)
+_IMPERATIVE_PHRASES = ("you must", "you should", "you will", "you are now", "ai assistant", "language model", "system prompt")
+
+
+def normalize(text: str) -> str:
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def norm_key(text: str) -> str:
+    """Normalized, case-folded form used for exact comparisons."""
+    return normalize(text).casefold()
+
+
+def tokens(text: str, *, lower: bool = True) -> list[str]:
+    """Word tokens with possessives and edge punctuation stripped (insights.md §7.10)."""
+    out: list[str] = []
+    for raw in _TOKEN_RE.findall(text or ""):
+        t = _POSSESSIVE.sub("", raw).strip(_EDGE)
+        if t:
+            out.append(t.lower() if lower else t)
+    return out
+
+
+def content_tokens(text: str, *, min_len: int = 2) -> list[str]:
+    return [t for t in tokens(text) if len(t) >= min_len and t not in STOPWORDS]
+
+
+def word_shingles(text: str, n: int = 3) -> set[str]:
+    xs = tokens(text)
+    if len(xs) < n:
+        return {" ".join(xs)} if xs else set()
+    return {" ".join(xs[i : i + n]) for i in range(len(xs) - n + 1)}
+
+
+def trigrams(text: str) -> frozenset[tuple[str, ...]]:
+    xs = tokens(text)
+    return frozenset(tuple(xs[i : i + 3]) for i in range(max(0, len(xs) - 2)))
+
+
+def jaccard(a: frozenset | set, b: frozenset | set) -> float:
+    if not a and not b:
+        return 1.0
+    inter = len(a & b)
+    union = len(a) + len(b) - inter
+    return inter / union if union else 0.0
+
+
+def containment(small: frozenset | set, big: frozenset | set) -> float:
+    """Share of `small` found in `big` (asymmetric)."""
+    if not small:
+        return 0.0
+    return len(small & big) / len(small)
+
+
+def sha1(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text or "")
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def looks_imperative(sentence: str) -> bool:
+    low = sentence.lower()
+    toks = tokens(low)
+    if toks and toks[0] in _IMPERATIVE_HEADS:
+        return True
+    return any(p in low for p in _IMPERATIVE_PHRASES)
+
+
+def best_window(text: str, terms: set[str], width: int = 40) -> tuple[str, float]:
+    """Snippet of `text` (about `width` tokens) holding the most distinct `terms`.
+
+    Returns (snippet, overlap), where overlap = distinct terms in window / |terms|.
+    Always a verbatim substring of `text`.
+    """
+    if not text or not terms:
+        return "", 0.0
+    spans = [(m.group(0).lower().strip(_EDGE), m.start(), m.end()) for m in _TOKEN_RE.finditer(text)]
+    if not spans:
+        return "", 0.0
+    best = (0, 0, min(width, len(spans)))
+    for i in range(0, max(1, len(spans) - width + 1)):
+        window = spans[i : i + width]
+        hit = len({t for t, _, _ in window if t in terms})
+        if hit > best[0]:
+            best = (hit, i, i + len(window))
+    hit, i, j = best
+    j = max(j, i + 1)
+    snippet = text[spans[i][1] : spans[min(j, len(spans)) - 1][2]]
+    return snippet, hit / len(terms)
+
+
+def truncate(text: str, n: int) -> str:
+    text = text or ""
+    return text if len(text) <= n else text[: max(0, n - 1)].rstrip() + "…"
+
+
+def content_hash(text: str) -> str:
+    return hashlib.sha1(norm_key(text).encode("utf-8")).hexdigest()
+
+
+def stable_obs_key(*parts: str) -> str:
+    """Dedup key from stable fields only (planS2 §2). Caption excluded."""
+    return norm_key("\n".join(p for p in parts if p))
+
+
+def minhash(text: str, *, permutations: int | None = None) -> MinHash:
+    permutations = permutations or 128
+    m = MinHash(num_perm=permutations)
+    xs = word_shingles(text, 3)
+    if len(xs) < 30:
+        xs = xs | {t for t in tokens(text) if len(t) >= 2}
+    for sh in xs:
+        m.update(sh.encode("utf-8"))
+    return m
+
+
+def minhash_jaccard(a: MinHash, b: MinHash) -> float:
+    return float(a.jaccard(b))
+
+
+def bm25_idf(df: int, n_docs: int) -> float:
+    if n_docs <= 0 or df <= 0:
+        return 0.0
+    return math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+
+
+def cosine(a, b) -> float:
+    na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+    if na <= 0 or nb <= 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def rrf(rankings: list[list[int]], *, k: float = 60.0) -> dict[int, float]:
+    out: dict[int, float] = {}
+    for ranking in rankings:
+        for rank, doc_id in enumerate(ranking):
+            out[doc_id] = out.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
+    return out
+
+
+def fts_query(terms: list[str], *, mode: str = "OR") -> str:
+    safe = []
+    for t in terms:
+        t = re.sub(r"[^\w\s.@/'-]", " ", t).strip()
+        if not t:
+            continue
+        safe.append('"' + t.replace('"', "") + '"' if " " in t else f'"{t}"')
+    if not safe:
+        return ""
+    joiner = " OR " if mode.upper() == "OR" else " AND "
+    return joiner.join(safe)
+
+
+def parse_json_list(raw: str) -> list:
+    if not raw:
+        return []
+    try:
+        val = json.loads(raw)
+        return val if isinstance(val, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+def site_from_url(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        import tldextract
+
+        ext = tldextract.extract(url)
+        if ext.domain and ext.suffix:
+            return f"{ext.domain}.{ext.suffix}".lower()
+    except Exception:
+        pass
+    return ""

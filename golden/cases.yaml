@@ -1,0 +1,15 @@
+# Golden evaluation cases — extend as store grows.
+- question: "what design tools have I used"
+  category: aggregate
+  expect_any: []
+  unanswerable: true
+
+- question: "what did I do this morning"
+  category: temporal
+  expect_any: []
+  unanswerable: true
+
+- question: "what is my email address"
+  category: recall
+  expect_any: []
+  unanswerable: true
