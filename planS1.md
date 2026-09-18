@@ -58,6 +58,24 @@ Implementation bugs from the same review are in `insights.md` §7.11–7.26.
 | 3.4 | §9 | **Self-observation is also detected by window title** (`SELF_WINDOW_PATTERNS`, default `bin/discrete`, `discrete run`). Agent-origin captures are stored for audit with no VLM call, and are excluded from Stage 2 and 3. | Observations 1, 2 and 5 of the first run were the daemon's own terminal log, summarized as user activity. The terminal is an ordinary app, so `SELF_APPS` (app names) cannot catch it. |
 | 3.5 | §5 | **`doctor` verifies Screen Recording by grabbing a frame**, not only through `CGPreflightScreenCaptureAccess`. | The preflight reported "missing" for a terminal-launched Python whose captures worked. |
 
+### Rev 4 — 2026-09-15 (navigation is a capture boundary)
+
+Evidence: a live run reading a burst of Hacker News articles produced **one**
+observation for the whole burst instead of one per article.
+
+| # | Section | Change | Why (evidence) |
+|---|---|---|---|
+| 4.1 | §4, §5 | **A navigation to a different window/app finalizes the pair in flight and opens a fresh one**, rather than resetting the shared debounce timer. Previously every trigger — including each `window_change` — cancelled and rescheduled the single `_pending`/timer, so continuous browsing coalesced into a single before/after that spanned the first and last page. The debounce still governs settling *within* one page. | Reading N articles faster than `MOUSE_DEBOUNCE_S` (2 s) yielded 1 observation, not N. The interval was never the cause; the single-slot coalescing model was. Generalises the existing focus-drift guard (§5) from "abort at flush" to "segment at the boundary". |
+| 4.2 | §6.1 | **A rotated (boundary) capture reads its text from the frame it froze, not from the live window.** After a tab/window switch the live AX tree and browser URL already describe the *new* page, so a stale capture uses the last cached frame as its `after`, OCRs that image for `screen_text`, and keeps the URL/title captured when the page was in focus. The VLM still sees the frozen frame, so the caption and entities stay correct per article. | Same-process tab navigation cannot be read retroactively — the AX tree only exposes the current tab — so the previous article's text must come from its own captured pixels. |
+
+### Rev 5 — 2026-09-15 (browser page identity)
+
+| # | Section | Change | Why (evidence) |
+|---|---|---|---|
+| 5.1 | §2, §6.3 | **Browser tab identity comes from the tab's `AXWebArea`** (`AXURL`, `AXTitle`). It is cached, costs about 3 ms per poll, and is re-found when the window title changes or every 2 s. The change key is (pid, title, URL), so in-tab navigation triggers a capture. AppleScript is only a fallback. | On the live store most Arc rows were titled "Space 1" with no URL, because Arc titles windows by Space. AppleScript cost 0.25 s in Arc and 3.7 s in Chrome per call (`insights.md` §7.33). |
+| 5.2 | §5 | **A rotated capture uses a frame of its own window**, the newest match in a 6-frame ring, or is dropped. A navigation trigger keeps no "before" frame from the page just left. | Rows were captioned from the next page's frame ("Blueprint" captioned as a Google Doc) (`insights.md` §7.37). |
+| 5.3 | §6.2 | **The caption describes the last screenshot** and names the page, article, document or item by its title. | Before/after captions narrated transitions ("switched from Hacker News to…"), which leaked the previous page into every row. |
+
 ---
 
 ## 1. Purpose and scope

@@ -17,7 +17,7 @@ from ..config import T, bubble_vision_endpoint
 from ..llm import EXPECTED_ERRORS, NotConfigured, complete_json, embed, image_part
 from ..retrieval.gaps import maybe_record_gap
 from ..store import Store
-from .engine import BubbleEngine
+from .engine import BubbleEngine, EmptyField, field_query
 from .keys import HotkeyTap, type_text
 from .overlay_client import Overlay
 from .prompts import FIELD_READ_PROMPT
@@ -144,7 +144,7 @@ class BubbleService:
         typed = ""
         try:
             text, desc = await self._read_field(snap)
-            if not text.strip():
+            if not field_query(text):
                 self.overlay.message("No text in this field", tone="warn")
                 return
 
@@ -181,6 +181,8 @@ class BubbleService:
                          p.timings.get("first_chunk_s", 0.0), time.perf_counter() - t0)
             else:
                 self.overlay.message("Nothing to add here", tone="muted")
+        except EmptyField:
+            self.overlay.message("No text in this field", tone="warn")
         except asyncio.CancelledError:
             self.stats["cancelled"] += 1
             self.overlay.message("Stopped" if self._cancel_reason == "escape" else "Stopped — you kept typing",

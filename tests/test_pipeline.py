@@ -60,6 +60,43 @@ def test_ocr_runs_in_accurate_mode():
     assert "archive" in ocr.ocr_image(img).lower()
 
 
+async def test_navigation_boundary_captures_each_article(monkeypatch):
+    """§7.32: a burst of navigations was coalesced into one before/after; each
+    window change must finalize the article in flight and open a fresh pair."""
+    import asyncio
+
+    from discrete.capture import accessibility as ax
+    from discrete.capture import screen as sc
+
+    def wc(title):
+        return ax.WindowContext(app="Safari", bundle_id="com.apple.Safari",
+                                window_title=title, url=f"https://news.ycombinator.com/{title}", pid=42)
+
+    articles = ["a1", "a2", "a3"]
+    state = {"i": 0}
+    monkeypatch.setattr(sc.ax, "window_context", lambda: wc(articles[min(state["i"], len(articles) - 1)]))
+
+    observer = sc.ScreenObserver(queue=asyncio.Queue())
+    observer._loop = asyncio.get_running_loop()
+    monkeypatch.setattr(observer.grabber, "grab", lambda *a, **k: None)
+    finalized: list[str] = []
+
+    async def fake_finalize(pending, ctx, after, *, stale):
+        finalized.append(pending["before_ctx"].window_title)
+
+    monkeypatch.setattr(observer, "_finalize", fake_finalize)
+
+    for i in range(len(articles)):
+        state["i"] = i
+        observer.arm("window_change")  # each new article resets the debounce today
+    await observer._flush()            # the last article is still pending
+    await asyncio.sleep(0)             # let the rotated finalize tasks run
+    if observer._timer:
+        observer._timer.cancel()
+
+    assert sorted(finalized) == articles  # one capture per article, not one for the burst
+
+
 def test_self_window_is_agent_origin():
     from discrete.capture.suppress import classify_origin
 
@@ -269,6 +306,38 @@ async def test_retrieve_end_to_end(store, fake):
     res = await retrieve(store, "what was I reading about sqlite ranking")
     assert res.hits and "sqlite" in res.hits[0].text.lower()
     assert evaluate(res).mode == "grounded"
+
+
+def test_enumerate_intent_distinct_from_aggregate():
+    """§17: 'list all X' wants every record enumerated, not an entity roll-up or a count."""
+    from discrete.retrieval.query import fallback_plan
+
+    assert fallback_plan("list all the articles i opened in hacker news").intent == "enumerate"
+    assert fallback_plan("show me every site i visited today").intent == "enumerate"
+    assert fallback_plan("what did i read on hacker news").intent == "enumerate"
+    assert fallback_plan("how many articles did i read").intent == "aggregate"
+    assert fallback_plan("which tools have i used").intent == "aggregate"
+
+
+async def test_enumerate_lists_every_article_without_topk_cap(store):
+    """§17: enumeration bypasses TOP_K (8) and MMR, and dedups by article identity."""
+    from discrete.retrieval.search import retrieve
+
+    topics = ["python", "rust", "gpu tombs", "ios release", "ai models", "startups",
+              "number theory", "jazz music", "deep space", "ocean life", "chess", "compilers"]
+    titles = [f"HN Article {i}: {topics[i]}" for i in range(12)]
+    for i, ttl in enumerate(titles):
+        await store.add_observation(obs(app="Safari", site="news.ycombinator.com",
+                                        title=ttl, text=f"Hacker News thread about {topics[i]} detail {i}", t=T0 + i))
+    # A re-capture of one article (same app/title/url) must not become a second line.
+    await store.add_observation(obs(app="Safari", site="news.ycombinator.com",
+                                    title=titles[0], text=f"Hacker News thread about {topics[0]} revisited", t=T0 + 100))
+
+    res = await retrieve(store, "list all the articles i opened in hacker news")
+    assert res.plan.intent == "enumerate" and res.exhaustive
+    assert len(res.hits) == 12  # every distinct article, well past TOP_K
+    assert all(h.ref_kind == "observation" for h in res.hits)
+    assert any("number theory" in h.title for h in res.hits)
 
 
 async def test_exhaustive_mode_shows_undrafted_episodes(store, fake):

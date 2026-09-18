@@ -33,6 +33,9 @@ Rules:
 - Every claim cites at least one observation_id from above, with a quote copied
   character-for-character from that observation's text or caption (5-120 chars).
 - Viewing is not doing: if the user only scrolled past or looked at something, say "viewed".
+- Name the specific thing (the article, page, file, or person) by its title or name.
+  Skip interface trivia (menus, buttons, settings options, dialogs): fewer, specific
+  claims beat filling the limit.
 - Return an empty claims list if nothing is worth remembering.
 """
 

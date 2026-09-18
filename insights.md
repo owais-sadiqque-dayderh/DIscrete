@@ -664,3 +664,114 @@ feasible.*
   declares zero arguments.
 - **Rule:** UI state lives in a plain Python class. Only the minimal
   callback target (the `tick:` timer target) subclasses `NSObject`.
+
+### 7.31 The caret AXValue came back as a tuple, not a struct
+
+- **Symptom:** every Bubble hotkey press crashed the event-tap callback with
+  `AttributeError: 'tuple' object has no attribute 'location'` in
+  `_caret_rect` → `capture_focus`, so no snapshot was ever taken.
+- **Root cause:** `AXValueGetValue(rng, kAXValueCFRangeType, None)` bridges the
+  `CFRange` as a plain `(location, length)` tuple on this pyobjc version, not
+  an object with `.location`. The code assumed the object form; the same
+  assumption sat on the `CGPoint`/`CGSize`/`CGRect` reads.
+- **Rule:** never touch a bridged AXValue struct field directly. Normalize
+  through `_range_location` / `_point_xy` / `_size_wh` / `_rect_xywh`, which
+  accept both the object and (nested) tuple forms and return `None` on
+  anything malformed, so a hotkey press can never crash the tap.
+
+### 7.32 A browse of many pages collapsed into one before/after
+
+- **Symptom:** opening a burst of Hacker News articles produced a single
+  observation for the whole session, not one per article.
+- **Root cause:** every trigger — clicks, scrolls, *and* each `window_change`
+  — funnelled into one shared `_pending` slot and one debounce timer, and each
+  new trigger cancelled and rescheduled that timer. While the user kept moving
+  faster than the debounce, the pair never flushed; the first page's `before`
+  and the last page's `after` were finally stored as one "moment." The debounce
+  *interval* was not the cause — the single-slot coalescing model was.
+- **Rule:** a navigation to a different window/app is a capture *boundary*, not
+  another debounce reset. On `app_switch`/`window_change` to a different key,
+  `_rotate` finalizes the article in flight immediately and a fresh pair opens
+  on the new window (planS1 §5, Rev 4). This generalises the focus-drift guard
+  from "abort at flush" to "segment at the boundary." A rotated capture reads
+  its text from the frame it froze (OCR), because the live AX tree is already
+  the *next* page — same-process tab navigation cannot be read retroactively.
+
+### 7.33 Browser pages had no identity
+
+- **Symptom:** most Arc rows were titled "Space 1" with no URL. Navigating
+  between pages inside a tab triggered no capture at all.
+- **Root cause:** Arc titles its windows by Space, not by page. The poller's
+  change key was (pid, window title), so in-tab navigation was invisible to
+  it. URLs came from AppleScript, which takes 0.25 s per call in Arc and
+  3.7 s in Chrome, and returns nothing for a stale capture.
+- **Rule:** page identity comes from the tab's `AXWebArea` (`AXURL`,
+  `AXTitle`). The lookup is cached, takes about 3 ms per poll, and is re-found
+  when the title changes or every 2 s. The change key is (pid, title, URL).
+  AppleScript is only a fallback.
+
+### 7.34 "What did I open from X" cannot be answered by matching
+
+- **Symptom:** "list all the articles I opened in hacker news" returned the
+  Hacker News listing pages themselves.
+- **Root cause:** a page opened from a listing never mentions the listing.
+  Top-k and keyword matching can only find the listing.
+- **Rule:** list mode returns a time-ordered trail. It holds the pages that
+  match the subject (★), plus the pages visited in the same app within
+  `ENUMERATE_TRAIL_S` after a match (→). Visits collapse by URL, or by title
+  when the URL is missing. The writer decides which pages answer the question.
+
+### 7.35 A zero-width field became a query
+
+- **Symptom:** in Google Docs, Bubble typed a paraphrase of random captions.
+  The log showed `query="​"`.
+- **Root cause:** Docs renders its text on a canvas, and its AX value is a
+  zero-width space. `str.strip()` keeps U+200B, so the field looked non-empty.
+  An empty query then retrieved arbitrary records, and the writer paraphrased
+  them.
+- **Rule:** invisible characters are stripped from field text. A field
+  without words falls back to the vision read. The engine raises `EmptyField`
+  instead of retrieving on nothing.
+
+### 7.36 Query scaffolding and captions matched everything
+
+- **Symptom:** list-mode results were full of unrelated rows (a todo "list"),
+  and every page was marked as the source.
+- **Root cause:** the request's own words ("list", "opened", "articles",
+  "below") were searched as if they were the subject. VLM captions also
+  mention the previous page ("switched from Hacker News to…").
+- **Rule:** scaffolding words are stripped before search, and the stripped
+  subject is embedded. A named source matches on page identity (title, site,
+  URL), scored per query string. Content matches are used only when no
+  identity matches anywhere.
+
+### 7.37 Rotated captures captioned the wrong page
+
+- **Symptom:** the "Blueprint | Founders, Inc." row was captioned as a Google
+  Doc, and another row as a Finder folder.
+- **Root cause:** a rotated capture took the latest cached frame. The poller
+  notices a navigation up to `POLL_S` after the frame cache already holds the
+  next page. The "before" frame at arm time also showed the page just left.
+- **Rule:** keep a small ring of recent (frame, context) pairs and use the
+  newest frame whose window key matches. Drop the capture rather than caption
+  another window's frame. The caption prompt describes only the last
+  screenshot, and names the page.
+
+### 7.38 List answers were summarized prose, not article names
+
+- **Symptom:** "list all the articles I opened in hacker news" produced a
+  paragraph about Arc, OpenRouter and Finder — or listed "Hacker News" three
+  times — instead of article titles like WorkAA would.
+- **Root cause:** three compounding gaps, all on the read path:
+  1. Arc titles in-tab pages "Space 1", so enumerate dedup collapsed every
+     article into one row and the writer only saw generic window names.
+  2. The writer's `grounded` instruction asks for "the most specific facts" as
+     prose; even with an `enumerate` mode, the LLM still merged/summarized.
+  3. Listing pages (HN index) were returned as items instead of the trail
+     pages opened after them; captions held the real names ("Linux From
+     Scratch", "frank-386") but were never used for labels.
+- **Rule:** `page_label` / `page_identity` in `textkit.py` derive display names
+  from captions and URLs when the window title is generic. `shape_enumerate_items`
+  keeps only navigation-away rows for opened-item questions and drops listing
+  index pages. `format_enumerate_answer` renders the list deterministically —
+  no LLM on the enumerate write path.

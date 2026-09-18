@@ -13,6 +13,7 @@ versus WorkAA's 4-round research tool loop (5-15 s before the writer started).
 
 from __future__ import annotations
 
+import contextlib
 import re
 import time
 from dataclasses import dataclass, field
@@ -22,7 +23,7 @@ from .. import textkit as tk
 from ..config import T, USER_NAME, writer_endpoint
 from ..llm import stream
 from ..retrieval.grounding import GroundingDecision, evaluate
-from ..retrieval.search import Hit, RetrievalResult, retrieve
+from ..retrieval.search import Hit, RetrievalResult, retrieve, shape_enumerate_items
 from ..store import Store
 from ..timeutil import now, to_local
 from .prompts import MODE_INSTRUCTIONS, WRITER_SYSTEM, WRITER_USER
@@ -30,6 +31,11 @@ from .prompts import MODE_INSTRUCTIONS, WRITER_SYSTEM, WRITER_USER
 _PARA = re.compile(r"\n\s*\n")
 _SENT_START = re.compile(r"(?<=[.!?])\s+")
 _NO_SPACE_BEFORE = set(".,;:!?)]}'\"…")
+_INVISIBLE = re.compile(r"[​-‏ - ⁠-⁤﻿￼]")
+
+
+class EmptyField(ValueError):
+    """The field holds no words; there is nothing to answer or continue."""
 
 
 @dataclass
@@ -51,7 +57,7 @@ def field_query(text: str, max_chars: int | None = None) -> str:
     """The part of the field that is the actual request: its last paragraph,
     trimmed to a sentence boundary when long (a draft's opening is noise)."""
     max_chars = max_chars or T.BUBBLE_QUERY_CHARS
-    t = (text or "").strip()
+    t = _INVISIBLE.sub("", text or "").strip()
     if not t:
         return ""
     para = _PARA.split(t)[-1].strip() or t
@@ -76,9 +82,39 @@ def _when(h: Hit) -> str:
     return f" · {a:%a %b %d %H:%M}"
 
 
+def _when_short(h: Hit) -> str:
+    if not h.occurred_at:
+        return ""
+    a = to_local(h.occurred_at)
+    return f"{a:%a %b %d %H:%M}"
+
+
+def format_enumerate_answer(result: RetrievalResult) -> str:
+    """Deterministic list output — no LLM paraphrase (insights.md §7.38)."""
+    items = shape_enumerate_items(result.hits, result.plan)
+    if not items:
+        return ""
+    lines = [f"- {h.title} ({_when_short(h)})" for h in items]
+    return "\n".join(lines)
+
+
 def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> str:
     """Evidence pack for the writer: typed, time-stamped, id-tagged, budgeted."""
     max_chars = max_chars or T.BUBBLE_CONTEXT_CHARS
+    if result.plan.intent == "enumerate":
+        # One compact line per page, time-ordered, so the whole trail fits (planS3 §17).
+        if not result.hits:
+            return "(no records)"
+        lines = ["Timeline of pages/windows (★ matched the question directly; → opened shortly after a ★ "
+                 "page in the same app):"]
+        for h in result.hits:
+            mark = "★" if h.status == "matched" else "→"
+            site, _, caption = h.body.partition("\n")
+            line = f"{mark}{_when(h)} · {h.title} · {site}"
+            if caption:
+                line += f"\n    ({caption})"
+            lines.append(line)
+        return tk.truncate("\n".join(lines), max_chars * 2)
     terms = set(result.plan.terms)
     blocks: list[str] = []
     used = 0
@@ -117,6 +153,10 @@ class BubbleEngine:
                       progress: Callable[[str, object], None] | None = None) -> Prepared:
         t0 = time.perf_counter()
         query = field_query(field_text)
+        if not tk.tokens(query):
+            # An empty query retrieves arbitrary records, and the writer paraphrased them
+            # as if they were an answer (insights.md §7.35).
+            raise EmptyField(repr(field_text[:20]))
         result = await retrieve(self.store, query, field_text=field_text, progress=progress)
         decision = evaluate(result)
         return Prepared(field_text=field_text, query=query, app=app or "an app", field_desc=field_desc or "text field",
@@ -136,6 +176,20 @@ class BubbleEngine:
                     should_continue: Callable[[], bool] = lambda: True) -> str:
         """Stream the writer, emitting at word boundaries so the field never shows half a word.
         `emit` returns False when it could not insert, which stops the run."""
+        if p.mode == "enumerate":
+            text = format_enumerate_answer(p.result)
+            if not text:
+                return ""
+            if needs_space(p.field_text, text):
+                text = " " + text
+            else:
+                text = text.lstrip()
+            if emit(text):
+                p.timings["write_s"] = 0.0
+                p.timings["first_chunk_s"] = 0.0
+                return text
+            return ""
+
         t0 = time.perf_counter()
         buf, out, first = "", "", True
 
@@ -154,19 +208,22 @@ class BubbleEngine:
             out += chunk
             return True
 
-        async for piece in stream(writer_endpoint(), self.messages(p), temperature=0.2,
-                                  max_tokens=T.BUBBLE_WRITER_MAX_TOKENS):
-            if not should_continue():
-                return out
-            buf += piece
-            if len(buf) < T.BUBBLE_MIN_CHUNK:
-                continue
-            cut = max(buf.rfind(" "), buf.rfind("\n"))
-            if cut <= 0:
-                continue
-            chunk, buf = buf[:cut], buf[cut:]
-            if not push(chunk):
-                return out
+        max_tokens = T.ENUMERATE_WRITER_MAX_TOKENS if p.mode == "enumerate" else T.BUBBLE_WRITER_MAX_TOKENS
+        # aclosing: an early return must close the HTTP stream now, not at interpreter exit.
+        async with contextlib.aclosing(stream(writer_endpoint(), self.messages(p), temperature=0.2,
+                                              max_tokens=max_tokens)) as pieces:
+            async for piece in pieces:
+                if not should_continue():
+                    return out
+                buf += piece
+                if len(buf) < T.BUBBLE_MIN_CHUNK:
+                    continue
+                cut = max(buf.rfind(" "), buf.rfind("\n"))
+                if cut <= 0:
+                    continue
+                chunk, buf = buf[:cut], buf[cut:]
+                if not push(chunk):
+                    return out
         tail = buf.rstrip()
         if tail and should_continue():
             push(tail)

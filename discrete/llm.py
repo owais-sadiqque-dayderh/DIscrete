@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import re
@@ -168,8 +169,9 @@ async def stream(ep: Endpoint, messages: list[dict], *, temperature: float | Non
     if fn is None:
         yield await _backend.chat(ep, messages, temperature=temperature, max_tokens=max_tokens, json_mode=False)
         return
-    async for piece in fn(ep, messages, temperature=temperature, max_tokens=max_tokens):
-        yield piece
+    async with contextlib.aclosing(fn(ep, messages, temperature=temperature, max_tokens=max_tokens)) as inner:
+        async for piece in inner:
+            yield piece
 
 
 def image_part(jpeg: bytes, *, detail: str = "auto") -> dict:

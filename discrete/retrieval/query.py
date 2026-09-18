@@ -18,14 +18,29 @@ from ..config import T, utility_endpoint
 from ..llm import EXPECTED_ERRORS, complete_json
 from ..timeutil import day_bounds, from_local, now, to_local
 
-INTENTS = frozenset({"edit", "recall", "temporal", "aggregate", "world", "continuation", "mixed"})
+INTENTS = frozenset({"edit", "recall", "temporal", "aggregate", "enumerate", "world", "continuation", "mixed"})
 ENTITY_KINDS = frozenset({"person", "organization", "software", "website", "project", "file", "place", "topic"})
 
 _FILE = re.compile(r"[\w.-]+\.(?:py|js|ts|tsx|md|json|yaml|yml|txt|csv|pdf|png|jpg)\b", re.I)
 _IDENT = re.compile(r"\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b|\b[\w-]+\.[a-z]{2,}\b")
+# Entity roll-up ("which tools have I used") or a count — answered from the entity table.
 _AGG = re.compile(r"\b(?:which|what)\b.*\b(?:have i|did i|do i)\b.*\b(?:use|used|visit|visited|try|tried)\b"
-                  r"|\b(?:list|all the|how many)\b", re.I)
+                  r"|\bhow many\b|\bhow much\b|\bcount\b", re.I)
+# Enumeration ("list all the articles I opened") — the user wants every matching
+# record listed, not a synthesized summary or a count (planS3 §17).
+_ENUM = re.compile(r"\ball (?:the|of the)\b|\bevery\b|\blist\b|\bshow (?:me |all )\b"
+                   r"|\bwhat .*\bdid i (?:open|read|visit|see|watch|look)\b", re.I)
 _EDIT_VERBS = ("fix", "rewrite", "complete", "summarize", "translate", "format", "rephrase", "shorten")
+# The request's own scaffolding. Searching for "list" or "opened" matches any row that
+# says so (a todo list), not the pages being asked about (insights.md §7.36).
+_ENUM_SCAFFOLD = frozenset(
+    "list all every show me open opened visit visited read saw seen see look looked watch watched till until now "
+    "ever far article articles page pages site sites link links tab tabs item items thing things "
+    "below above here".split())
+
+
+def strip_scaffold(text: str) -> str:
+    return " ".join(t for t in tk.content_tokens(text) if t not in _ENUM_SCAFFOLD)
 
 KIND_VOCAB = {
     "software": ("tool", "tools", "app", "apps", "software", "program", "programs", "editor", "editors"),
@@ -87,6 +102,8 @@ async def build_plan(text: str) -> QueryPlan:
         return plan
     for q in data.get("queries") or []:
         q = str(q).strip()
+        if plan.intent == "enumerate":
+            q = strip_scaffold(q)
         if q and q not in plan.queries:
             plan.queries.append(q)
     for e in data.get("entities") or []:
@@ -122,6 +139,10 @@ def fallback_plan(text: str) -> QueryPlan:
         intent = "aggregate"
         words = set(tk.tokens(text))
         kind = next((k for k, vocab in KIND_VOCAB.items() if words & set(vocab)), "")
+    elif intent == "recall" and _ENUM.search(text):
+        intent = "enumerate"
+        terms = [t for t in terms if t not in _ENUM_SCAFFOLD]
+        queries = list(dict.fromkeys(q for q in (strip_scaffold(x) for x in queries) if q))
     elif intent == "recall" and interval:
         intent = "temporal"
     return QueryPlan(raw=text, intent=intent, queries=queries, entities=ents + files, terms=terms,

@@ -13,6 +13,7 @@ AX attribute names are passed as plain strings. pyobjc does not export every
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -57,7 +58,8 @@ class WindowContext:
 
     @property
     def key(self) -> tuple:
-        return (self.pid, self.window_title)
+        # The URL is part of identity: in-tab navigation often keeps the window title.
+        return (self.pid, self.window_title, self.url.split("#")[0])
 
 
 def accessibility_granted() -> bool:
@@ -138,10 +140,60 @@ def window_context() -> WindowContext:
                 url = _ax_url(_ax_get(win, attr))
                 if url:
                     break
+            if win is not None and bundle.startswith(_BROWSER_BUNDLES):
+                page_url, page_title = _web_page(pid, win, title)
+                if page_url:
+                    # The tab, not the window: Arc titles windows by Space ("Space 1").
+                    url, title = page_url, page_title or title
         return WindowContext(app=name, bundle_id=bundle, window_title=title, url=url, pid=pid, bounds=bounds)
     except Exception as exc:
         log.debug("window_context failed: %s", exc)
         return WindowContext()
+
+
+_BROWSER_BUNDLES = (
+    "company.thebrowser.", "com.google.Chrome", "com.apple.Safari", "com.microsoft.edgemac", "com.brave.Browser",
+    "com.vivaldi.Vivaldi", "com.operasoftware.Opera", "org.chromium.Chromium",
+)
+_WEB_REFIND_S = 2.0
+# pid -> (window title at lookup, AXWebArea or None, monotonic time of lookup)
+_web_cache: dict[int, tuple[str, object, float]] = {}
+
+
+def _find_role(el, role: str, *, max_nodes: int = 1500, budget_s: float = 0.08):
+    deadline = time.monotonic() + budget_s
+    stack, seen = [el], 0
+    while stack and seen < max_nodes and time.monotonic() < deadline:
+        cur = stack.pop()
+        seen += 1
+        if _ax_get(cur, "AXRole") == role:
+            return cur
+        stack.extend(reversed(_ax_get(cur, "AXChildren") or []))
+    return None
+
+
+def _web_page(pid: int, win, win_title: str) -> tuple[str, str]:
+    """(url, page title) of the visible tab, from its AXWebArea (~0 ms when cached,
+    ~30 ms to find). AppleScript is 0.25-4 s per call, too slow to poll (insights.md §7.33).
+    The element is re-found when the window title changes and every `_WEB_REFIND_S`,
+    because a background tab's web area stays valid and would report the old page."""
+    now_m = time.monotonic()
+    ent = _web_cache.get(pid)
+    wa = None
+    if ent and ent[0] == win_title and now_m - ent[2] < _WEB_REFIND_S:
+        wa = ent[1]
+        if wa is None:
+            return "", ""
+    if wa is None:
+        _enable_full_tree(AXUIElementCreateApplication(pid), pid)
+        wa = _find_role(win, "AXWebArea")
+        _web_cache[pid] = (win_title, wa, now_m)
+        if wa is None:
+            return "", ""
+    url = _ax_url(_ax_get(wa, "AXURL"))
+    if not url.startswith("http"):
+        return "", ""
+    return url, str(_ax_get(wa, "AXTitle") or "")
 
 
 _enhanced_pids: set[int] = set()
@@ -202,6 +254,7 @@ def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: in
 # ------------------------------------------------------------ focused field (Bubble)
 
 _VALUE_ATTRS = ("AXValue", "AXSelectedText")
+_INVISIBLE = re.compile(r"[​-‏ - ⁠-⁤﻿￼]")
 _DESC_ATTRS = ("AXPlaceholderValue", "AXDescription", "AXTitle", "AXHelp", "AXRoleDescription")
 
 
@@ -268,28 +321,78 @@ def _ax_value(raw, kind):
         return None
 
 
+# pyobjc may bridge AXValue structs either as objects (NSPoint/NSSize/NSRect/CFRange,
+# with .x/.width/.location attributes) or as plain (nested) tuples, depending on the
+# installed pyobjc version. These normalizers accept both so a tuple never raises
+# AttributeError (insights.md §caret) and vice versa.
+def _range_location(r) -> int | None:
+    if r is None:
+        return None
+    try:
+        return int(r.location)
+    except AttributeError:
+        try:
+            return int(r[0])
+        except (TypeError, IndexError, ValueError):
+            return None
+
+
+def _point_xy(p) -> tuple[float, float] | None:
+    if p is None:
+        return None
+    try:
+        return float(p.x), float(p.y)
+    except AttributeError:
+        try:
+            return float(p[0]), float(p[1])
+        except (TypeError, IndexError, ValueError):
+            return None
+
+
+def _size_wh(s) -> tuple[float, float] | None:
+    if s is None:
+        return None
+    try:
+        return float(s.width), float(s.height)
+    except AttributeError:
+        try:
+            return float(s[0]), float(s[1])
+        except (TypeError, IndexError, ValueError):
+            return None
+
+
+def _rect_xywh(r) -> tuple[float, float, float, float] | None:
+    if r is None:
+        return None
+    try:
+        return float(r.origin.x), float(r.origin.y), float(r.size.width), float(r.size.height)
+    except AttributeError:
+        try:
+            (ox, oy), (w, h) = r
+            return float(ox), float(oy), float(w), float(h)
+        except (TypeError, ValueError):
+            return None
+
+
 def _caret_rect(el) -> tuple[tuple[float, float, float, float] | None, int | None]:
     rng = _ax_get(el, "AXSelectedTextRange")
     index = None
     if rng is not None:
-        r = _ax_value(rng, kAXValueCFRangeType)
-        if r is not None:
-            index = int(r.location)
+        index = _range_location(_ax_value(rng, kAXValueCFRangeType))
         try:
             err, b = AXUIElementCopyParameterizedAttributeValue(el, "AXBoundsForRange", rng, None)
-            rect = _ax_value(b, kAXValueCGRectType) if err == _AX_OK else None
-            if rect is not None and (rect.size.height > 0 or rect.origin.x > 0):
-                return (rect.origin.x, rect.origin.y, rect.size.width, max(rect.size.height, 14.0)), index
+            rect = _rect_xywh(_ax_value(b, kAXValueCGRectType)) if err == _AX_OK else None
+            if rect is not None and (rect[3] > 0 or rect[0] > 0):
+                x, y, w, h = rect
+                return (x, y, w, max(h, 14.0)), index
         except Exception:
             pass
-    pos = _ax_get(el, "AXPosition")
-    size = _ax_get(el, "AXSize")
-    p = _ax_value(pos, kAXValueCGPointType) if pos is not None else None
-    s = _ax_value(size, kAXValueCGSizeType) if size is not None else None
+    p = _point_xy(_ax_value(_ax_get(el, "AXPosition"), kAXValueCGPointType))
+    s = _size_wh(_ax_value(_ax_get(el, "AXSize"), kAXValueCGSizeType))
     if p is not None:
-        h = s.height if s is not None else 20.0
+        h = s[1] if s is not None else 20.0
         # Field rect; the pill goes under the field's first line.
-        return (p.x, p.y, s.width if s is not None else 0.0, min(h, 28.0)), index
+        return (p[0], p[1], s[0] if s is not None else 0.0, min(h, 28.0)), index
     return None, index
 
 
@@ -309,7 +412,10 @@ def capture_focus() -> FocusSnapshot:
     snap.role = str(_ax_get(el, "AXRole") or "")
     for attr in _VALUE_ATTRS:
         val = _ax_get(el, attr)
-        if isinstance(val, str) and val.strip():
+        # Canvas editors (Google Docs) report a zero-width space as the field value;
+        # str.strip() keeps it, so it looked like text (insights.md §7.35).
+        val = _INVISIBLE.sub("", val) if isinstance(val, str) else ""
+        if val.strip():
             snap.value = val
             break
     for attr in _DESC_ATTRS:

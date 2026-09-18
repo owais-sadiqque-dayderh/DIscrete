@@ -63,6 +63,51 @@ retrieval designs of Zep, Hindsight and tada.
 | 4.4 | §16.3 | **Progress goes to a separate overlay pill, never into the field.** The field is untouched until the answer's first word. | The typed spinner and its cleanup backspaces were the source of WorkA's text-eating race. |
 | 4.5 | §16.4 | **`empty` inserts nothing.** The pill says "Nothing on file about that" and the gap check runs in the background. `thin` writes one honest sentence and also runs the gap check. | Typing a refusal into someone's document is worse than typing nothing. |
 
+### Rev 5 — 2026-09-15 (enumeration is its own intent)
+
+Evidence: "List all the articles I opened in Hacker News" returned a two-sentence
+narrative summary ("…focusing on job postings and discussions about AI…") naming
+two topics, not the list of articles. WorkA/WorkAA listed what they saw; this
+pipeline could not.
+
+| # | Section | Change | Why (evidence) |
+|---|---|---|---|
+| 5.1 | §2, §17 | **A new `enumerate` intent, split out from `aggregate`.** "list / all the / every / show me / what did I open|read|visit" now means *enumerate records*; `aggregate` is narrowed to entity roll-ups ("which tools have I used") and counts ("how many"). | Enumeration and entity-aggregation are different questions. Folding "list all the articles" into `aggregate` sent it to the entity table, which holds no articles. |
+| 5.2 | §17 | **Enumeration bypasses `TOP_K` and MMR.** A dedicated path lists *every* distinct observation matching the query terms and interval, time-ordered, deduplicated by article identity (canonical URL, else normalized title), capped at `ENUMERATE_MAX` (200). | `TOP_K` = 8 capped any list at eight items, and MMR (§5.3) exists to *drop near-duplicate records for diversity* — the exact opposite of what a "list all" query needs. No amount of ranking tuning fixes a completeness query run through a precision pipeline. |
+| 5.3 | §16, §17 | **A writer `enumerate` mode.** Records render as one compact line each (`id · when · title`) and the writer is told to list every item verbatim — no summarising, merging or topic reordering — with a raised token budget (`ENUMERATE_WRITER_MAX_TOKENS`). An `empty` writer instruction was also added (previously `empty` fell back to the `grounded` text). | The `grounded` instruction asks for "the most specific facts", which produces prose. A list needs an enumeration instruction and room to emit every line. |
+
+**Known limit (not fixed here):** an article opened *from* Hacker News loads an
+external site, and DIscrete stores no referrer, so enumeration lists the pages it
+actually captured (HN pages and any capture whose text names HN), not a guaranteed
+"everything reached via HN". Closing that needs referrer/link capture — a Stage 1
+data question, tracked in §13.
+
+### Rev 6 — 2026-09-15 (a real "list all" question failed on live data)
+
+Evidence: "List all the articles I opened in hacker news" typed into Google
+Docs. Bubble retrieved on a zero-width query and typed a paraphrase of random
+captions. Once that was fixed, list mode returned only the Hacker News listing
+pages.
+
+| # | Section | Change | Why (evidence) |
+|---|---|---|---|
+| 6.1 | §17 | **Enumeration returns a trail, not only matches.** The trail holds the pages matching the subject (★), plus the pages visited in the same app within `ENUMERATE_TRAIL_S` (600 s) after a match (→). Visits collapse by URL, or by title when a row lacks its URL. The writer decides from the question which lines qualify. | A page opened from a listing never mentions the listing, so matching alone can never answer "what did I open from X". On the live store the trail recovered the GitHub, Founders Inc. and Blueprint pages opened from HN. This supersedes the Rev 5 "known limit". |
+| 6.2 | §17 | **A named source matches on page identity** (title, site, URL), scored per query string. Content matches are used only if no identity matches exist. | VLM captions mention the previous page ("switched from Hacker News to…"), so content matching marked every page as the source. |
+| 6.3 | §2 | **Enumeration scaffolding is stripped** before search and before embedding ("list", "all", "opened", "articles", "below", …). With no subject left, the interval alone defines the matches. | "list" matched a todo list; the raw request's embedding pulled in unrelated rows. |
+| 6.4 | §16 | **Invisible characters are stripped from field text, and a wordless field never retrieves** (`EmptyField`, then the vision read). | Google Docs reports its field as U+200B. `str.strip()` keeps it, and the empty query retrieved arbitrary records (`insights.md` §7.35). |
+
+### Rev 7 — 2026-09-15 (list answers still summarized on live data)
+
+Evidence: after Rev 6, "list all the articles I opened in hacker news" still
+returned "Hacker News" three times or a paragraph about OpenRouter — not article
+titles. WorkAA named what was opened.
+
+| # | Section | Change | Why (evidence) |
+|---|---|---|---|
+| 7.1 | §17 | **`page_label` / `page_identity` derive names from captions when the window title is generic** (Arc "Space 1"). Dedup keys never collapse unlike pages. | Every in-tab article shared one title; enumerate merged them and the writer had no article names to list. |
+| 7.2 | §17 | **`shape_enumerate_items` filters opened-item questions** to navigation-away rows (caption says switched/clicked/opened) and drops listing index pages. | Listing pages (HN front page) were returned as items; trail pages held the real names in captions. |
+| 7.3 | §16, §17 | **Enumerate answers are rendered deterministically** (`format_enumerate_answer`) — one `- title (time)` line per item, no LLM writer. | Even with an enumerate writer prompt, the LLM merged records into prose. WorkAA listed; we format. |
+
 ---
 
 ## 1. Purpose and scope
@@ -670,3 +715,41 @@ headlessly, with stage timings.
   not land (some Electron fields), with a click to insert.
 - A second retrieval round only when `thin` and the planner produced
   unexplored queries. This needs eval evidence that recall improves.
+
+## 17. Enumeration — "list all …"  `[Rev 5]`
+
+Some questions ask for a *complete list*, not a synthesized answer: "list all the
+articles I opened in Hacker News", "show me every site I visited today". The recall
+path (§4–6) is built for precision — it caps at `TOP_K` and runs MMR to diversify —
+so it is structurally unable to answer these. Enumeration is therefore its own intent
+with its own path.
+
+**Detection (§2).** Structural cues — `list`, `all (the|of the)`, `every`,
+`show me`, or `what … did I open|read|visit|see` — set `intent = enumerate`. Entity
+roll-ups ("which/what … have I used") and counts ("how many") stay `aggregate`. As
+with every intent, the structural plan is authoritative; the advisory LLM plan cannot
+override it.
+
+**Path.** `enumerate` skips recall entirely:
+- FTS over the plan's query strings gathers up to `ENUMERATE_POOL` observation ids.
+- Rows outside the interval (when one is set) are dropped.
+- Survivors are ordered by time and **deduplicated by article identity** — canonical
+  URL (fragment stripped, trailing slash trimmed) when present, else the normalized
+  title — so repeat captures of the same page collapse to one line.
+- **No `TOP_K` cap and no MMR.** Every distinct item is kept, up to `ENUMERATE_MAX`
+  (200). `exhaustive` is set so grounding treats the result as authoritative.
+
+**Rendering and writer (§16).** Records render as one compact line each
+(`[screen id · when] title`) so the whole list fits the context budget. The writer
+runs in `enumerate` mode: list every item verbatim, one per line, no summarising,
+merging or topic reordering, with the budget raised to `ENUMERATE_WRITER_MAX_TOKENS`.
+
+**Tunables.** `ENUMERATE_MAX` (200), `ENUMERATE_POOL` (400),
+`ENUMERATE_WRITER_MAX_TOKENS` (1500).
+
+**Trail (`[Rev 6]`, supersedes the Rev 5 known limit).** Subject matches (★) are
+selected by page identity when the subject names a source, else by content. The
+list also includes every page visited in the same app within `ENUMERATE_TRAIL_S`
+after a match (→). The writer decides which lines answer the question. For
+"opened from X" the → pages are the answer. The render shows one line per visit:
+time range, title, site or URL, and the caption for pages with generic titles.

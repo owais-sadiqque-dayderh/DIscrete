@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -18,6 +19,8 @@ from .query import QueryPlan, build_plan
 from .rerank import llm_rerank
 
 log = logging.getLogger("discrete.retrieval.search")
+
+_OPENED_QUERY = re.compile(r"\b(?:open|opened|read|visit|visited|click|clicked|saw|seen)\b", re.I)
 
 KINDS = ("episode", "observation", "claim", "entity")
 
@@ -49,6 +52,7 @@ class Hit:
     occurred_at: float = 0.0
     occurred_to: float = 0.0
     claim_kind: str = ""
+    url: str = ""
 
     @property
     def dense_hit(self) -> bool:
@@ -120,7 +124,7 @@ async def _materialize(store: Store, kind: str, ids: list[int]) -> dict[int, Hit
             title = f"{r['app']} — {r['window_title']}".strip(" —") or r["caption"][:80]
             body = "\n".join(p for p in (r["caption"], tk.truncate(r["screen_text"], 1500)) if p)
             out[r["id"]] = Hit("observation", r["id"], title[:120], body, occurred_at=r["started_at"],
-                               occurred_to=r["ended_at"], untrusted=True)
+                               occurred_to=r["ended_at"], untrusted=True, url=r["url"] or "")
     elif kind == "episode":
         for r in await store.q(f"SELECT * FROM episodes WHERE id IN ({ph}) AND status='closed'", ids):
             out[r["id"]] = Hit("episode", r["id"], r["title"] or "episode", r["summary"],
@@ -177,6 +181,10 @@ async def retrieve(store: Store, query: str, *, field_text: str = "", progress=N
     progress("searching", plan.intent)
     if plan.intent == "edit":
         qvec_task.cancel()
+        return result
+
+    if plan.intent == "enumerate":
+        await _enumerate(store, plan, result, await qvec_task)
         return result
 
     if plan.interval and plan.interval[1] - plan.interval[0] <= T.EXHAUSTIVE_MAX_SPAN_S and plan.intent in ("temporal", "recall"):
@@ -303,6 +311,218 @@ async def _exhaustive(store: Store, plan: QueryPlan, result: RetrievalResult) ->
     digest = await store.get_digest(day_key(start))
     if digest:
         result.digest = digest["text"]
+
+
+def _canon_url(u: str) -> str:
+    return u.split("#")[0].rstrip("/") if u else ""
+
+
+def _wants_opened_items(plan: QueryPlan) -> bool:
+    return bool(_OPENED_QUERY.search(plan.raw))
+
+
+def _is_listing_row(row: dict) -> bool:
+    title = (row.get("window_title") or "").lower()
+    if tk.is_listing_url(row.get("url") or ""):
+        return True
+    if title in ("hacker news",) or title.startswith("hacker news "):
+        cap = (row.get("caption") or row.get("screen_text") or "").lower()
+        if "switched" not in cap and "clicked on a link" not in cap:
+            return True
+    return False
+
+
+def _hit_caption(h: Hit) -> str:
+    return h.body.split("\n", 1)[1] if "\n" in h.body else ""
+
+
+def shape_enumerate_items(hits: list[Hit], plan: QueryPlan) -> list[Hit]:
+    """Pick the lines that answer a 'list what I opened/read' question (planS3 §17).
+
+    Raw enumerate hits include listing pages (★) and every same-app page within the
+    trail window (→). For opened-item questions, drop the listings and pages that are
+    clearly not article visits, and relabel generic window titles from captions."""
+    if not hits:
+        return hits
+    labeled: list[Hit] = []
+    seen: set[str] = set()
+    for h in hits:
+        cap = _hit_caption(h)
+        label = h.title if not tk.is_generic_title(h.title) else tk.page_label(
+            h.title, url=h.url, caption=cap, site=h.body.partition(" · ")[0])
+        ident = tk.page_identity(h.title, url=h.url, caption=cap)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        labeled.append(Hit(h.ref_kind, h.ref_id, label, h.body, score=h.score, strong=h.strong,
+                           untrusted=h.untrusted, status=h.status, occurred_at=h.occurred_at,
+                           occurred_to=h.occurred_to, url=h.url))
+
+    if not _wants_opened_items(plan):
+        return labeled
+
+    listings = [h for h in labeled if _is_listing_row(
+        {"url": h.url, "window_title": h.title, "caption": _hit_caption(h), "screen_text": h.body})]
+
+    def opened_item(h: Hit) -> bool:
+        cap = _hit_caption(h)
+        if h.status == "inferred":
+            return True
+        return tk.navigation_caption(cap)
+
+    items = [h for h in labeled if opened_item(h)]
+
+    if listings and not items:
+        extras: list[Hit] = []
+        for h in listings:
+            cap = _hit_caption(h)
+            if "click" not in cap.lower():
+                continue
+            for title in tk.hn_headlines(h.body):
+                key = tk.norm_key(title)
+                if key in seen:
+                    continue
+                seen.add(key)
+                extras.append(Hit("observation", h.ref_id, title, h.body, strong=True, untrusted=True,
+                                  status="inferred", occurred_at=h.occurred_at, occurred_to=h.occurred_to))
+        if extras:
+            return extras
+
+    def keep(h: Hit) -> bool:
+        cap = _hit_caption(h)
+        low = h.title.lower()
+        if low.startswith("untitled document") or low.startswith("arc\n"):
+            return False
+        if "hacker news" == low or (low == "hacker news" and not h.url):
+            return False
+        if low in ("exploring local files",):
+            return False
+        if any(x in low for x in ("terminal window", "finder", ".cache", "credits", "openrouter", "google.com")):
+            return False
+        if "blueprint" in low and "hacker news" not in cap.lower():
+            return False
+        if h.title.startswith("The user"):
+            return False
+        if tk.is_generic_title(h.title) and not tk.navigation_caption(cap):
+            return False
+        return True
+
+    deduped: list[Hit] = []
+    seen_labels: set[str] = set()
+    for h in items:
+        if not keep(h):
+            continue
+        key = tk.norm_key(h.title)
+        if key in seen_labels:
+            continue
+        seen_labels.add(key)
+        deduped.append(h)
+    return deduped or labeled
+
+
+async def _enumerate(store: Store, plan: QueryPlan, result: RetrievalResult, qvec) -> None:
+    """planS3 §17: a time-ordered list of distinct pages/windows, bypassing TOP_K and MMR.
+
+    Matching alone cannot answer "what did I open from X": the pages opened from a
+    listing never mention the listing. So the list is the *trail*: every page that
+    matched the query (status "matched") plus the pages visited in the same app within
+    `ENUMERATE_TRAIL_S` after a match (status "trail"). The writer decides which answer
+    the question; the marks tell it how each page got there (insights.md §7.34)."""
+    result.exhaustive = True
+    ids: list[int] = []
+    subject = " ".join(plan.queries[:8]).strip()
+    if subject:
+        for q in plan.queries[:8]:
+            ids += await fts_ids(store, "observation", q, limit=T.ENUMERATE_POOL)
+        # Embed the subject, not the raw request: its scaffolding pulls in unrelated rows.
+        qvec = await _embed_query(subject) if subject != plan.raw else qvec
+        if qvec is not None:
+            ids += [i for i, s in await store.dense_search("observation", qvec, limit=T.ENUMERATE_POOL)
+                    if s >= T.DENSE_HIT_THRESHOLD]
+    elif plan.interval:
+        # "List the pages I opened today": no subject, so everything in the interval matches.
+        ids = [r["id"] for r in await store.q(
+            "SELECT id FROM observations WHERE origin='user' AND started_at >= ? AND started_at < ?",
+            plan.interval)]
+    hits = await _materialize(store, "observation", list(dict.fromkeys(ids)))
+    matched = {i: h for i, h in hits.items() if _in_interval(h, plan.interval)}
+    if not matched:
+        return
+    m_rows = {r["id"]: r for r in await store.q(
+        f"SELECT id, app, window_title, url, site FROM observations WHERE id IN ({','.join('?' * len(matched))})",
+        list(matched))}
+    # A named source ("hacker news", "figma") is matched by page identity: title, site, URL.
+    # Captions and screen text mention the previous page too ("switched from Hacker News
+    # to…"), so content matches alone marked every page as the source (insights.md §7.36).
+    # A topic with no identity matches anywhere ("articles about rust") keeps content matches.
+    # Per query string, not their union: the planner adds sibling queries, and the union
+    # of all their words is never mostly present in one title.
+    wants = [w for w in (set(tk.content_tokens(q)) for q in plan.queries[:8]) if w]
+    if wants:
+        def ident_cov(r) -> float:
+            toks = set(tk.tokens(f"{r['window_title']} {r['site']} {r['url']}"))
+            return max(len(w & toks) / len(w) for w in wants)
+
+        by_ident = {i for i, r in m_rows.items() if ident_cov(r) >= 0.5}
+        if by_ident:
+            matched = {i: h for i, h in matched.items() if i in by_ident}
+            m_rows = {i: r for i, r in m_rows.items() if i in by_ident}
+    apps = {r["app"] for r in m_rows.values()}
+
+    spans: list[list[float]] = []
+    for t in sorted(h.occurred_at for h in matched.values()):
+        if spans and t <= spans[-1][1]:
+            spans[-1][1] = t + T.ENUMERATE_TRAIL_S
+        else:
+            spans.append([t, t + T.ENUMERATE_TRAIL_S])
+    rows = []
+    for a, b in spans:
+        b = min(b, plan.interval[1]) if plan.interval else b
+        rows += await store.q(
+            "SELECT id, app, site, url, window_title, caption, screen_text, started_at, ended_at FROM observations "
+            "WHERE origin='user' AND started_at >= ? AND started_at <= ? ORDER BY started_at", (a, b))
+
+    visits: list[dict] = []
+    by_ident: dict[str, dict] = {}
+    for r in rows:
+        is_match = r["id"] in matched
+        if not is_match and r["app"] not in apps:
+            continue
+        url = _canon_url(r["url"] or "")
+        title = r["window_title"] or r["app"]
+        screen_text = r["screen_text"] or ""
+        ident = tk.page_identity(title, url=url, caption=r["caption"] or "", screen_text=screen_text)
+        v = by_ident.get(ident)
+        if v is None and url:
+            v = by_ident.get(url)
+            if v is not None and v["url"] and v["url"] != url:
+                v = None
+        if v is None:
+            label = tk.page_label(title, url=url, caption=r["caption"] or "", screen_text=screen_text,
+                                  site=r["site"] or "")
+            v = {"id": r["id"], "title": label, "raw_title": title, "app": r["app"], "site": r["site"], "url": url,
+                 "caption": r["caption"], "screen_text": screen_text,
+                 "first": r["started_at"], "last": r["ended_at"], "matched": False}
+            visits.append(v)
+            by_ident[ident] = v
+            if url:
+                by_ident[url] = v
+        if url and not v["url"]:
+            v["url"], v["site"] = url, r["site"]
+        v["last"] = max(v["last"], r["ended_at"])
+        v["matched"] = v["matched"] or is_match
+        if r["caption"] and (not v["caption"] or tk.navigation_caption(r["caption"])):
+            v["caption"] = r["caption"]
+            v["title"] = tk.page_label(v["raw_title"], url=v["url"], caption=r["caption"],
+                                       screen_text=screen_text, site=v["site"] or "")
+
+    for v in visits[: T.ENUMERATE_MAX]:
+        body = " · ".join(x for x in (v["site"] or v["app"], v["url"]) if x)
+        if v["caption"]:
+            body += f"\n{tk.truncate(v['caption'], 160)}"
+        result.hits.append(Hit("observation", v["id"], v["title"][:140], body, strong=True, untrusted=True,
+                               status="matched" if v["matched"] else "trail", url=v["url"],
+                               occurred_at=v["first"], occurred_to=v["last"]))
 
 
 async def brute_verify(store: Store, plan: QueryPlan, exclude: set[tuple[str, int]]) -> str | None:

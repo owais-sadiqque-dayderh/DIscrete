@@ -45,6 +45,26 @@ MODE_INSTRUCTIONS = {
         "The records directly cover this. Write using the most specific facts they give (names, figures, "
         "titles, dates), preferring [screen] excerpts over [claim] headlines. No hedging, no 'records show'."
     ),
+    "enumerate": (
+        "They asked for a list. Using the timeline, list every page or item that answers the question, one "
+        "per line as '- <name> (<time>)', in time order.\n"
+        "Which lines qualify:\n"
+        "- If the question asks for things opened, read or clicked in/on/from X, and the ★ X pages are a "
+        "listing, feed, search or index (a news aggregator, forum front page, search results, an inbox), the "
+        "answer is the → pages that follow them. The listing pages themselves are the source, not items, and "
+        "must not be listed.\n"
+        "- If the question asks which X pages or documents themselves were visited, the ★ lines are the "
+        "answer.\n"
+        "Skip lines that are clearly not the kind of thing asked for (the document the question is being "
+        "typed in, settings or billing pages when articles were asked for). Name each page by its title; if "
+        "the title is generic (a window or Space name), name it from its caption. Collapse repeat visits into "
+        "one line. Never add items that are not in the timeline. If nothing qualifies, say so in one sentence "
+        "addressed to them as 'you'."
+    ),
+    "empty": (
+        "No records answer this. In one short sentence, addressed to them as 'you', say you don't have that on "
+        "file. Do not guess or use your own knowledge."
+    ),
     "thin": (
         "The records are only loosely related; nothing answers this directly. In one short sentence, addressed "
         "to them as 'you', say you don't have that on file. Mention the closest record only if it is genuinely "

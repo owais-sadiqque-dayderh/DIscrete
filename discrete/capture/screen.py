@@ -7,6 +7,7 @@ counts always describe exactly the pending capture's interval (insights.md §7.1
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import time
 
@@ -44,6 +45,10 @@ class ScreenObserver:
         self._capture_lock = asyncio.Lock()
         self._frame_task: asyncio.Task | None = None
         self._latest: tuple[Image.Image, ax.WindowContext] | None = None
+        # Last few cached frames: a rotated capture must use a frame of *its* window, and
+        # the poller notices a navigation up to POLL_S after the frame cache already has the
+        # next page (insights.md §7.37).
+        self._recent: collections.deque = collections.deque(maxlen=6)
         self._last_event_mono = time.monotonic()
         self._last_kept: dict[tuple, str] = {}  # (app, title, url) -> phash of last kept frame
         self._last_full_capture = 0.0
@@ -105,13 +110,25 @@ class ScreenObserver:
         if is_suppressed():
             self.stats["suppressed"] += 1
             return
+        # A navigation to a different window/app is a capture boundary: finalize the
+        # article in flight *now* and open a fresh pair, instead of letting the debounce
+        # coalesce a whole browse into one before/after (planS1 §5, insights.md §7.32).
+        cur = None
+        if kind in ("app_switch", "window_change"):
+            cur = ax.window_context()
+            if self._pending is not None and cur.pid and cur.key != self._pending["before_ctx"].key:
+                self._rotate()
         if self._pending is None:
             before = self._latest
+            if cur is not None and before is not None and before[1].key != cur.key:
+                before = None  # the cached frame shows the page we just left, not this one
             self._pending = {
                 "kind": kind,
                 "started": time.time(),
                 "before_img": before[0] if before else None,
-                "before_ctx": before[1] if before else ax.window_context(),
+                # A navigation trigger anchors the pair to the window we just landed on;
+                # other triggers keep the cached context of the frame already in hand.
+                "before_ctx": cur or (before[1] if before else ax.window_context()),
                 "counts": {"keys": 0, "clicks": 0, "scrolls": 0, "clipboard": 0},
             }
         elif kind == "keyboard":
@@ -133,6 +150,7 @@ class ScreenObserver:
                 img = await asyncio.to_thread(self.grabber.grab, ctx.bounds, max_width=T.FRAME_MAX_WIDTH)
                 if img is not None:
                     self._latest = (img, ctx)
+                    self._recent.append((img, ctx))
                     if not self._warned_blank and is_blank(img):
                         self._warned_blank = True
                         log.warning("near-flat frame — check Screen Recording permission")
@@ -149,23 +167,48 @@ class ScreenObserver:
 
     # ----------------------------------------------------------------- flush
 
-    async def _flush(self) -> None:
-        async with self._capture_lock:
-            pending, self._pending = self._pending, None
-            if not pending:
-                return
-            ctx = await asyncio.to_thread(ax.window_context)
-            before_ctx: ax.WindowContext = pending["before_ctx"]
-            if before_ctx.pid and ctx.pid and before_ctx.pid != ctx.pid:
-                # Focus drift: a pair spanning two apps is not one moment (planS1 §5).
-                self.stats["aborted_drift"] += 1
-                self.arm("app")
-                return
-            after = await asyncio.to_thread(self.grabber.grab, ctx.bounds, max_width=T.FRAME_MAX_WIDTH)
-            await self._capture(pending, ctx, pending["before_img"], after)
+    def _rotate(self) -> None:
+        """Finalize the in-flight pair immediately at a navigation boundary. The
+        window has already moved on, so the previous article's `after` is its last
+        cached frame and its text is read from that image, not from the live (now
+        different) window (planS1 §5, insights.md §7.32)."""
+        if self._timer:
+            self._timer.cancel()
+            self._timer = None
+        pending, self._pending = self._pending, None
+        if not pending:
+            return
+        ctx: ax.WindowContext = pending["before_ctx"]
+        own = next((img for img, c in reversed(self._recent) if c.key == ctx.key), None)
+        after = own if own is not None else pending["before_img"]
+        if after is None:
+            self.stats["dropped_failed"] += 1  # degraded: no frame, but still segment the boundary
+        asyncio.create_task(self._finalize(pending, ctx, after, stale=True))
 
-    async def _capture(self, pending: dict, ctx: ax.WindowContext, before, after, *, heartbeat: bool = False) -> None:
-        url = await asyncio.to_thread(browser_url, ctx.app) or ctx.url
+    async def _flush(self) -> None:
+        pending, self._pending = self._pending, None
+        if not pending:
+            return
+        ctx = await asyncio.to_thread(ax.window_context)
+        before_ctx: ax.WindowContext = pending["before_ctx"]
+        if before_ctx.pid and ctx.pid and before_ctx.pid != ctx.pid:
+            # Focus drift: a pair spanning two apps is not one moment (planS1 §5).
+            self.stats["aborted_drift"] += 1
+            self.arm("app")
+            return
+        after = await asyncio.to_thread(self.grabber.grab, ctx.bounds, max_width=T.FRAME_MAX_WIDTH)
+        await self._finalize(pending, ctx, after, stale=False)
+
+    async def _finalize(self, pending: dict, ctx: ax.WindowContext, after, *, stale: bool) -> None:
+        async with self._capture_lock:
+            await self._capture(pending, ctx, pending["before_img"], after, stale=stale)
+
+    async def _capture(self, pending: dict, ctx: ax.WindowContext, before, after, *,
+                       heartbeat: bool = False, stale: bool = False) -> None:
+        # A stale (rotated) capture describes a window we already left; its live AX/URL
+        # would read the new window, so trust the context frozen at arm time instead.
+        # The tab URL comes from the web view (window_context); AppleScript is a slow fallback.
+        url = ctx.url or ("" if stale else await asyncio.to_thread(browser_url, ctx.app))
         counts = pending["counts"]
         started, ended = pending["started"], time.time()
         phash = str(imagehash.phash(after)) if after is not None else ""
@@ -181,7 +224,7 @@ class ScreenObserver:
             return
         self._last_kept[sig] = phash
 
-        screen_text, text_source = await asyncio.to_thread(self._screen_text, ctx, after)
+        screen_text, text_source = await asyncio.to_thread(self._screen_text, ctx, after, stale)
         origin = classify_origin(ctx.app, ctx.window_title, screen_text)
         base = dict(
             origin=origin, event_kind=pending["kind"], session_id=self.session.session_id,
@@ -225,12 +268,15 @@ class ScreenObserver:
             frame_path=after_path, **base,
         ))
 
-    def _screen_text(self, ctx: ax.WindowContext, after) -> tuple[str, str]:
-        text = ax.read_screen_text(ctx.pid, max_nodes=T.AX_WALK_MAX_NODES, timeout_ms=T.AX_WALK_TIMEOUT_MS,
-                                   max_chars=T.SCREEN_TEXT_MAX_CHARS)
+    def _screen_text(self, ctx: ax.WindowContext, after, stale: bool = False) -> tuple[str, str]:
+        # For a stale (rotated) capture the live AX tree is the *new* window, so the
+        # only faithful text for the old article is OCR of its captured frame.
+        text = "" if stale else ax.read_screen_text(
+            ctx.pid, max_nodes=T.AX_WALK_MAX_NODES, timeout_ms=T.AX_WALK_TIMEOUT_MS,
+            max_chars=T.SCREEN_TEXT_MAX_CHARS)
         source = "ax" if text else ""
         canvas = any(c in (ctx.app or "").lower() for c in T.CANVAS_APPS)
-        if len(text) < T.AX_TEXT_MIN_CHARS or canvas:
+        if stale or len(text) < T.AX_TEXT_MIN_CHARS or canvas:
             ocr_text = ocr.ocr_image(after)
             if ocr_text:
                 text = f"{text}\n{ocr_text}".strip()

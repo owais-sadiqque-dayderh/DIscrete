@@ -250,6 +250,11 @@ class T:
     LLM_RERANK_POOL = _typed("LLM_RERANK_POOL", 24)
     QUERY_LLM_PLAN = _typed("QUERY_LLM_PLAN", True)
     TOP_K = _typed("TOP_K", 8)
+    # Enumeration ("list all …") bypasses TOP_K/MMR: it returns every distinct page.
+    ENUMERATE_MAX = _typed("ENUMERATE_MAX", 200)
+    ENUMERATE_POOL = _typed("ENUMERATE_POOL", 400)
+    ENUMERATE_WRITER_MAX_TOKENS = _typed("ENUMERATE_WRITER_MAX_TOKENS", 1500)
+    ENUMERATE_TRAIL_S = _typed("ENUMERATE_TRAIL_S", 600.0)
     EVAL_K = _typed("EVAL_K", 8)
     EVAL_REGRESSION_ALPHA = _typed("EVAL_REGRESSION_ALPHA", 0.05)
     EVAL_MIN_CASES_FOR_SIG = _typed("EVAL_MIN_CASES_FOR_SIG", 100)
