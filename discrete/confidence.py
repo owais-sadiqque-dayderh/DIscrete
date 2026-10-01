@@ -1,10 +1,10 @@
-"""Derived confidence from evidence (planS2 §8)."""
+"""Derived confidence and recency half-lives (planS2 §8). Pure functions; used by the store and retrieval."""
 
 from __future__ import annotations
 
 import math
 
-from ..config import T
+from .config import T
 
 _MODALITY_W = {"stated": 1.0, "engaged": 0.8, "passive": 0.4}
 

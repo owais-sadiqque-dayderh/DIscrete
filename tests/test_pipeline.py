@@ -8,17 +8,17 @@ import sys
 import pytest
 
 from discrete import textkit as tk
-from discrete.process import prompts as p2
 from discrete.capture import prompts as p1
+from discrete.models import ClaimDraft, ObservationDraft
+from discrete.process import prompts as p2
 from discrete.process.consolidate import run_consolidation
 from discrete.process.embed_worker import drain_outbox
 from discrete.process.entities import promote_recurring
 from discrete.process.episodes import EpisodeTracker
 from discrete.process.pipeline import ProcessPipeline
 from discrete.retrieval.grounding import evaluate
+from discrete.retrieval.hybrid import retrieve
 from discrete.retrieval.query import build_plan, parse_interval
-from discrete.retrieval.search import retrieve
-from discrete.store import ClaimDraft, ObservationDraft
 
 T0 = 1_789_000_000.0
 
@@ -37,6 +37,7 @@ async def add(store, tracker, draft):
 
 # ------------------------------------------------------------------- Stage 1
 
+@pytest.mark.display
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS only")
 def test_capture_modules_import_and_find_a_window():
     """§7.11: a missing pyobjc constant silently disabled all AX."""
@@ -46,6 +47,7 @@ def test_capture_modules_import_and_find_a_window():
     assert isinstance(ax.window_context(), ax.WindowContext)
 
 
+@pytest.mark.display
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS only")
 def test_ocr_runs_in_accurate_mode():
     """§7.12: level 1 is *fast*, which garbled every capture."""
@@ -124,7 +126,7 @@ async def test_dedup_same_app_only_and_extends_interval(store):
 
 
 async def test_brief_alt_tab_is_absorbed(store):
-    tr = EpisodeTracker(store, use_embeddings=False)
+    tr = EpisodeTracker(store)
     for i, app in enumerate(["Code", "Code", "Slack", "Code"]):
         await add(store, tr, obs(app=app, text=f"text {i} {app}", t=T0 + 10 * i))
     await tr.close_current()
@@ -133,7 +135,7 @@ async def test_brief_alt_tab_is_absorbed(store):
 
 
 async def test_sustained_switch_splits_retroactively(store):
-    tr = EpisodeTracker(store, use_embeddings=False)
+    tr = EpisodeTracker(store)
     ids = []
     for i, (app, dt) in enumerate([("Code", 0), ("Code", 10), ("Slack", 20), ("Slack", 60), ("Slack", 130)]):
         ids.append(await add(store, tr, obs(app=app, text=f"text {i} {app}", t=T0 + dt)))
@@ -148,13 +150,13 @@ async def test_sustained_switch_splits_retroactively(store):
 
 async def test_orphaned_open_episode_is_recovered(store):
     """§7.16: episodes were left open forever when the process stopped."""
-    tr = EpisodeTracker(store, use_embeddings=False)
+    tr = EpisodeTracker(store)
     await add(store, tr, obs(text="hello"))
     assert await store.recover_open_episodes() == [tr.state.episode_id]
 
 
 async def _one_episode(store, texts, **kw):
-    tr = EpisodeTracker(store, use_embeddings=False)
+    tr = EpisodeTracker(store)
     ids = [await add(store, tr, obs(text=t, t=T0 + 10 * i, **kw)) for i, t in enumerate(texts)]
     (eid,) = await tr.close_current()
     return eid, ids
@@ -186,7 +188,7 @@ async def test_draft_keeps_only_verified_claims(store, fake):
 async def test_mentions_need_name_and_recurrence(store, fake):
     """§7.18: batch-level mentions and immediate entity creation."""
     for day in range(2):
-        tr = EpisodeTracker(store, use_embeddings=False)
+        tr = EpisodeTracker(store)
         oid = await add(store, tr, obs(text=f"Grainient gradient export {day}", t=T0 + day * 86400))
         (eid,) = await tr.close_current()
         fake.draft = {"title": "x", "summary": "y", "claims": [
@@ -207,7 +209,7 @@ async def test_reinforce_accumulates_confidence(store, fake):
     """§7.19: reinforcement reset confidence instead of accumulating."""
     confs = []
     for day in range(3):
-        tr = EpisodeTracker(store, use_embeddings=False)
+        tr = EpisodeTracker(store)
         oid = await add(store, tr, obs(text=f"Adobe Illustrator logo session {day}", t=T0 + day * 86400))
         (eid,) = await tr.close_current()
         fake.draft = {"title": "x", "summary": "y", "claims": [
@@ -321,7 +323,6 @@ def test_enumerate_intent_distinct_from_aggregate():
 
 async def test_enumerate_lists_every_article_without_topk_cap(store):
     """§17: enumeration bypasses TOP_K (8) and MMR, and dedups by article identity."""
-    from discrete.retrieval.search import retrieve
 
     topics = ["python", "rust", "gpu tombs", "ios release", "ai models", "startups",
               "number theory", "jazz music", "deep space", "ocean life", "chess", "compilers"]
@@ -343,7 +344,7 @@ async def test_enumerate_lists_every_article_without_topk_cap(store):
 async def test_exhaustive_mode_shows_undrafted_episodes(store, fake):
     from discrete.timeutil import now
 
-    tr = EpisodeTracker(store, use_embeddings=False)
+    tr = EpisodeTracker(store)
     await add(store, tr, obs(text="budget spreadsheet", caption="The user edited the Q3 budget", t=now() - 60))
     res = await retrieve(store, "what did I do today")
     assert res.exhaustive and "Q3 budget" in res.hits[0].body
@@ -360,3 +361,76 @@ def test_structural_candidates_skip_ui_chrome_and_paths():
     assert not promotable("Users/owaissadiqque") and not promotable("Unnamed Unnamed")
     assert not promotable("Thinking\nThe")
     assert promotable("Conductor/DIscrete") and promotable("OpenRouter")
+
+
+# ------------------------------------------------------------ docs/C6.md
+
+async def test_one_relation_call_per_episode_and_durable_claims_embedded_once(store, fake):
+    from discrete.process.embed_worker import claim_text
+
+    for text in ("The user uses Neovim for Python", "The user prefers dark themes"):
+        await store.create_claim(ClaimDraft(kind="fact" if "Neovim" in text else "preference", text=text))
+    await drain_outbox(store)
+    eid, (o1,) = await _one_episode(store, ["Neovim config for Python and a dark theme with monospace fonts"])
+    fake.embedded.clear()
+    fake.draft = {"title": "Editor setup", "summary": "Set up the editor.", "claims": [
+        {"kind": "fact", "text": "The user configures Neovim for Python", "entities": [],
+         "evidence": [{"observation_id": o1, "quote": "Neovim config for Python"}]},
+        {"kind": "preference", "text": "The user prefers a dark theme", "entities": [],
+         "evidence": [{"observation_id": o1, "quote": "dark theme"}]},
+        {"kind": "event", "text": "The user set up Neovim with monospace fonts", "entities": [],
+         "evidence": [{"observation_id": o1, "quote": "monospace fonts"}]},
+    ]}
+    out = await ProcessPipeline(store).draft_episode(eid)
+    assert out.added == 3
+    assert fake.calls.count("relate") == 1  # both durable claims in one call
+    await drain_outbox(store)
+    new = [c for c in await store.live_claims() if c["episode_id"] == eid and c["kind"] != "event"]
+    assert len(new) == 2
+    for c in new:
+        assert fake.embedded.count(claim_text(c["text"], c["context"])) == 1
+
+
+async def test_pending_cases_are_written_to_the_data_dir(store, fake):
+    from discrete.config import data_dir, golden_dir
+    from discrete.retrieval import gaps
+
+    gaps._append_pending_case("what was that font site", "observation:3")
+    assert gaps.pending_cases_path() == data_dir() / "auto_cases.pending.yaml"
+    assert gaps.pending_cases_path().exists()
+    assert not (golden_dir() / "auto_cases.pending.yaml").exists()
+
+
+def test_no_site_specific_rules_in_topic_neutral_code():
+    """The page/enumeration code and textkit may not name particular sites or apps,
+    nor parse caption wording (docs/C6.md §2). Checks string literals, not comments."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    banned = ("hacker news", "ycombinator", "blueprint", "openrouter", "google.com", "finder", "illustrator",
+              "github", "switched from", "clicked on a link", "arc\n")
+    for rel in ("discrete/textkit.py", "discrete/retrieval/pages.py", "discrete/retrieval/enumerate.py",
+                "discrete/retrieval/hybrid.py", "tools/replay_workaa.py"):
+        tree = ast.parse((root / rel).read_text())
+        docstrings = {id(n.body[0].value) for n in ast.walk(tree)
+                      if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                      and n.body and isinstance(n.body[0], ast.Expr) and isinstance(n.body[0].value, ast.Constant)}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+                low = node.value.lower()
+                assert not any(b in low for b in banned), f"{rel}: {node.value!r}"
+
+
+def test_replay_maps_domain_apps_to_browser_without_app_names():
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "replay", Path(__file__).resolve().parent.parent / "tools" / "replay_workaa.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.app_and_site("logosystem.co", "") == ("Browser", "logosystem.co")
+    assert mod.app_and_site("Adobe Illustrator 2026", "https://example.com/x") == ("Adobe Illustrator 2026",
+                                                                                  "example.com")
+    assert mod.app_and_site("", "https://example.com/x") == ("Browser", "example.com")

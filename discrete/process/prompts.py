@@ -39,21 +39,23 @@ Rules:
 - Return an empty claims list if nothing is worth remembering.
 """
 
-RELATE_PROMPT = """Compare a NEW claim about the user with EXISTING claims.
+RELATE_PROMPT = """Compare NEW claims about the user with EXISTING claims.
+Each NEW claim is followed by the existing claims to compare it with.
 
-NEW ({kind}): {text}
+{blocks}
 
-EXISTING:
-{candidates}
-
-For each existing claim give its relation to NEW:
+For each NEW claim and each of its existing claims, give the existing claim's relation to that NEW claim:
 - same: the same proposition, NEW adds nothing
 - refines: same subject, NEW adds detail or scope
 - contradicts: both cannot be true now
 - unrelated
 
-Return strict JSON: {{"relations": [{{"id": <int>, "relation": "<same|refines|contradicts|unrelated>"}}]}}
+Return strict JSON: {{"relations": [{{"new": <int>, "id": <int>, "relation": "<same|refines|contradicts|unrelated>"}}]}}
 """
+
+RELATE_BLOCK = """NEW {n} ({kind}): {text}
+EXISTING for NEW {n}:
+{candidates}"""
 
 CONSOLIDATE_PROMPT = """These claims about the user overlap. Rewrite them as a clear, non-redundant set.
 You may merge, split, or drop duplicates.

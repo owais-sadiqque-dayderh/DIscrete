@@ -17,7 +17,7 @@ import yaml
 
 from ..config import T, golden_dir
 from ..retrieval.grounding import evaluate
-from ..retrieval.search import retrieve
+from ..retrieval.hybrid import retrieve
 from ..store import Store
 
 
@@ -93,8 +93,8 @@ def load_cases(path: Path) -> tuple[list[Case], str]:
 
 async def health_checks(store: Store) -> dict:
     s = await store.stats()
-    confs = await store.q("SELECT ROUND(confidence, 3) c, COUNT(*) n FROM claims WHERE status='live' GROUP BY c")
-    top_share = max((r["n"] for r in confs), default=0) / max(1, s["claims_live"])
+    confs = await store.confidence_histogram(decimals=3)
+    top_share = max((n for _, n in confs), default=0) / max(1, s["claims_live"])
     return {
         "index_coverage": s["index_coverage"],
         "index_coverage_ok": all(v >= 1.0 for v in s["index_coverage"].values()),

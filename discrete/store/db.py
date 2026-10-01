@@ -1,14 +1,22 @@
-"""SQLite schema. Timestamps are epoch floats (see timeutil)."""
+"""SQLite schema and numbered migrations. Timestamps are epoch floats (see timeutil).
+
+`PRAGMA user_version` is the applied migration count. Each migration runs once,
+in order, inside its own transaction; a new schema change is a new function
+appended to MIGRATIONS, never an edit to an old one.
+"""
 
 from __future__ import annotations
 
+import logging
+import pickle
 import sqlite3
+from collections.abc import Callable
 
-SCHEMA_VERSION = 1
+log = logging.getLogger("discrete.store.db")
 
 _FTS_TOKENIZE = "tokenize='porter unicode61 remove_diacritics 2'"
 
-SCHEMA = f"""
+_BASE = f"""
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS metrics(name TEXT PRIMARY KEY, value REAL NOT NULL DEFAULT 0, updated_at REAL);
 
@@ -230,29 +238,146 @@ CREATE TABLE IF NOT EXISTS retrieval_misses(
 """
 
 
-# Columns added after v1; applied to existing stores on connect.
-_ADDED_COLUMNS = [
-    ("episodes", "draft_attempts", "INTEGER NOT NULL DEFAULT 0"),
-    ("digests", "n_episodes", "INTEGER NOT NULL DEFAULT 0"),
-]
+def _add_column(conn: sqlite3.Connection, table: str, col: str, decl: str) -> None:
+    """Stores created before numbered migrations may already have the column."""
+    if col not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 
-def _migrate(conn: sqlite3.Connection) -> None:
-    for table, col, decl in _ADDED_COLUMNS:
-        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-        if col not in have:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+def m001_base(conn: sqlite3.Connection) -> None:
+    for stmt in _statements(_BASE):
+        conn.execute(stmt)
+
+
+def m002_draft_attempts_and_digest_counts(conn: sqlite3.Connection) -> None:
+    _add_column(conn, "episodes", "draft_attempts", "INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "digests", "n_episodes", "INTEGER NOT NULL DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS ix_obs_app_site ON observations(app, site, id)")
     conn.execute("CREATE INDEX IF NOT EXISTS ix_mentions_entity ON mentions(entity_id)")
 
 
-def connect(path: str) -> sqlite3.Connection:
+def m003_structured_page_fields(conn: sqlite3.Connection) -> None:
+    """Page identity as columns from the vision call, deferred enrichment state,
+    and page_title in the observation FTS index."""
+    _add_column(conn, "observations", "page_title", "TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "observations", "is_listing", "INTEGER NOT NULL DEFAULT 0")
+    _add_column(conn, "observations", "navigated_from", "TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "observations", "enrich_state", "TEXT NOT NULL DEFAULT ''")
+    for trig in ("observations_ai", "observations_ad", "observations_au"):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+    conn.execute("DROP TABLE IF EXISTS observations_fts")
+    cols = "caption, screen_text, window_title, site, app, page_title"
+    new = ", ".join(f"new.{c.strip()}" for c in cols.split(","))
+    old = ", ".join(f"old.{c.strip()}" for c in cols.split(","))
+    for stmt in (
+        f"CREATE VIRTUAL TABLE observations_fts USING fts5({cols}, "
+        f"content='observations', content_rowid='id', {_FTS_TOKENIZE})",
+        f"CREATE TRIGGER observations_ai AFTER INSERT ON observations BEGIN "
+        f"INSERT INTO observations_fts(rowid, {cols}) VALUES (new.id, {new}); END",
+        f"CREATE TRIGGER observations_ad AFTER DELETE ON observations BEGIN "
+        f"INSERT INTO observations_fts(observations_fts, rowid, {cols}) VALUES ('delete', old.id, {old}); END",
+        f"CREATE TRIGGER observations_au AFTER UPDATE OF {cols} ON observations BEGIN "
+        f"INSERT INTO observations_fts(observations_fts, rowid, {cols}) VALUES ('delete', old.id, {old}); "
+        f"INSERT INTO observations_fts(rowid, {cols}) VALUES (new.id, {new}); END",
+        "INSERT INTO observations_fts(observations_fts) VALUES ('rebuild')",
+        "CREATE INDEX IF NOT EXISTS ix_obs_enrich ON observations(enrich_state) WHERE enrich_state != ''",
+    ):
+        conn.execute(stmt)
+
+
+def m004_minhash_raw_bytes(conn: sqlite3.Connection) -> None:
+    """Pickled datasketch objects → raw uint64 hash values. A pickle is slow to load
+    and breaks when datasketch changes its class layout; the bytes do not. Runs
+    once, before which every stored signature was a pickle."""
+    for oid, sig in conn.execute("SELECT obs_id, sig FROM obs_minhash").fetchall():
+        try:
+            raw = pickle.loads(sig).hashvalues.astype("<u8").tobytes()
+        except Exception as exc:  # unreadable: the row just loses near-dup matching
+            log.warning("dropping unreadable minhash for observation %s: %s", oid, exc)
+            conn.execute("DELETE FROM obs_minhash WHERE obs_id=?", (oid,))
+            continue
+        conn.execute("UPDATE obs_minhash SET sig=? WHERE obs_id=?", (raw, oid))
+
+
+def m005_perf_log(conn: sqlite3.Connection) -> None:
+    """Step-0 measurement (docs/C7.md): one row per model call, one per stage sample
+    or event count. `src` separates the daemon ("live") from ask/eval/query runs."""
+    conn.execute("""CREATE TABLE perf_calls(
+      id INTEGER PRIMARY KEY,
+      at REAL NOT NULL,
+      src TEXT NOT NULL,
+      component TEXT NOT NULL,
+      model TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL,
+      ms REAL NOT NULL,
+      first_ms REAL,
+      prompt_tokens INTEGER NOT NULL DEFAULT 0,
+      completion_tokens INTEGER NOT NULL DEFAULT 0,
+      cost REAL)""")
+    conn.execute("CREATE INDEX ix_perf_calls_at ON perf_calls(at)")
+    conn.execute("""CREATE TABLE perf_samples(
+      id INTEGER PRIMARY KEY,
+      at REAL NOT NULL,
+      src TEXT NOT NULL,
+      stage TEXT NOT NULL,
+      ms REAL,
+      n INTEGER,
+      ref_id INTEGER)""")
+    conn.execute("CREATE INDEX ix_perf_samples_at ON perf_samples(at)")
+
+
+MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
+    m001_base,
+    m002_draft_attempts_and_digest_counts,
+    m003_structured_page_fields,
+    m004_minhash_raw_bytes,
+    m005_perf_log,
+]
+
+SCHEMA_VERSION = len(MIGRATIONS)
+
+
+def _statements(script: str) -> list[str]:
+    """Split a script on complete statements (triggers contain inner semicolons)."""
+    out, buf = [], ""
+    for line in script.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            if buf.strip():
+                out.append(buf.strip())
+            buf = ""
+    return out
+
+
+def migrate(conn: sqlite3.Connection) -> int:
+    """Apply pending migrations; returns how many ran."""
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    ran = 0
+    for n, step in enumerate(MIGRATIONS[version:], start=version + 1):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            step(conn)
+            conn.execute(f"PRAGMA user_version = {n}")
+            conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(n),))
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+        log.info("applied migration %d (%s)", n, step.__name__)
+        ran += 1
+    return ran
+
+
+def connect(path: str, *, read_only: bool = False) -> sqlite3.Connection:
     conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
+    if read_only:
+        # A second connection for retrieval: WAL lets it read while the writer writes.
+        conn.execute("PRAGMA query_only=ON")
+        return conn
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.executescript(SCHEMA)
-    _migrate(conn)
-    conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+    migrate(conn)
     return conn

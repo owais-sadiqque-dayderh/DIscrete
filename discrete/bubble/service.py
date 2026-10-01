@@ -11,10 +11,13 @@ import io
 import logging
 import time
 
+from ..aio import spawn
 from ..capture import accessibility as ax
+from ..capture.frames import FrameGrabber
 from ..capture.suppress import hold, note_agent_output, release
 from ..config import T, bubble_vision_endpoint
 from ..llm import EXPECTED_ERRORS, NotConfigured, complete_json, embed, image_part
+from ..perf import PERF, since_ms
 from ..retrieval.gaps import maybe_record_gap
 from ..store import Store
 from .engine import BubbleEngine, EmptyField, field_query
@@ -60,9 +63,7 @@ class BubbleService:
         return self._task is not None and not self._task.done()
 
     def _spawn(self, coro) -> None:
-        t = asyncio.create_task(coro)
-        self._bg.add(t)
-        t.add_done_callback(self._bg.discard)
+        spawn(coro, owner=self._bg)
 
     async def _warm(self) -> None:
         """Open the API connection now so the first trigger skips the TLS handshake."""
@@ -96,7 +97,7 @@ class BubbleService:
         self._task = asyncio.create_task(self._run(snap), name="bubble-run")
 
     def _cancel(self, reason: str) -> None:
-        if self.busy() and not self._cancel_reason:
+        if self._task is not None and self.busy() and not self._cancel_reason:
             self._cancel_reason = reason
             self._task.cancel()
 
@@ -117,18 +118,20 @@ class BubbleService:
         self.overlay.status("Reading the screen")
 
         def shoot() -> bytes:
-            from ..capture.frames import FrameGrabber
-
             g = FrameGrabber()
             try:
                 img = g.grab(snap.window_bounds, max_width=1280)
             finally:
                 g.close()
+            if img is None:
+                return b""
             buf = io.BytesIO()
             img.save(buf, "JPEG", quality=75)
             return buf.getvalue()
 
         jpeg = await asyncio.to_thread(shoot)
+        if not jpeg:
+            return "", ""
         data = await complete_json(ep, [{"role": "user", "content": [
             image_part(jpeg, detail="high"), {"type": "text", "text": FIELD_READ_PROMPT}]}], max_tokens=800)
         if not isinstance(data, dict):
@@ -143,7 +146,8 @@ class BubbleService:
         self.overlay.show(snap.caret)
         typed = ""
         try:
-            text, desc = await self._read_field(snap)
+            with PERF.timer("bubble.field_read"):
+                text, desc = await self._read_field(snap)
             if not field_query(text):
                 self.overlay.message("No text in this field", tone="warn")
                 return
@@ -176,6 +180,7 @@ class BubbleService:
                                             should_continue=lambda: not watcher.done())
             if typed:
                 self.stats["completed"] += 1
+                PERF.sample("bubble.total", since_ms(t0), n=len(typed))  # hotkey → last word typed
                 self.overlay.done(f"Done · {time.perf_counter() - t0:.1f}s")
                 log.info("bubble: typed %d chars; first chunk %.2fs after retrieval, total %.2fs", len(typed),
                          p.timings.get("first_chunk_s", 0.0), time.perf_counter() - t0)

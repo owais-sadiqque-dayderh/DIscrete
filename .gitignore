@@ -5,3 +5,7 @@ __pycache__/
 .pytest_cache/
 *.egg-info/
 data/
+.DS_Store
+.ruff_cache/
+# written at runtime into the data dir; never commit one if it appears here
+golden/auto_cases.pending.yaml

@@ -1,15 +1,23 @@
-# Golden evaluation cases — extend as store grows.
-- question: "what design tools have I used"
-  category: aggregate
-  expect_any: []
-  unanswerable: true
+# Golden evaluation cases: the "quality" numbers in `discrete bench --eval` and `discrete eval`.
+#
+# Write 15-20 of these from what you actually did during your recorded session, so every
+# optimization step can show it did not make answers worse. One case per question:
+#
+#   - question: "which pull request did I review on GitHub"   # ask it the way you would in Bubble
+#     category: recall        # recall | temporal | aggregate | enumerate (a label; scored per category)
+#     expect_any: ["#1234", "fix race in uploader"]           # a correct answer's evidence contains ANY of these
+#     expect_none: ["#999"]   # optional: text that must NOT appear in the evidence (wrong-thing check)
+#
+#   - question: "what is my passport number"                  # something never on screen
+#     category: recall
+#     unanswerable: true      # correct = the system says it has nothing, instead of guessing
+#
+# expect_any is matched case-insensitively against each retrieved record's title and body;
+# the case scores when a match is in the top EVAL_K (8). Use short, distinctive strings from
+# the page: a title, a name, a number. Avoid "today" / "this morning": the answer moves
+# as days pass; name the date instead ("on September 30").
+#
+# Aim for a mix: ~8 recall, ~3 temporal, ~2 aggregate ("which apps/tools…"),
+# ~2 enumerate ("list all the … I opened from …"), ~3 unanswerable.
 
-- question: "what did I do this morning"
-  category: temporal
-  expect_any: []
-  unanswerable: true
-
-- question: "what is my email address"
-  category: recall
-  expect_any: []
-  unanswerable: true
+[]

@@ -1,4 +1,4 @@
-# Cases against the store built by `discrete replay-workaa` from the WorkAA
+# Cases against the store built by `python tools/replay_workaa.py` from the WorkAA
 # prototype session (2026-09-12 21:08-22:18 UTC). Hand-written from the known
 # session content; regenerate the baseline, never overwrite cases in place.
 snapshot: obs69-max69-claims31

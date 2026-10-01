@@ -25,11 +25,12 @@ class Overlay:
         if not self.enabled or (self._proc and self._proc.poll() is None):
             return
         try:
-            err = open(data_dir() / "overlay.log", "a")
-            self._proc = subprocess.Popen(
-                [sys.executable, "-m", "discrete.bubble.overlay"],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err, text=True, bufsize=1,
-            )
+            # The child inherits its own copy of the log descriptor; ours closes here.
+            with open(data_dir() / "overlay.log", "a") as err:
+                self._proc = subprocess.Popen(
+                    [sys.executable, "-m", "discrete.bubble.overlay"],
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err, text=True, bufsize=1,
+                )
         except OSError as exc:
             log.warning("overlay unavailable: %s", exc)
             self.enabled = False
@@ -39,9 +40,12 @@ class Overlay:
             return
         if self._proc is None or self._proc.poll() is not None:
             self.start()
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            return
         try:
-            self._proc.stdin.write(json.dumps(msg) + "\n")
-            self._proc.stdin.flush()
+            proc.stdin.write(json.dumps(msg) + "\n")
+            proc.stdin.flush()
         except (OSError, ValueError, AttributeError) as exc:
             log.debug("overlay send failed: %s", exc)
             self._proc = None
@@ -62,11 +66,13 @@ class Overlay:
         self._send(op="hide")
 
     def close(self) -> None:
-        if self._proc and self._proc.poll() is None:
+        proc = self._proc
+        if proc and proc.poll() is None:
             self._send(op="quit")
             try:
-                self._proc.stdin.close()
-                self._proc.wait(timeout=2)
+                if proc.stdin:
+                    proc.stdin.close()
+                proc.wait(timeout=2)
             except Exception:
-                self._proc.kill()
+                proc.kill()
         self._proc = None

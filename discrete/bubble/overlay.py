@@ -27,7 +27,6 @@ import sys
 import threading
 import time
 
-import objc
 from AppKit import (
     NSAnimationContext,
     NSApplication,

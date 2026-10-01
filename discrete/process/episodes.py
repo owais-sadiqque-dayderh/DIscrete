@@ -7,6 +7,11 @@ episode's context before `EPISODE_SWITCH_MIN_S` is absorbed.
 
 Tracker state lives in memory. On restart, orphaned open episodes are made
 ready by `Store.recover_open_episodes` (planS2 Rev 3).
+
+The tracker never calls the embeddings API itself: the caller passes the
+observation's stored vector (process/embed_worker.embed_row), so each
+observation is embedded exactly once. Without a vector, only the (app, site)
+and time rules apply.
 """
 
 from __future__ import annotations
@@ -16,9 +21,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .. import textkit as tk
 from ..config import T
-from ..llm import EXPECTED_ERRORS, NotConfigured, embed
 from ..store import Store
 from ..timeutil import now
 
@@ -31,7 +34,7 @@ class _Pending:
 
     pair: tuple[str, str]
     since: float
-    obs: list[tuple[int, object]] = field(default_factory=list)  # (id, row)
+    obs: list[tuple[int, object, np.ndarray | None]] = field(default_factory=list)  # (id, row, vec)
 
 
 @dataclass
@@ -44,7 +47,7 @@ class EpisodeState:
     n: int = 0
     centroid: np.ndarray | None = None
     switch: _Pending | None = None
-    low_sim: list[tuple[int, object, np.ndarray]] = field(default_factory=list)
+    low_sim: list[tuple[int, object, np.ndarray | None]] = field(default_factory=list)
 
 
 def pair_of(row) -> tuple[str, str]:
@@ -52,35 +55,35 @@ def pair_of(row) -> tuple[str, str]:
 
 
 class EpisodeTracker:
-    def __init__(self, store: Store, *, use_embeddings: bool = True):
+    def __init__(self, store: Store):
         self.store = store
         self.state: EpisodeState | None = None
-        self.use_embeddings = use_embeddings
 
-    async def on_observation(self, obs_id: int, row, *, session_id: str) -> list[int]:
-        """Assign an observation; returns episode ids that were closed (now ready)."""
+    async def on_observation(self, obs_id: int, row, *, session_id: str,
+                             vec: np.ndarray | None = None) -> list[int]:
+        """Assign an observation; returns episode ids that were closed (now ready).
+        `vec` is the observation's unit embedding, if it has one."""
         closed: list[int] = []
         if self.state is not None and self.state.session_id != session_id:
             closed += await self.close_current()
         if self.state is None:
-            await self._open(obs_id, row, session_id)
+            await self._open(obs_id, row, session_id, vec)
             return closed
 
         st = self.state
         pair = pair_of(row)
         t = row["started_at"]
-        vec = await self._embed(row)
 
         if pair == st.pair:
             st.switch = None  # a brief excursion returned: absorbed
         elif st.switch is not None and st.switch.pair == pair:
-            st.switch.obs.append((obs_id, row))
+            st.switch.obs.append((obs_id, row, vec))
             if t - st.switch.since >= T.EPISODE_SWITCH_MIN_S:
                 moved = st.switch.obs
-                closed += await self._split(moved[:-1], obs_id, row, session_id)
+                closed += await self._split(moved[:-1], obs_id, row, session_id, vec)
                 return closed
         else:
-            st.switch = _Pending(pair=pair, since=t, obs=[(obs_id, row)])
+            st.switch = _Pending(pair=pair, since=t, obs=[(obs_id, row, vec)])
 
         # Semantic shift: two consecutive low-similarity observations (same context).
         if vec is not None and pair == st.pair:
@@ -88,8 +91,8 @@ class EpisodeTracker:
             if sim < T.EPISODE_SHIFT_SIM:
                 st.low_sim.append((obs_id, row, vec))
                 if len(st.low_sim) >= 2:
-                    moved = [(i, r) for i, r, _ in st.low_sim[:-1]]
-                    closed += await self._split(moved, obs_id, row, session_id)
+                    moved = st.low_sim[:-1]
+                    closed += await self._split(moved, obs_id, row, session_id, vec)
                     return closed
             else:
                 st.low_sim.clear()
@@ -103,22 +106,23 @@ class EpisodeTracker:
             closed += await self.close_current()
         return closed
 
-    async def _open(self, obs_id: int, row, session_id: str) -> None:
+    async def _open(self, obs_id: int, row, session_id: str, vec: np.ndarray | None) -> None:
         eid = await self.store.open_episode(session_id, row["started_at"])
         await self.store.assign_episode([obs_id], eid)
-        vec = await self._embed(row)
         self.state = EpisodeState(
             episode_id=eid, session_id=session_id, started_at=row["started_at"],
             last_obs_at=row["ended_at"], pair=pair_of(row), n=1, centroid=vec,
         )
 
-    async def _split(self, moved: list[tuple[int, object]], obs_id: int, row, session_id: str) -> list[int]:
+    async def _split(self, moved: list[tuple[int, object, np.ndarray | None]], obs_id: int, row,
+                     session_id: str, vec: np.ndarray | None) -> list[int]:
         """Boundary at the switch point: `moved` + this observation start the next
         episode. They are reassigned before the old episode's interval is computed."""
+        assert self.state is not None
         old = self.state.episode_id
-        first_id, first_row = moved[0] if moved else (obs_id, row)
-        await self._open(first_id, first_row, session_id)
-        rest = [i for i, _ in moved[1:]] + ([obs_id] if moved else [])
+        first_id, first_row, first_vec = moved[0] if moved else (obs_id, row, vec)
+        await self._open(first_id, first_row, session_id, first_vec)
+        rest = [i for i, _, _ in moved[1:]] + ([obs_id] if moved else [])
         if rest:
             await self.store.assign_episode(rest, self.state.episode_id)
             self.state.n += len(rest)
@@ -126,18 +130,6 @@ class EpisodeTracker:
             self.state.pair = pair_of(row)
         await self.store.mark_episode_ready(old)
         return [old]
-
-    async def _embed(self, row) -> np.ndarray | None:
-        if not self.use_embeddings:
-            return None
-        text = f"{row['caption']}\n{tk.truncate(row['screen_text'], 1000)}".strip()
-        if not text:
-            return None
-        try:
-            v = np.asarray((await embed([text]))[0], dtype=np.float32)
-        except (NotConfigured, *EXPECTED_ERRORS):
-            return None
-        return v / max(float(np.linalg.norm(v)), 1e-9)
 
     async def close_current(self) -> list[int]:
         if not self.state:

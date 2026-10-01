@@ -9,6 +9,7 @@ import numpy as np
 from .. import textkit as tk
 from ..config import T, consolidate_endpoint
 from ..llm import EXPECTED_ERRORS, complete, complete_json
+from ..perf import PERF
 from ..store import Store
 from ..timeutil import now, to_local
 from .embed_worker import drain_outbox
@@ -20,6 +21,11 @@ log = logging.getLogger("discrete.process.consolidate")
 
 
 async def run_consolidation(store: Store) -> dict:
+    with PERF.timer("consolidate.run"):
+        return await _consolidate(store)
+
+
+async def _consolidate(store: Store) -> dict:
     report: dict = {}
     report["embedded"] = await drain_outbox(store)
     report["entities_promoted"] = await promote_recurring(store)
@@ -102,9 +108,7 @@ async def _entity_pages(store: Store) -> int:
         if not summary:
             continue
         kind = str((data or {}).get("kind") or "").lower()
-        if row["kind"] == "unknown" and kind:
-            await store.execute("UPDATE entities SET kind=? WHERE id=?", (kind, row["id"]))
-        await store.update_entity_page(row["id"], summary)
+        await store.update_entity_page(row["id"], summary, kind=kind)
         n += 1
     return n
 

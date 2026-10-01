@@ -13,6 +13,7 @@ import re
 import unicodedata
 
 import numpy as np
+import tldextract
 from datasketch import MinHash
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@/\-'’]*")
@@ -151,19 +152,30 @@ def stable_obs_key(*parts: str) -> str:
     return norm_key("\n".join(p for p in parts if p))
 
 
-def minhash(text: str, *, permutations: int | None = None) -> MinHash:
-    permutations = permutations or 128
-    m = MinHash(num_perm=permutations)
+def minhash(text: str, *, permutations: int | None = None) -> np.ndarray:
+    """MinHash signature as its raw uint64 hash values (datasketch's fixed seed,
+    so signatures from different runs compare)."""
+    m = MinHash(num_perm=permutations or 128)
     xs = word_shingles(text, 3)
     if len(xs) < 30:
         xs = xs | {t for t in tokens(text) if len(t) >= 2}
     for sh in xs:
         m.update(sh.encode("utf-8"))
-    return m
+    return m.hashvalues.astype(np.uint64)
 
 
-def minhash_jaccard(a: MinHash, b: MinHash) -> float:
-    return float(a.jaccard(b))
+def minhash_jaccard(a: np.ndarray, b: np.ndarray) -> float:
+    if len(a) != len(b) or not len(a):
+        return 0.0
+    return float(np.mean(a == b))
+
+
+def minhash_bytes(sig: np.ndarray) -> bytes:
+    return np.asarray(sig, dtype="<u8").tobytes()
+
+
+def minhash_from_bytes(raw: bytes) -> np.ndarray:
+    return np.frombuffer(raw, dtype="<u8")
 
 
 def bm25_idf(df: int, n_docs: int) -> float:
@@ -215,6 +227,10 @@ _FILE_EXT = re.compile(r"\.(?:py|js|ts|tsx|jsx|md|json|ya?ml|txt|csv|pdf|png|jpe
 _GENERIC_SUFFIXES = frozenset("font fonts app inc ltd llc".split())
 
 
+def looks_like_domain(text: str) -> bool:
+    return bool(_DOMAINISH.match(norm_key(text)))
+
+
 def entity_key(name: str) -> str:
     """Normalized identity key (planS2 §10.4 step 2): web addresses reduce to the
     registrable domain's label, file extensions and generic suffixes drop, then
@@ -222,8 +238,6 @@ def entity_key(name: str) -> str:
     s = norm_key(name).strip(_EDGE + " \"()[]{}")
     if _DOMAINISH.match(s):
         try:
-            import tldextract
-
             label = tldextract.extract(s).domain
             if label:
                 s = label
@@ -248,116 +262,9 @@ def site_from_url(url: str) -> str:
     if not url:
         return ""
     try:
-        import tldextract
-
         ext = tldextract.extract(url)
         if ext.domain and ext.suffix:
             return f"{ext.domain}.{ext.suffix}".lower()
     except Exception:
         pass
     return ""
-
-
-_GENERIC_TITLE = re.compile(
-    r"^(?:space\s+\d+|untitled(?:\s+document)?|new\s+tab|document|window)$", re.I
-)
-_LISTING_URL = re.compile(r"news\.ycombinator\.com/(?:news|newest|shownew|ask|show|jobs)(?:\?|$)", re.I)
-_NAV_CAPTION = re.compile(
-    r"\b(?:switched from|clicked on a link|clicked on a specific item|opened a new tab|navigated to|"
-    r"reading an article on|viewing the github repository|github repository page for|focused on the)\b",
-    re.I,
-)
-_DEST_CAPTION = re.compile(
-    r"(?:switched from .+? to (?:the )?|clicked on a link to (?:the )?|reading an article on (?:the )?|"
-    r"github repository page for ['\"]?|viewing the github repository for ['\"]?|post regarding )"
-    r"(.+?)(?:\s+website|\s+page|\s+about|\s+project|\s+repository|,|\.|$)",
-    re.I,
-)
-_HN_ITEM = re.compile(r"\d+\.\s*(?:[▲A►●4]\s*)?(.+?)\s+\([\w.-]+\)", re.I)
-
-
-def is_generic_title(title: str) -> bool:
-    t = normalize(title)
-    return not t or bool(_GENERIC_TITLE.match(t))
-
-
-def is_listing_url(url: str) -> bool:
-    return bool(url and _LISTING_URL.search(url))
-
-
-def navigation_caption(caption: str) -> bool:
-    return bool(caption and _NAV_CAPTION.search(caption))
-
-
-def destination_from_caption(caption: str) -> str:
-    if not caption:
-        return ""
-    m = re.search(r"github repository page for ['\"]?([^'\".,]+)", caption, re.I)
-    if m:
-        return f"{normalize(m.group(1))} (GitHub)"[:120]
-    m = re.search(r"repository (?:page )?for ['\"]?([^'\".,]+)", caption, re.I)
-    if m:
-        return f"{normalize(m.group(1))} (GitHub)"[:120]
-    m = re.search(r"post regarding (.+?)(?:\.|$)", caption, re.I)
-    if m:
-        return normalize(m.group(1))[:120]
-    m = re.search(r"article on (?:the )?(.+?) website", caption, re.I)
-    if m:
-        return normalize(m.group(1))[:120]
-    m = _DEST_CAPTION.search(caption)
-    if m:
-        dest = normalize(m.group(1).strip("'\""))
-        if dest and not dest.lower().startswith(("the ", "a ", "an ")):
-            return dest[:120]
-    return ""
-
-
-def hn_headlines(screen_text: str, *, limit: int = 12) -> list[str]:
-    """Article titles visible on a Hacker News listing page (OCR-tolerant)."""
-    if not screen_text:
-        return []
-    out: list[str] = []
-    for m in _HN_ITEM.finditer(screen_text):
-        title = normalize(m.group(1))
-        if len(title) >= 8 and title not in out:
-            out.append(title)
-        if len(out) >= limit:
-            break
-    return out
-
-
-def page_label(title: str, *, url: str = "", caption: str = "", screen_text: str = "", site: str = "") -> str:
-    """Human-readable page name when the window title is generic (Arc 'Space 1', etc.)."""
-    dest = destination_from_caption(caption)
-    if dest:
-        return dest
-    if not is_generic_title(title):
-        return normalize(title)
-    if url and not is_listing_url(url):
-        try:
-            import tldextract
-
-            ext = tldextract.extract(url)
-            if ext.domain:
-                host = f"{ext.domain}.{ext.suffix}" if ext.suffix else ext.domain
-                path = (url.split("?", 1)[0].split("#", 1)[0].rstrip("/").split("/")[-1] or "").replace("-", " ")
-                if path and path not in ("news", "index", "html"):
-                    return f"{normalize(path)} ({host})"
-                return host
-        except Exception:
-            pass
-    heads = hn_headlines(screen_text, limit=1)
-    if heads:
-        return heads[0]
-    if site:
-        return site
-    return normalize(title) or "page"
-
-
-def page_identity(title: str, *, url: str = "", caption: str = "", screen_text: str = "") -> str:
-    """Dedup key for enumerate: URL when known, else a stable label — never bare 'Space 1'."""
-    u = url.split("#")[0].rstrip("/") if url else ""
-    if u and not is_listing_url(u):
-        return u
-    label = page_label(title, url=url, caption=caption, screen_text=screen_text)
-    return f"{label}\x00{hashlib.sha1(normalize(caption)[:200].encode()).hexdigest()[:10]}"

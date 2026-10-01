@@ -4,13 +4,20 @@ All model calls go to APIs (plans Rev 2: no locally hosted models). Each
 component may point at its own endpoint; unset components fall back to
 CORE_LM_*. Blank env values count as unset. Tunables are read from
 `DISCRETE_<NAME>` env vars, with the plan defaults below.
+
+Per-model request settings (`<PREFIX>_EXTRA_TOKENS`, `_REASONING_EFFORT`,
+`_TEMPERATURE`, `_JSON_MODE`, `_TIMEOUT_S`, `_EXTRA_BODY`) cascade the same way
+as the model name, so any OpenAI-compatible model, reasoning models included,
+is a `.env` change, not a code change. See `.env.example`.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar, cast
 
 from dotenv import load_dotenv
 
@@ -34,22 +41,26 @@ def first(*names: str) -> str | None:
     return None
 
 
-def _typed(name: str, default):
+V = TypeVar("V", bool, int, float, str, list[str])
+
+
+def _typed(name: str, default: V) -> V:
+    """`DISCRETE_<name>` parsed to the type of `default`; the default if unset or invalid."""
     raw = env(f"DISCRETE_{name}")
     if raw is None:
         return default
     try:
         if isinstance(default, bool):
-            return raw.lower() in ("1", "true", "yes", "on")
+            return cast(V, raw.lower() in ("1", "true", "yes", "on"))
         if isinstance(default, int):
-            return int(raw)
+            return cast(V, int(raw))
         if isinstance(default, float):
-            return float(raw)
-        if isinstance(default, (list, tuple)):
-            return [p.strip() for p in raw.split(",") if p.strip()]
+            return cast(V, float(raw))
+        if isinstance(default, list):
+            return cast(V, [p.strip() for p in raw.split(",") if p.strip()])
     except ValueError:
         return default
-    return raw
+    return cast(V, raw)
 
 
 @dataclass(frozen=True)
@@ -58,16 +69,61 @@ class Endpoint:
     base_url: str | None
     api_key: str | None
     model: str | None
+    prefix: str = ""  # the component's own env prefix, e.g. CAPTION_LM (for messages)
+    # Request settings; None = use what the calling code asks for.
+    extra_tokens: int = 0  # added to every max_tokens: room for a reasoning model to think
+    reasoning_effort: str | None = None  # minimal | low | medium | high
+    temperature: float | None = None
+    no_temperature: bool = False  # TEMPERATURE=off: never send one (some models reject it)
+    json_mode: bool = True  # False: skip response_format (some models reject it)
+    timeout_s: float | None = None
+    extra_body: str = ""  # JSON object merged into every request body
 
     @property
     def configured(self) -> bool:
         return bool(self.api_key and self.model)
 
+    @property
+    def is_openrouter(self) -> bool:
+        return "openrouter.ai" in (self.base_url or "")
+
+    def body_extras(self) -> dict:
+        """Request fields beyond the OpenAI basics: reasoning effort and EXTRA_BODY."""
+        out: dict = {}
+        if self.reasoning_effort:
+            if self.is_openrouter:
+                out["reasoning"] = {"effort": self.reasoning_effort}
+            else:
+                out["reasoning_effort"] = self.reasoning_effort
+        if self.extra_body:
+            out.update(json.loads(self.extra_body))
+        return out
+
+    def settings(self) -> dict:
+        """The non-default request settings, for `doctor` and bench snapshots."""
+        out: dict = {}
+        if self.extra_tokens:
+            out["extra_tokens"] = self.extra_tokens
+        if self.reasoning_effort:
+            out["reasoning_effort"] = self.reasoning_effort
+        if self.no_temperature:
+            out["temperature"] = "off"
+        elif self.temperature is not None:
+            out["temperature"] = self.temperature
+        if not self.json_mode:
+            out["json_mode"] = False
+        if self.timeout_s is not None:
+            out["timeout_s"] = self.timeout_s
+        if self.extra_body:
+            out["extra_body"] = self.extra_body
+        return out
+
     def describe(self) -> str:
         if not self.configured:
             return f"{self.name}: (not configured)"
         host = (self.base_url or "https://api.openai.com/v1").split("//")[-1].split("/")[0]
-        return f"{self.name}: {self.model} @ {host}"
+        extras = ", ".join(f"{k}={v}" for k, v in self.settings().items())
+        return f"{self.name}: {self.model} @ {host}" + (f"  [{extras}]" if extras else "")
 
 
 _TAIL_BASE = ("CORE_LM_API_BASE",)
@@ -75,11 +131,49 @@ _TAIL_KEY = ("CORE_LM_API_KEY", "OPENAI_API_KEY")
 _TAIL_MODEL = ("CORE_LM_MODEL_NAME",)
 
 
+class ConfigError(ValueError):
+    """A malformed setting in .env, named so it can be fixed."""
+
+
+def _setting(prefixes: list[str], field: str) -> tuple[str, str] | None:
+    """(env name, value) of the first `<prefix>_<field>` that is set."""
+    for p in prefixes:
+        v = env(f"{p}_{field}")
+        if v is not None:
+            return f"{p}_{field}", v
+    return None
+
+
 def _ep(name: str, *prefixes: str, model_fallback: bool = True) -> Endpoint:
     bases = [f"{p}_API_BASE" for p in prefixes] + list(_TAIL_BASE)
     keys = [f"{p}_API_KEY" for p in prefixes] + list(_TAIL_KEY)
     models = [f"{p}_MODEL_NAME" for p in prefixes] + (list(_TAIL_MODEL) if model_fallback else [])
-    return Endpoint(name, first(*bases), first(*keys), first(*models))
+    # Request settings cascade like the model name: component, then CORE_LM for chat
+    # components. Embeddings and rerank never inherit chat settings from CORE_LM.
+    chain = list(prefixes) + (["CORE_LM"] if model_fallback else [])
+    opts: dict = {}
+    try:
+        if got := _setting(chain, "EXTRA_TOKENS"):
+            opts["extra_tokens"] = int(got[1])
+        if got := _setting(chain, "REASONING_EFFORT"):
+            if got[1].lower() not in ("none", "default"):
+                opts["reasoning_effort"] = got[1].lower()
+        if got := _setting(chain, "TEMPERATURE"):
+            if got[1].lower() in ("off", "none"):
+                opts["no_temperature"] = True
+            else:
+                opts["temperature"] = float(got[1])
+        if got := _setting(chain, "JSON_MODE"):
+            opts["json_mode"] = got[1].lower() in ("1", "true", "yes", "on")
+        if got := _setting(chain, "TIMEOUT_S"):
+            opts["timeout_s"] = float(got[1])
+        if got := _setting(chain, "EXTRA_BODY"):
+            if not isinstance(json.loads(got[1]), dict):
+                raise ValueError("must be a JSON object")
+            opts["extra_body"] = got[1]
+    except ValueError as exc:  # json.JSONDecodeError is a ValueError
+        raise ConfigError(f"{got[0] if got else name}: {exc}") from None
+    return Endpoint(name, first(*bases), first(*keys), first(*models), prefix=prefixes[0], **opts)
 
 
 def caption_endpoint() -> Endpoint:
@@ -131,6 +225,7 @@ def all_endpoints() -> list[Endpoint]:
         embedding_endpoint(),
         rerank_endpoint(),
         writer_endpoint(),
+        bubble_vision_endpoint(),
     ]
 
 
@@ -154,6 +249,7 @@ def frames_dir() -> Path:
 
 
 def golden_dir() -> Path:
+    """Reviewed evaluation cases (read-only at runtime)."""
     return ROOT / "golden"
 
 
@@ -190,6 +286,10 @@ class T:
         ["figma", "illustrator", "photoshop", "sketch", "screen sharing", "remote desktop", "affinity"],
     )]
     LLM_TIMEOUT_S = _typed("LLM_TIMEOUT_S", 60.0)
+    # Vision calls in flight at once; captures never wait for them (capture/enrich.py).
+    ENRICH_CONCURRENCY = _typed("ENRICH_CONCURRENCY", 2)
+    # Windows remembered for the frame-duplicate check.
+    LAST_KEPT_MAX = _typed("LAST_KEPT_MAX", 512)
 
     # ---- Stage 2 (planS2 §13)
     DEDUP_JACCARD_THRESHOLD = _typed("DEDUP_JACCARD_THRESHOLD", 0.80)
@@ -227,6 +327,8 @@ class T:
     ENTITY_PAGES_PER_RUN = _typed("ENTITY_PAGES_PER_RUN", 25)
     FRAME_TTL_DAYS = _typed("FRAME_TTL_DAYS", 3.0)
     SCREEN_TEXT_TTL_DAYS = _typed("SCREEN_TEXT_TTL_DAYS", 90.0)
+    # Measurement rows (perf_calls, perf_samples) kept this long; `discrete bench` reads them.
+    PERF_TTL_DAYS = _typed("PERF_TTL_DAYS", 90.0)
     OUTBOX_MAX_AGE_S = _typed("OUTBOX_MAX_AGE_S", 600.0)
     EMBED_BATCH = _typed("EMBED_BATCH", 64)
     EMBED_TEXT_CHARS = _typed("EMBED_TEXT_CHARS", 2000)

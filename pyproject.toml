@@ -29,7 +29,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "pyright>=1.1.380"]
 
 [project.scripts]
 discrete = "discrete.cli:main"
@@ -40,3 +40,34 @@ include = ["discrete*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "display: needs a logged-in macOS session with a real screen (skip on CI with -m 'not display')",
+]
+
+[tool.ruff]
+line-length = 135
+target-version = "py311"
+extend-exclude = [".venv", "docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC"]
+ignore = [
+    "E731",  # small lambdas assigned to names are used deliberately
+    "B008",  # dataclass field defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"discrete/*/prompts.py" = ["E501"]  # model prompts: line breaks would change the text sent
+
+[tool.ruff.lint.isort]
+known-first-party = ["discrete"]
+
+[tool.pyright]
+include = ["discrete", "tools"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"
+reportMissingModuleSource = false
+# pyobjc ships no type stubs; its frameworks resolve at runtime only.
+reportAttributeAccessIssue = "warning"

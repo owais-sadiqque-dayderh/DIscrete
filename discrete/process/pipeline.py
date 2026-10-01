@@ -2,22 +2,25 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 
 from .. import textkit as tk
 from ..config import T, insight_endpoint
-from ..llm import EXPECTED_ERRORS, NotConfigured, complete_json, embed
-from ..store import ClaimDraft, Store
+from ..llm import EXPECTED_ERRORS, LLMError, NotConfigured, complete_json, embed
+from ..models import ClaimDraft
+from ..perf import PERF
+from ..store import Store
 from ..timeutil import to_local
+from .embed_worker import claim_text
 from .entities import attach_claim_mentions, note_candidates, structural_candidates
-from .prompts import DRAFT_EPISODE_PROMPT, RELATE_PROMPT
+from .prompts import DRAFT_EPISODE_PROMPT, RELATE_BLOCK, RELATE_PROMPT
 from .validation import atomic, injection_drop, subject_ok, verify_evidence
 
 log = logging.getLogger("discrete.process.pipeline")
 
 _KINDS = ("event", "fact", "preference")
+_RELATIONS = ("same", "refines", "contradicts", "unrelated")
 
 
 @dataclass
@@ -30,6 +33,17 @@ class DraftOutcome:
 
     def reject(self, reason: str) -> None:
         self.rejected[reason] = self.rejected.get(reason, 0) + 1
+
+
+@dataclass
+class _Durable:
+    """A validated fact/preference on its way through the merge."""
+
+    cd: ClaimDraft
+    text: str  # embedding text (claim text + context)
+    vec: list[float] | None = None
+    candidates: list = field(default_factory=list)
+    relations: dict[int, str] = field(default_factory=dict)
 
 
 class ProcessPipeline:
@@ -49,7 +63,10 @@ class ProcessPipeline:
         if not await self.store.begin_draft(episode_id):
             return None  # someone else is drafting it, or it is not ready
         try:
-            return await self._draft(episode_id)
+            with PERF.timer("draft.episode", ref_id=episode_id) as t:
+                res = await self._draft(episode_id)
+                t.n = res.added + res.reinforced
+            return res
         except EXPECTED_ERRORS as exc:
             log.warning("episode %s draft failed: %s", episode_id, exc)
             await self.store.draft_failed(episode_id)
@@ -82,6 +99,7 @@ class ProcessPipeline:
         t1 = max(r["ended_at"] for r in rows)
         counts = {"event": 0, "durable": 0}
         names_seen: list[str] = []
+        durables: list[_Durable] = []
         for item in data.get("claims") or []:
             if not isinstance(item, dict):
                 continue
@@ -104,8 +122,9 @@ class ProcessPipeline:
                 await self._mentions(cid, cd)
                 outcome.added += 1
             else:
-                op = await self._merge(cd)
-                setattr(outcome, op, getattr(outcome, op) + 1)
+                durables.append(_Durable(cd=cd, text=claim_text(cd.text, cd.context)))
+        for op in await self._merge(durables):
+            setattr(outcome, op, getattr(outcome, op) + 1)
 
         # Entity candidates (planS2 §10.2): VLM working entities, claim entities, the
         # structural pass on AX text, and ground-truth app/site where the user acted.
@@ -132,9 +151,10 @@ class ProcessPipeline:
                     kept.append(line)
             excerpt = tk.truncate("\n".join(kept), T.DRAFT_TEXT_CHARS_PER_OBS)
             acted = "acted" if (r["keys"] or r["clicks"] or r["clipboard"]) else "viewed only"
+            page = f" page={r['page_title']!r}" if r["page_title"] else ""
             blocks.append(
                 f"[observation_id={r['id']}] {to_local(r['started_at']):%H:%M} app={r['app']} site={r['site']} "
-                f"window={r['window_title']!r} ({acted}: keys={r['keys']} clicks={r['clicks']} "
+                f"window={r['window_title']!r}{page} ({acted}: keys={r['keys']} clicks={r['clicks']} "
                 f"scrolls={r['scrolls']} copies={r['clipboard']})\n"
                 f"caption: {r['caption']}\n<<<DATA>>>\n{excerpt}\n<<<END>>>"
             )
@@ -143,8 +163,6 @@ class ProcessPipeline:
         )
         data = await complete_json(self.ep, [{"role": "user", "content": prompt}], max_tokens=2500)
         if not isinstance(data, dict):
-            from ..llm import LLMError
-
             raise LLMError("draft: not an object")
         return data
 
@@ -163,7 +181,7 @@ class ProcessPipeline:
             if not isinstance(ev, dict):
                 continue
             try:
-                oid = int(ev.get("observation_id"))
+                oid = int(ev.get("observation_id"))  # type: ignore[arg-type]  # None → TypeError
             except (TypeError, ValueError):
                 continue
             obs = by_id.get(oid)
@@ -194,63 +212,74 @@ class ProcessPipeline:
 
     # ----------------------------------------------------------- online merge
 
-    async def _candidates(self, cd: ClaimDraft) -> list:
-        from ..retrieval.search import fts_ids
-
-        bm25 = await fts_ids(self.store, "claim", cd.text, limit=T.CANDIDATE_LIMIT * 3)
-        rankings = [bm25]
+    async def _merge(self, durables: list[_Durable]) -> list[str]:
+        """planS2 §6.2: ADD / REINFORCE / INVALIDATE for an episode's durable claims.
+        One embeddings call and one relation call per episode, however many claims;
+        each new claim's vector is stored with it, so it is never embedded again."""
+        if not durables:
+            return []
         try:
-            qv = (await embed([cd.text]))[0]
-            rankings.append([i for i, _ in await self.store.dense_search("claim", qv, limit=T.CANDIDATE_LIMIT * 3)])
+            vecs = await embed([d.text for d in durables])
         except (NotConfigured, *EXPECTED_ERRORS):
-            pass
+            vecs = [None] * len(durables)
+        for d, v in zip(durables, vecs, strict=True):
+            d.vec = v
+            d.candidates = await self._candidates(d)
+        await self._relate(durables)
+        return [await self._apply(d) for d in durables]
+
+    async def _candidates(self, d: _Durable) -> list:
+        rankings = [await self.store.fts_ids("claim", d.cd.text, limit=T.CANDIDATE_LIMIT * 3)]
+        if d.vec is not None:
+            rankings.append([i for i, _ in await self.store.dense_search("claim", d.vec, limit=T.CANDIDATE_LIMIT * 3)])
         fused = sorted(tk.rrf(rankings, k=T.RRF_K).items(), key=lambda x: -x[1])
         rows = {r["id"]: r for r in await self.store.get_claims([i for i, _ in fused])}
-        out = [rows[i] for i, _ in fused if i in rows and rows[i]["status"] == "live" and rows[i]["kind"] == cd.kind]
+        out = [rows[i] for i, _ in fused if i in rows and rows[i]["status"] == "live" and rows[i]["kind"] == d.cd.kind]
         return out[: T.RELATE_CANDIDATES]
 
-    async def _relate(self, cd: ClaimDraft, candidates: list) -> dict[int, str]:
-        listing = "\n".join(f"[id={c['id']}] {c['text']}" for c in candidates)
-        prompt = RELATE_PROMPT.format(kind=cd.kind, text=cd.text, candidates=listing)
+    async def _relate(self, durables: list[_Durable]) -> None:
+        asked = [(n, d) for n, d in enumerate(durables) if d.candidates]
+        if not asked:
+            return
+        blocks = "\n\n".join(
+            RELATE_BLOCK.format(n=n, kind=d.cd.kind, text=d.cd.text,
+                                candidates="\n".join(f"[id={c['id']}] {c['text']}" for c in d.candidates))
+            for n, d in asked
+        )
         try:
-            data = await complete_json(self.ep, [{"role": "user", "content": prompt}], max_tokens=300)
+            data = await complete_json(self.ep, [{"role": "user", "content": RELATE_PROMPT.format(blocks=blocks)}],
+                                       max_tokens=150 + 60 * sum(len(d.candidates) for _, d in asked))
         except EXPECTED_ERRORS:
-            return {}
-        rels: dict[int, str] = {}
+            return
         for r in (data or {}).get("relations") or []:
             try:
-                rid, rel = int(r.get("id")), str(r.get("relation") or "")
+                n, rid, rel = int(r.get("new")), int(r.get("id")), str(r.get("relation") or "")
             except (TypeError, ValueError, AttributeError):
                 continue
-            if rel in ("same", "refines", "contradicts", "unrelated"):
-                rels[rid] = rel
-        return rels
+            if 0 <= n < len(durables) and rel in _RELATIONS and any(c["id"] == rid for c in durables[n].candidates):
+                durables[n].relations[rid] = rel
 
-    async def _merge(self, cd: ClaimDraft) -> str:
-        """planS2 §6.2: ADD / REINFORCE / INVALIDATE. Never rewrites claim text."""
-        candidates = await self._candidates(cd)
-        rels = await self._relate(cd, candidates) if candidates else {}
-        by_rel = {rel: [c for c in candidates if rels.get(c["id"]) == rel] for rel in ("same", "contradicts", "refines")}
+    async def _apply(self, d: _Durable) -> str:
+        """Never rewrites claim text."""
+        cd = d.cd
+        vector = (d.vec, tk.content_hash(d.text)) if d.vec is not None else None
+        by_rel = {rel: [c for c in d.candidates if d.relations.get(c["id"]) == rel]
+                  for rel in ("same", "contradicts", "refines")}
         if by_rel["same"]:
-            target = by_rel["same"][0]
-            await self.store.reinforce_claim(target["id"], cd)
+            await self.store.reinforce_claim(by_rel["same"][0]["id"], cd)
             return "reinforced"
         if by_rel["contradicts"]:
             old = by_rel["contradicts"][0]
             if cd.modality == "passive" and old["modality"] in ("engaged", "stated"):
-                cid = await self.store.create_claim(cd)
+                cid = await self.store.create_claim(cd, vector=vector)
                 await self.store.flag_claims([cid, old["id"]], "contested")
                 await self._mentions(cid, cd)
                 return "added"
-            cid = await self.store.create_claim(cd, invalidates_id=old["id"])
+            cid = await self.store.create_claim(cd, invalidates_id=old["id"], vector=vector)
             await self.store.invalidate_claim(old["id"], by_id=cid, at=cd.occurred_from)
             await self._mentions(cid, cd)
             return "invalidated"
         refines = by_rel["refines"][0]["id"] if by_rel["refines"] else None
-        cid = await self.store.create_claim(cd, refines_id=refines)
+        cid = await self.store.create_claim(cd, refines_id=refines, vector=vector)
         await self._mentions(cid, cd)
         return "added"
-
-
-def dumps(obj) -> str:
-    return json.dumps(obj, ensure_ascii=False)

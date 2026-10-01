@@ -1,4 +1,9 @@
-"""CLI entrypoint."""
+"""CLI entrypoint.
+
+Modules that load macOS frameworks (capture, bubble, the runtime) are imported
+inside the commands that need them, so `discrete stats` or `query` never touch
+Quartz/AppKit and start fast. Everything else is imported here.
+"""
 
 from __future__ import annotations
 
@@ -8,20 +13,43 @@ import json
 import logging
 import os
 import sys
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from . import textkit as tk
-from .config import all_endpoints, db_path
+from .config import ConfigError, T, all_endpoints, db_path
+from .evaluation import bench
+from .evaluation.harness import compare, default_cases, run_suite, save_baseline
+from .llm import flush_usage
+from .perf import PERF
+from .process.consolidate import run_consolidation
+from .process.embed_worker import drain_outbox
+from .process.pipeline import ProcessPipeline
+from .retrieval.gaps import answer_and_learn, maybe_record_gap
+from .retrieval.grounding import evaluate
+from .retrieval.hybrid import retrieve
+from .retrieval.store_card import store_card, usage_table
+from .store import Store
 
 
 def _print(*a) -> None:
     print(*a, flush=True)
 
 
-async def _open():
-    from .store import Store
+def _err(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
 
-    return await Store.open()
+
+@asynccontextmanager
+async def _session():
+    """The store for one command; model usage is recorded before it closes."""
+    store = await Store.open()
+    try:
+        yield store
+    finally:
+        await flush_usage(store)
+        await store.close()
 
 
 async def cmd_run(args) -> int:
@@ -31,57 +59,51 @@ async def cmd_run(args) -> int:
     return 0
 
 
-def _err(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
-
-
 async def cmd_ask(args) -> int:
     """Headless Bubble: the exact hotkey pipeline, answer streamed to stdout."""
-    import time
-
     from .bubble.engine import BubbleEngine, render_records
     from .bubble.overlay_client import Overlay
 
     overlay = Overlay(enabled=args.overlay)
     overlay.start()
-    store = await _open()
     t0 = time.perf_counter()
 
     def progress(stage, detail) -> None:
         _err(f"[{time.perf_counter() - t0:5.2f}s] {stage} {detail}")
         overlay.status("Searching your memory" if stage == "searching" else f"Ranking {detail} moments")
 
-    try:
-        overlay.show(None)
-        overlay.status("Understanding")
-        engine = BubbleEngine(store)
-        p = await engine.prepare(args.text, app=args.app, progress=progress)
-        _err(f"[{time.perf_counter() - t0:5.2f}s] mode={p.mode} intent={p.result.plan.intent} hits={len(p.result.hits)} "
-             f"exhaustive={p.result.exhaustive} query={p.query[:60]!r}")
-        if args.records:
-            _err(render_records(p.result))
-        if p.mode == "empty":
-            print("(nothing on file about that)")
-            overlay.message("Nothing on file about that", tone="muted")
-        else:
-            overlay.status(f"Writing from {len(p.result.hits)} sources")
-            t_write = time.perf_counter()
+    async with _session() as store:
+        try:
+            overlay.show(None)
+            overlay.status("Understanding")
+            engine = BubbleEngine(store)
+            p = await engine.prepare(args.text, app=args.app, progress=progress)
+            _err(f"[{time.perf_counter() - t0:5.2f}s] mode={p.mode} intent={p.result.plan.intent} "
+                 f"hits={len(p.result.hits)} exhaustive={p.result.exhaustive} query={p.query[:60]!r}")
+            if args.records:
+                _err(render_records(p.result))
+            if p.mode == "empty":
+                print("(nothing on file about that)")
+                overlay.message("Nothing on file about that", tone="muted")
+            else:
+                overlay.status(f"Writing from {len(p.result.hits)} sources")
+                t_write = time.perf_counter()
 
-            def emit(chunk: str) -> bool:
-                sys.stdout.write(chunk)
-                sys.stdout.flush()
-                return True
+                def emit(chunk: str) -> bool:
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+                    return True
 
-            await engine.write(p, emit)
-            print()
-            overlay.done(f"Done · {time.perf_counter() - t0:.1f}s")
-            _err(f"[{time.perf_counter() - t0:5.2f}s] done (retrieve {p.timings['retrieve_s']:.2f}s, first chunk "
-                 f"+{p.timings.get('first_chunk_s', 0):.2f}s, write {time.perf_counter() - t_write:.2f}s)")
-    finally:
-        if overlay.enabled:
-            await asyncio.sleep(1.4)
-        overlay.close()
-        await store.close()
+                await engine.write(p, emit)
+                print()
+                PERF.sample("bubble.total", (time.perf_counter() - t0) * 1000)
+                overlay.done(f"Done · {time.perf_counter() - t0:.1f}s")
+                _err(f"[{time.perf_counter() - t0:5.2f}s] done (retrieve {p.timings['retrieve_s']:.2f}s, first "
+                     f"chunk +{p.timings.get('first_chunk_s', 0):.2f}s, write {time.perf_counter() - t_write:.2f}s)")
+        finally:
+            if overlay.enabled:
+                await asyncio.sleep(1.4)
+            overlay.close()
     return 0
 
 
@@ -104,7 +126,7 @@ async def cmd_overlay_demo(args) -> int:
     return 0
 
 
-async def cmd_doctor(_args) -> int:
+async def cmd_doctor(args) -> int:
     from .capture import accessibility as ax
     from .capture.frames import FrameGrabber, is_blank
     from .capture.ocr import ocr_image
@@ -121,38 +143,37 @@ async def cmd_doctor(_args) -> int:
     g = FrameGrabber()
     img = g.grab(ctx.bounds, max_width=1600)
     g.close()
-    if is_blank(img):
+    if img is None or is_blank(img):
         ok = False
         _print("ISSUE: captured frame is blank — grant Screen Recording to this terminal/app")
     else:
         _print(f"screen capture: OK ({img.width}x{img.height}); OCR sample: {tk.truncate(ocr_image(img), 80)!r}")
     ax_ok = ax.accessibility_granted()
     _print(f"accessibility: {'OK (AX text walk active)' if ax_ok else 'NOT granted — OCR-only screen text'}")
+    txt = ""
     if ax_ok and ctx.pid:
-        txt = ax.read_screen_text(ctx.pid, max_nodes=2000, timeout_ms=250, max_chars=200)
+        txt = ax.read_screen_text(ctx.pid, max_nodes=2000, timeout_ms=250, max_chars=4000)
         _print(f"AX text sample: {txt[:80]!r}")
+    if args.models:
+        from .evaluation.model_check import check_models, render
+
+        _print("\nmodels (one real request each, same prompts, limits and .env settings as the pipeline):")
+        results = await check_models(img, app=ctx.app, title=ctx.window_title, screen_text=txt)
+        _print(render(results))
+        ok = ok and all(r.ok for r in results)
     _print("OK" if ok else "issues found")
     return 0 if ok else 1
 
 
 async def cmd_stats(_args) -> int:
-    from .retrieval.store_card import store_card
-
-    store = await _open()
-    try:
+    async with _session() as store:
         _print(await store_card(store))
-    finally:
-        await store.close()
+        _print(await usage_table(store))
     return 0
 
 
 async def cmd_query(args) -> int:
-    from .retrieval.gaps import maybe_record_gap
-    from .retrieval.grounding import evaluate
-    from .retrieval.search import retrieve
-
-    store = await _open()
-    try:
+    async with _session() as store:
         result = await retrieve(store, args.text, field_text=args.field or "")
         d = evaluate(result)
         p = result.plan
@@ -170,22 +191,15 @@ async def cmd_query(args) -> int:
         if args.gap and d.mode in ("thin", "empty"):
             outcome = await maybe_record_gap(store, args.text, result=result)
             _print(f"gap outcome: {outcome.kind} {outcome.missed or outcome.gap_id or ''}")
-    finally:
-        await store.close()
     return 0
 
 
 async def cmd_process(args) -> int:
-    from .config import T
-    from .process.consolidate import run_consolidation
-    from .process.embed_worker import drain_outbox
-    from .process.pipeline import ProcessPipeline
-
-    store = await _open()
-    try:
+    async with _session() as store:
         recovered = []
         if args.recover:
             await store.reset_stuck_drafting()
+            await store.fail_stale_enrichment()
             recovered = await store.recover_open_episodes(older_than_s=T.EPISODE_IDLE_CLOSE_S)
         pipe = ProcessPipeline(store)
         drafted = []
@@ -200,28 +214,26 @@ async def cmd_process(args) -> int:
         if args.consolidate:
             out["consolidation"] = await run_consolidation(store)
         _print(json.dumps(out, indent=2, default=str))
-    finally:
-        await store.close()
+    return 0
+
+
+async def cmd_backfill_pages(args) -> int:
+    from .capture.enrich import backfill_page_fields  # PIL/frames only; no macOS frameworks
+
+    async with _session() as store:
+        _print(json.dumps(await backfill_page_fields(store, limit=args.limit), indent=2))
     return 0
 
 
 async def cmd_consolidate(_args) -> int:
-    from .process.consolidate import run_consolidation
-
-    store = await _open()
-    try:
+    async with _session() as store:
         _print(json.dumps(await run_consolidation(store), indent=2, default=str))
-    finally:
-        await store.close()
     return 0
 
 
 async def cmd_eval(args) -> int:
-    from .evaluation.harness import compare, default_cases, run_suite, save_baseline
-
     path = Path(args.cases) if args.cases else default_cases()
-    store = await _open()
-    try:
+    async with _session() as store:
         result = await run_suite(store, path)
         if not result.cases:
             _print(f"no cases in {path}")
@@ -243,92 +255,49 @@ async def cmd_eval(args) -> int:
             _print(json.dumps({k: v for k, v in cmp.items() if k != "baseline"}, indent=2))
             if cmp["regressions"] and not result.stale:
                 return 2
-    finally:
-        await store.close()
+    return 0
+
+
+async def cmd_bench(args) -> int:
+    if args.compare and len(args.compare) == 2:
+        _print(bench.compare(bench.load(args.compare[0]), bench.load(args.compare[1])))
+        return 0
+    async with _session() as store:
+        try:
+            window = await bench.parse_window(store, args.since, args.until)
+        except ValueError as exc:
+            _err(f"bad window: {exc}")
+            return 2
+        quality = None
+        if args.eval:
+            PERF.source = "eval"  # the eval's own model calls are not the pipeline's cost
+            suite = await run_suite(store, Path(args.cases) if args.cases else default_cases())
+            quality = suite.metrics() if suite.cases else None
+            await flush_usage(store)
+            PERF.source = "bench"
+        sources = [s.strip() for s in args.source.split(",") if s.strip()] if args.source else None
+        snap = await bench.collect(store, window, sources=sources, eval_metrics=quality, name=args.save or "")
+    if args.json:
+        _print(json.dumps(snap, indent=2, default=str))
+    else:
+        _print(bench.render(snap))
+    if args.save:
+        _print(f"\nsaved {bench.save(snap, args.save)}")
+    if args.compare:
+        _print("\n" + bench.compare(bench.load(args.compare[0]), snap))
     return 0
 
 
 async def cmd_gaps(_args) -> int:
-    store = await _open()
-    try:
+    async with _session() as store:
         for g in await store.open_gaps():
             _print(f"[{g['id']}] {g['question']}")
-    finally:
-        await store.close()
     return 0
 
 
 async def cmd_answer(args) -> int:
-    from .retrieval.gaps import answer_and_learn
-
-    store = await _open()
-    try:
+    async with _session() as store:
         _print(json.dumps(await answer_and_learn(store, args.gap_id, args.text)))
-    finally:
-        await store.close()
-    return 0
-
-
-async def cmd_replay_workaa(args) -> int:
-    """Replay the WorkAA prototype's observations through Stage 2 (no capture, no VLM).
-
-    WorkAA's `app` was model-written (insights.md §7.9): a domain-looking value
-    becomes `site`, and `app` becomes "Browser". `dense_text` stands in for
-    screen_text, and interaction is approximated from event_kind.
-    """
-    import sqlite3
-    from datetime import datetime, timezone
-
-    from .process.consolidate import run_consolidation
-    from .process.embed_worker import drain_outbox
-    from .process.episodes import EpisodeTracker
-    from .process.pipeline import ProcessPipeline
-    from .store import ObservationDraft, Store
-
-    target = Path(os.environ["DISCRETE_DB"])
-    if target.exists():
-        if not args.fresh:
-            _print(f"{target} exists; pass --fresh to rebuild it")
-            return 1
-        for suffix in ("", "-wal", "-shm"):
-            Path(str(target) + suffix).unlink(missing_ok=True)
-    src = sqlite3.connect(f"file:{Path(args.source).expanduser()}?mode=ro", uri=True)
-    src.row_factory = sqlite3.Row
-    rows = src.execute("SELECT * FROM observations WHERE origin='user' ORDER BY id").fetchall()[: args.limit or None]
-    store = await Store.open(str(target))
-    tracker = EpisodeTracker(store)
-    new = 0
-    try:
-        for r in rows:
-            ts = datetime.fromisoformat(r["created_at"]).replace(tzinfo=timezone.utc).timestamp()
-            raw_app = r["app"] or ""
-            url = r["url"] or ""
-            domainish = bool(tk._DOMAINISH.match(raw_app.lower()))
-            site = tk.site_from_url(url if url.startswith("http") else f"https://{url}") if url else ""
-            if domainish and not site:
-                site = tk.site_from_url(f"https://{raw_app}")
-            app = "Browser" if (domainish or site) and raw_app not in ("Adobe Illustrator 2026",) else raw_app
-            draft = ObservationDraft(
-                source="replay", event_kind=r["event_kind"], session_id=r["session_id"],
-                started_at=ts, ended_at=ts + 5, app=app, window_title=r["window_title"] or "", url=url, site=site,
-                screen_text=r["dense_text"] or "", text_source="replay", caption=r["caption"] or "",
-                keys=1 if r["event_kind"] == "keyboard" else 0, clicks=1 if r["event_kind"] == "mouse" else 0,
-            )
-            oid, is_new = await store.add_observation(draft)
-            if is_new and oid:
-                new += 1
-                await tracker.on_observation(oid, await store.get_observation(oid), session_id=draft.session_id)
-        await tracker.close_current()
-        _print(f"ingested {new}/{len(rows)} observations (rest collapsed as duplicates)")
-        pipe = ProcessPipeline(store)
-        while batch := await pipe.process_ready(limit=5):
-            for res in batch:
-                _print(f"episode {res.episode_id}: +{res.added} ~{res.reinforced} !{res.invalidated} rejected={res.rejected}")
-        _print(f"embedded {await drain_outbox(store)}")
-        if not args.no_consolidate:
-            _print(json.dumps(await run_consolidation(store), default=str))
-    finally:
-        await store.close()
     return 0
 
 
@@ -337,58 +306,88 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", help="store path (default: $DISCRETE_DATA_DIR/discrete.db)")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
+
     prun = sub.add_parser("run", help="capture and process continuously, with Bubble on the hotkey")
     prun.add_argument("--no-bubble", action="store_true", help="capture only; do not arm the hotkey")
+    prun.set_defaults(func=cmd_run)
+
     pk = sub.add_parser("ask", help="run the Bubble pipeline headlessly on some field text")
     pk.add_argument("text")
     pk.add_argument("--app", default="Terminal")
     pk.add_argument("--records", action="store_true", help="print the evidence pack sent to the writer")
     pk.add_argument("--overlay", action="store_true", help="also show the status pill")
+    pk.set_defaults(func=cmd_ask)
+
     pd = sub.add_parser("overlay-demo", help="preview the retrieval animation")
     pd.add_argument("--step", type=float, default=1.3)
-    sub.add_parser("doctor", help="check permissions, capture and endpoints")
-    sub.add_parser("stats", help="print the store card")
+    pd.set_defaults(func=cmd_overlay_demo)
+
+    pdoc = sub.add_parser("doctor", help="check permissions, capture and endpoints")
+    pdoc.add_argument("--models", action="store_true",
+                      help="also send one real request to each model (checks a new model in .env; costs < $0.01)")
+    pdoc.set_defaults(func=cmd_doctor)
+    sub.add_parser("stats", help="print the store card and model usage").set_defaults(func=cmd_stats)
+
     pp = sub.add_parser("process", help="draft ready episodes and drain the embedding outbox")
     pp.add_argument("--recover", action="store_true", help="also close open episodes left by a dead run")
     pp.add_argument("--consolidate", action="store_true")
-    sub.add_parser("consolidate")
-    pq = sub.add_parser("query")
+    pp.set_defaults(func=cmd_process)
+
+    sub.add_parser("consolidate", help="run offline consolidation now").set_defaults(func=cmd_consolidate)
+
+    pb = sub.add_parser("backfill-pages", help="one-off: add page titles/listing/source to rows captured before C6")
+    pb.add_argument("--limit", type=int, default=500)
+    pb.set_defaults(func=cmd_backfill_pages)
+
+    pq = sub.add_parser("query", help="show what retrieval returns for a question")
     pq.add_argument("text")
     pq.add_argument("--field", default="")
     pq.add_argument("--gap", action="store_true", help="verify and record a gap if unanswerable")
-    pe = sub.add_parser("eval")
+    pq.set_defaults(func=cmd_query)
+
+    pe = sub.add_parser("eval", help="score the golden retrieval cases")
     pe.add_argument("--cases", help="case file (default golden/cases.yaml)")
     pe.add_argument("--save-baseline", action="store_true")
     pe.add_argument("--verbose", action="store_true")
-    sub.add_parser("gaps", help="list open knowledge gaps")
-    pa = sub.add_parser("answer")
+    pe.set_defaults(func=cmd_eval)
+
+    pbe = sub.add_parser("bench", help="cost, speed, volume, quality and storage over a time window")
+    pbe.add_argument("--since", default="all", help="all | last-run | 90m / 6h / 2d | a local date/time")
+    pbe.add_argument("--until", help="a local date/time (default: now)")
+    pbe.add_argument("--source", help="comma list of run sources (default: all but eval/query/bench)")
+    pbe.add_argument("--eval", action="store_true", help="also score the golden cases (quality)")
+    pbe.add_argument("--cases", help="case file for --eval (default golden/cases.yaml)")
+    pbe.add_argument("--save", metavar="NAME", help="write the snapshot to bench/NAME.json")
+    pbe.add_argument("--compare", nargs="+", metavar="NAME",
+                     help="one name: compare it with this report; two: compare two saved snapshots")
+    pbe.add_argument("--json", action="store_true", help="print the snapshot as JSON")
+    pbe.set_defaults(func=cmd_bench)
+
+    sub.add_parser("gaps", help="list open knowledge gaps").set_defaults(func=cmd_gaps)
+
+    pa = sub.add_parser("answer", help="answer a knowledge gap (stored as a stated fact)")
     pa.add_argument("gap_id", type=int)
     pa.add_argument("text")
-    pr = sub.add_parser("replay-workaa", help="rebuild a store from WorkAA observations")
-    pr.add_argument("--source", default="~/.cache/workaa/workaa.db")
-    pr.add_argument("--limit", type=int, default=0)
-    pr.add_argument("--fresh", action="store_true")
-    pr.add_argument("--no-consolidate", action="store_true")
+    pa.set_defaults(func=cmd_answer)
     return p
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    if args.cmd == "replay-workaa" and not args.db:
-        from .config import data_dir
-
-        args.db = str(data_dir() / "replay-workaa.db")
+    PERF.source = "live" if args.cmd == "run" else args.cmd  # tags every measurement this process makes
     if args.db:
         os.environ["DISCRETE_DB"] = str(Path(args.db).expanduser())
     if args.cmd != "run":
         logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING,
                             format="%(levelname)s %(name)s %(message)s")
         logging.getLogger("httpx").setLevel(logging.WARNING)
-    handler = globals()["cmd_" + args.cmd.replace("-", "_")]
     try:
-        code = asyncio.run(handler(args))
+        code = asyncio.run(args.func(args))
     except KeyboardInterrupt:
         code = 130
+    except ConfigError as exc:
+        _err(f".env: {exc}")
+        code = 2
     sys.exit(code or 0)
 
 

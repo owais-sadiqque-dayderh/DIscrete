@@ -2,6 +2,10 @@
 
 Interaction counting happens on the event loop thread inside `arm()`, so the
 counts always describe exactly the pending capture's interval (insights.md §7.14).
+
+The capture lock covers only local work (frame hash, AX walk, OCR). The vision
+call happens later in capture/enrich.py: every capture is queued at once with a
+basic caption, so a slow model never holds up the next capture.
 """
 
 from __future__ import annotations
@@ -10,19 +14,21 @@ import asyncio
 import collections
 import logging
 import time
+from typing import Any
 
 import imagehash
 from PIL import Image
 
 from .. import textkit as tk
+from ..aio import spawn
 from ..config import T, caption_endpoint, frames_dir
-from ..llm import EXPECTED_ERRORS, complete_json, image_part
-from ..store import ObservationDraft
+from ..models import ObservationDraft
+from ..perf import PERF, since_ms
 from . import accessibility as ax
 from . import ocr
 from .browser import browser_url
-from .frames import FrameGrabber, downscale, is_blank
-from .prompts import CAPTURE_PROMPT
+from .enrich import Capture, EnrichJob
+from .frames import FrameGrabber, is_blank
 from .session import SessionTracker
 from .suppress import classify_origin, is_suppressed
 
@@ -50,13 +56,14 @@ class ScreenObserver:
         # next page (insights.md §7.37).
         self._recent: collections.deque = collections.deque(maxlen=6)
         self._last_event_mono = time.monotonic()
-        self._last_kept: dict[tuple, str] = {}  # (app, title, url) -> phash of last kept frame
+        # (app, title, url) -> phash of the last kept frame; least recently used evicted.
+        self._last_kept: collections.OrderedDict[tuple, str] = collections.OrderedDict()
         self._last_full_capture = 0.0
         self._last_full_text = ""
         self._warned_blank = False
         self.away = False
-        self.stats = {k: 0 for k in ("captured", "light", "frame_dup", "dropped_failed", "dropped_useless",
-                                     "degraded", "suppressed", "aborted_drift", "self")}
+        self.stats = {k: 0 for k in ("captured", "light", "frame_dup", "dropped_failed", "degraded",
+                                     "suppressed", "aborted_drift", "self")}
 
     # ------------------------------------------------------------ lifecycle
 
@@ -139,7 +146,11 @@ class ScreenObserver:
         delay = T.KEY_IDLE_DEBOUNCE_S if self._pending["kind"] == "keyboard" else T.MOUSE_DEBOUNCE_S
         if self._timer:
             self._timer.cancel()
-        self._timer = self._loop.call_later(delay, lambda: asyncio.create_task(self._flush()))
+        assert self._loop is not None, "arm() before start()"
+        self._timer = self._loop.call_later(delay, self._flush_soon)
+
+    def _flush_soon(self) -> None:
+        spawn(self._flush(), name="discrete-flush")
 
     # ---------------------------------------------------------------- frames
 
@@ -183,7 +194,7 @@ class ScreenObserver:
         after = own if own is not None else pending["before_img"]
         if after is None:
             self.stats["dropped_failed"] += 1  # degraded: no frame, but still segment the boundary
-        asyncio.create_task(self._finalize(pending, ctx, after, stale=True))
+        spawn(self._finalize(pending, ctx, after, stale=True), name="discrete-rotate")
 
     async def _flush(self) -> None:
         pending, self._pending = self._pending, None
@@ -208,25 +219,28 @@ class ScreenObserver:
         # A stale (rotated) capture describes a window we already left; its live AX/URL
         # would read the new window, so trust the context frozen at arm time instead.
         # The tab URL comes from the web view (window_context); AppleScript is a slow fallback.
+        t0 = time.perf_counter()
         url = ctx.url or ("" if stale else await asyncio.to_thread(browser_url, ctx.app))
-        counts = pending["counts"]
+        counts: dict[str, Any] = pending["counts"]
         started, ended = pending["started"], time.time()
         phash = str(imagehash.phash(after)) if after is not None else ""
         sig = (ctx.app, ctx.window_title, url)
         prev = self._last_kept.get(sig)
         if phash and prev and imagehash.hex_to_hash(phash) - imagehash.hex_to_hash(prev) <= T.FRAME_PHASH_MAX_DIST:
             self.stats["frame_dup"] += 1
-            await self.queue.put(ObservationDraft(
+            await self.queue.put(Capture(ObservationDraft(
                 source="screen", event_kind=pending["kind"], session_id=self.session.session_id,
                 started_at=started, ended_at=ended, app=ctx.app, bundle_id=ctx.bundle_id,
                 window_title=ctx.window_title, url=url, frame_duplicate=True, **counts,
-            ))
+            )))
             return
-        self._last_kept[sig] = phash
+        self._remember(sig, phash)
 
+        t_text = time.perf_counter()
         screen_text, text_source = await asyncio.to_thread(self._screen_text, ctx, after, stale)
+        PERF.sample("capture.text", since_ms(t_text), n=len(screen_text))
         origin = classify_origin(ctx.app, ctx.window_title, screen_text)
-        base = dict(
+        base: dict[str, Any] = dict(
             origin=origin, event_kind=pending["kind"], session_id=self.session.session_id,
             started_at=started, ended_at=ended, app=ctx.app, bundle_id=ctx.bundle_id,
             window_title=ctx.window_title, url=url, site=tk.site_from_url(url),
@@ -236,7 +250,7 @@ class ScreenObserver:
         if origin != "user":
             # The system's own output is stored for audit only; no model call.
             self.stats["self"] += 1
-            await self.queue.put(ObservationDraft(source="screen", caption=light_caption, **base))
+            await self.queue.put(Capture(ObservationDraft(source="screen", caption=light_caption, **base)))
             return
 
         text_change = 1.0 - tk.jaccard(tk.trigrams(screen_text), tk.trigrams(self._last_full_text))
@@ -246,27 +260,30 @@ class ScreenObserver:
             or since_full >= T.HEARTBEAT_MAX_GAP_S
         ):
             self.stats["light"] += 1
-            await self.queue.put(ObservationDraft(source="heartbeat", caption=light_caption, **base))
+            await self.queue.put(Capture(ObservationDraft(source="heartbeat", caption=light_caption, **base)))
             return
 
-        after_path = self._save(after, "after")
-        vlm = await self._vlm([before, after], ctx, url, screen_text, counts)
+        after_path = await asyncio.to_thread(self._save, after, "after")
         self._last_full_capture = time.time()
         self._last_full_text = screen_text
-        if vlm is None:
+        if not self.ep.configured:
             self.stats["degraded"] += 1
-            await self.queue.put(ObservationDraft(source="degraded", caption=light_caption, frame_path=after_path, **base))
+            await self.queue.put(Capture(ObservationDraft(
+                source="degraded", caption=light_caption, frame_path=after_path, **base)))
             return
-        caption = str(vlm.get("caption") or "").strip()
-        if not vlm.get("useful", True) or (len(screen_text) < 40 and len(caption) < 5):
-            self.stats["dropped_useless"] += 1
-            return
+        # Stored now with the basic caption; the vision caption follows (enrich.py).
         self.stats["captured"] += 1
-        await self.queue.put(ObservationDraft(
-            source="screen", caption=caption or light_caption,
-            entities=[str(e).strip() for e in (vlm.get("entities") or []) if str(e).strip()],
-            frame_path=after_path, **base,
-        ))
+        job = EnrichJob(frames=[f for f in (before, after) if f is not None], app=ctx.app,
+                        window_title=ctx.window_title, url=url, screen_text=screen_text, counts=dict(counts))
+        PERF.sample("capture.local", since_ms(t0))  # hash, text, frame save: all work before the queue
+        await self.queue.put(Capture(ObservationDraft(
+            source="screen", caption=light_caption, frame_path=after_path, enrich_state="pending", **base), job))
+
+    def _remember(self, sig: tuple, phash: str) -> None:
+        self._last_kept[sig] = phash
+        self._last_kept.move_to_end(sig)
+        while len(self._last_kept) > T.LAST_KEPT_MAX:
+            self._last_kept.popitem(last=False)
 
     def _screen_text(self, ctx: ax.WindowContext, after, stale: bool = False) -> tuple[str, str]:
         # For a stale (rotated) capture the live AX tree is the *new* window, so the
@@ -283,26 +300,6 @@ class ScreenObserver:
                 source = "ax+ocr" if source else "ocr"
         return tk.truncate(text, T.SCREEN_TEXT_MAX_CHARS), source
 
-    async def _vlm(self, frames: list, ctx: ax.WindowContext, url: str, screen_text: str, counts: dict) -> dict | None:
-        if not self.ep.configured:
-            return None
-        imgs = [image_part(_jpeg(downscale(f, T.VLM_MAX_WIDTH)), detail=T.VLM_IMAGE_DETAIL) for f in frames if f is not None]
-        prompt = CAPTURE_PROMPT.format(
-            app=ctx.app, window_title=ctx.window_title, url=url,
-            screen_text=tk.truncate(screen_text, 4000), **counts,
-        )
-        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}, *imgs]}]
-        for attempt in range(T.CAPTURE_MAX_RETRIES):
-            try:
-                data = await complete_json(self.ep, messages, max_tokens=400)
-                if isinstance(data, dict):
-                    return data
-            except EXPECTED_ERRORS as exc:
-                log.warning("VLM attempt %s failed: %s", attempt + 1, exc)
-            await asyncio.sleep(T.CAPTURE_RETRY_BASE_S * (2**attempt))
-        self.stats["dropped_failed"] += 1
-        return None
-
     # ------------------------------------------------------------- heartbeat
 
     async def heartbeat_tick(self) -> None:
@@ -317,11 +314,3 @@ class ScreenObserver:
             pending = {"kind": "heartbeat", "started": time.time(),
                        "counts": {"keys": 0, "clicks": 0, "scrolls": 0, "clipboard": 0}}
             await self._capture(pending, ctx, None, img, heartbeat=True)
-
-
-def _jpeg(img: Image.Image) -> bytes:
-    import io
-
-    buf = io.BytesIO()
-    img.convert("RGB").save(buf, "JPEG", quality=T.FRAME_JPEG_QUALITY)
-    return buf.getvalue()

@@ -8,8 +8,8 @@ from discrete.bubble.engine import BubbleEngine, field_query, needs_space, rende
 from discrete.bubble.keys import parse_hotkey
 from discrete.bubble.overlay_client import Overlay
 from discrete.capture import suppress
+from discrete.models import ClaimDraft
 from discrete.process.embed_worker import drain_outbox
-from discrete.store import ClaimDraft
 
 
 def test_field_query_takes_last_paragraph_and_sentence_boundary():
@@ -171,26 +171,31 @@ async def test_empty_field_never_retrieves(store, fake):
     assert "writer" not in fake.calls
 
 
-def test_page_label_from_navigation_caption():
-    from discrete import textkit as tk
+def test_page_label_comes_from_structured_fields():
+    """Labels come from the vision call's page_title and ground truth, never caption prose."""
+    from discrete.retrieval.pages import page_identity, page_label
 
-    cap = "The user switched from viewing Hacker News threads to a GitHub repository page for 'frank-386'."
-    assert tk.page_label("Space 1", caption=cap) == "frank-386 (GitHub)"
-    assert tk.destination_from_caption(
-        "The user clicked on a link to view details about a specific post regarding auto-vectorization."
-    ) == "auto-vectorization"
+    assert page_label("Space 1", page_title="frank-386") == "frank-386"
+    assert page_label("Space 1", url="https://github.com/acme/frank-386") == "frank 386 (github.com)"
+    assert page_label("Rust Book", url="https://doc.rust-lang.org/book/") == "Rust Book"
+    # A caption is never read for the label, however it is worded.
+    assert page_label("Space 1", site="example.org") == "example.org"
+    # A generic window title with no page title is never a shared identity.
+    assert page_identity("Space 1", caption="a") != page_identity("Space 1", caption="b")
+    assert page_identity("Space 1", page_title="Linux From Scratch", caption="a") == \
+        page_identity("Space 1", page_title="Linux From Scratch", caption="b")
 
 
 async def test_enumerate_answer_is_deterministic_list(store, fake):
     from discrete.bubble.engine import format_enumerate_answer
-    from discrete.retrieval.search import retrieve
-    from discrete.store import ObservationDraft
+    from discrete.models import ObservationDraft
+    from discrete.retrieval.hybrid import retrieve
 
     t = 1_789_000_000.0
     await store.add_observation(ObservationDraft(
         app="Arc", window_title="Space 1", url="",
-        screen_text="Hacker News new past comments",
-        caption="The user switched from Hacker News to the Linux From Scratch website.",
+        screen_text="build your own linux system from source",
+        caption="The user is reading a guide.", page_title="Linux From Scratch", navigated_from="Hacker News",
         started_at=t, ended_at=t + 10, session_id="s"))
     await drain_outbox(store)
     res = await retrieve(store, "list all articles I opened from hacker news")
@@ -201,8 +206,8 @@ async def test_enumerate_answer_is_deterministic_list(store, fake):
 
 async def test_enumerate_lists_the_trail_after_a_matched_listing(store, fake):
     """Pages opened *from* a listing never mention it; they come from the trail."""
-    from discrete.retrieval.search import retrieve
-    from discrete.store import ObservationDraft
+    from discrete.models import ObservationDraft
+    from discrete.retrieval.hybrid import retrieve
 
     t = 1_789_000_000.0
 
@@ -231,3 +236,36 @@ async def test_enumerate_lists_the_trail_after_a_matched_listing(store, fake):
     assert sum(1 for t, _ in titles if t == "Hacker News") == 1  # repeat visits collapse by URL
     pack = render_records(res)
     assert "★" in pack and "→" in pack and "Blueprint" in pack
+
+
+def test_opened_items_drop_listings_and_pages_from_other_sources():
+    from discrete.models import Hit, QueryPlan
+    from discrete.retrieval.enumerate import shape_enumerate_items
+
+    def hit(title, status, **kw):
+        return Hit("observation", abs(hash(title)) % 1000, title, "", status=status, strong=True, **kw)
+
+    hits = [hit("Front Page", "matched", is_listing=True),
+            hit("A deep dive into allocators", "trail", navigated_from="Front Page"),
+            hit("Search results", "trail", navigated_from="Web search"),
+            hit("Pricing", "trail"),
+            hit("Space 1", "trail")]
+    plan = QueryPlan(raw="list the articles I opened from front page", intent="enumerate")
+    # "Pricing" was only open nearby in time; the allocators page has a recorded source.
+    assert [h.title for h in shape_enumerate_items(hits, plan)] == ["A deep dive into allocators"]
+    # With no provenance recorded anywhere, the time trail is all there is.
+    bare = [hit("Front Page", "matched", is_listing=True), hit("Pricing", "trail"), hit("Changelog", "trail")]
+    assert [h.title for h in shape_enumerate_items(bare, plan)] == ["Pricing", "Changelog"]
+    # A question that is not about opened items keeps every line.
+    assert len(shape_enumerate_items(hits, QueryPlan(raw="list every page about allocators"))) == 5
+
+
+def test_every_cli_command_has_a_handler():
+    from discrete.cli import build_parser
+
+    p = build_parser()
+    sub = next(a for a in p._actions if a.dest == "cmd")
+    needs = {"ask": ["x"], "query": ["x"], "answer": ["1", "x"]}
+    for name in sub.choices:
+        args = p.parse_args([name, *needs.get(name, [])])
+        assert callable(args.func), name

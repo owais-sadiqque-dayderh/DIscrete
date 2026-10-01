@@ -16,14 +16,17 @@ from __future__ import annotations
 import contextlib
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 from .. import textkit as tk
-from ..config import T, USER_NAME, writer_endpoint
+from ..config import USER_NAME, T, writer_endpoint
 from ..llm import stream
+from ..models import Hit, RetrievalResult
+from ..perf import PERF
+from ..retrieval.enumerate import shape_enumerate_items
 from ..retrieval.grounding import GroundingDecision, evaluate
-from ..retrieval.search import Hit, RetrievalResult, retrieve, shape_enumerate_items
+from ..retrieval.hybrid import retrieve
 from ..store import Store
 from ..timeutil import now, to_local
 from .prompts import MODE_INSTRUCTIONS, WRITER_SYSTEM, WRITER_USER
@@ -106,11 +109,13 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
         if not result.hits:
             return "(no records)"
         lines = ["Timeline of pages/windows (★ matched the question directly; → opened shortly after a ★ "
-                 "page in the same app):"]
+                 "page in the same app; [listing] = a feed, index or results page):"]
         for h in result.hits:
             mark = "★" if h.status == "matched" else "→"
             site, _, caption = h.body.partition("\n")
-            line = f"{mark}{_when(h)} · {h.title} · {site}"
+            line = f"{mark}{_when(h)} · {h.title}{' [listing]' if h.is_listing else ''} · {site}"
+            if h.navigated_from:
+                line += f" · from {h.navigated_from}"
             if caption:
                 line += f"\n    ({caption})"
             lines.append(line)
@@ -159,8 +164,10 @@ class BubbleEngine:
             raise EmptyField(repr(field_text[:20]))
         result = await retrieve(self.store, query, field_text=field_text, progress=progress)
         decision = evaluate(result)
-        return Prepared(field_text=field_text, query=query, app=app or "an app", field_desc=field_desc or "text field",
-                        result=result, decision=decision, timings={"retrieve_s": time.perf_counter() - t0})
+        p = Prepared(field_text=field_text, query=query, app=app or "an app", field_desc=field_desc or "text field",
+                     result=result, decision=decision, timings={"retrieve_s": time.perf_counter() - t0})
+        PERF.sample("bubble.retrieve", p.timings["retrieve_s"] * 1000, n=len(result.hits))
+        return p
 
     def messages(self, p: Prepared) -> list[dict]:
         instruction = MODE_INSTRUCTIONS.get(p.mode, MODE_INSTRUCTIONS["grounded"])
@@ -228,4 +235,7 @@ class BubbleEngine:
         if tail and should_continue():
             push(tail)
         p.timings["write_s"] = time.perf_counter() - t0
+        if out:
+            PERF.sample("bubble.first_chunk", p.timings["first_chunk_s"] * 1000)  # writer start → first words
+            PERF.sample("bubble.write", p.timings["write_s"] * 1000, n=len(out))
         return out

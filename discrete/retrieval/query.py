@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass, field
 from datetime import timedelta
+
+from dateparser.search import search_dates
 
 from .. import textkit as tk
 from ..config import T, utility_endpoint
 from ..llm import EXPECTED_ERRORS, complete_json
+from ..models import QueryPlan
 from ..timeutil import day_bounds, from_local, now, to_local
 
 INTENTS = frozenset({"edit", "recall", "temporal", "aggregate", "enumerate", "world", "continuation", "mixed"})
@@ -42,6 +44,7 @@ _ENUM_SCAFFOLD = frozenset(
 def strip_scaffold(text: str) -> str:
     return " ".join(t for t in tk.content_tokens(text) if t not in _ENUM_SCAFFOLD)
 
+
 KIND_VOCAB = {
     "software": ("tool", "tools", "app", "apps", "software", "program", "programs", "editor", "editors"),
     "website": ("site", "sites", "website", "websites", "domain", "domains", "page", "pages"),
@@ -57,18 +60,6 @@ _TEMPORAL_CUE = re.compile(
     r"|\b(?:today|tonight|yesterday|morning|afternoon|evening|night|week|month|year|ago|last|since|earlier)\b",
     re.I,
 )
-
-
-@dataclass
-class QueryPlan:
-    raw: str
-    intent: str = "recall"
-    queries: list[str] = field(default_factory=list)
-    entities: list[str] = field(default_factory=list)
-    terms: list[str] = field(default_factory=list)
-    interval: tuple[float, float] | None = None
-    entity_kind_filter: str = ""
-    needs_store: bool = True
 
 
 _PLAN_PROMPT = """Plan a memory search for this question about the user's own past computer activity.
@@ -183,8 +174,6 @@ def parse_interval(text: str, ref: float | None = None) -> tuple[float, float] |
             return t - 3600, t + 3600
         return day_bounds(ref - n * 86400)
     try:
-        from dateparser.search import search_dates
-
         found = search_dates(text, settings={"PREFER_DATES_FROM": "past", "RELATIVE_BASE": local.replace(tzinfo=None)})
     except Exception:
         found = None

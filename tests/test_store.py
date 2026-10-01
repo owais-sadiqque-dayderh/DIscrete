@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 from discrete import textkit as tk
-from discrete.store import ClaimDraft, ObservationDraft, Store
+from discrete.models import ClaimDraft, ObservationDraft
+from discrete.store import Store
 
 
 @pytest.fixture
@@ -60,3 +61,106 @@ def test_quote_verification_window():
     quote, overlap = tk.best_window(body, {"artboard", "illustrator", "monochrome"})
     assert overlap > 0
     assert quote.lower() in body.lower()
+
+
+# --- docs/C6.md: storage layer ------------------------------------------------
+
+async def test_reads_do_not_wait_for_the_writer(tmp_db):
+    """Bubble's retrieval reads on its own connection (WAL), not behind background writes."""
+    import asyncio
+
+    store = await Store.open(tmp_db)
+    try:
+        await store.add_observation(ObservationDraft(app="A", window_title="T", screen_text="some text here",
+                                                     session_id="s"))
+        async with store._lock:  # a long write in progress
+            rows = await asyncio.wait_for(store.q("SELECT COUNT(*) FROM observations"), 1.0)
+        assert rows[0][0] == 1
+    finally:
+        await store.close()
+
+
+async def test_minhash_signatures_are_raw_bytes(tmp_db):
+    from discrete.config import T
+
+    store = await Store.open(tmp_db)
+    try:
+        oid, _ = await store.add_observation(ObservationDraft(app="A", screen_text="alpha beta gamma delta",
+                                                              session_id="s"))
+        (sig,) = (await store.q1("SELECT sig FROM obs_minhash WHERE obs_id=?", (oid,)))
+        assert len(sig) == 8 * T.DEDUP_MINHASH_PERMUTATIONS and sig[:1] != b"\x80"
+    finally:
+        await store.close()
+
+
+async def test_numbered_migrations_upgrade_a_pre_c6_store(tmp_path):
+    """A store written before numbered migrations (user_version 0, pickled MinHash,
+    no page columns) upgrades in place and keeps working."""
+    import pickle
+    import sqlite3
+
+    from datasketch import MinHash
+
+    from discrete.store import db
+
+    path = str(tmp_path / "old.db")
+    conn = sqlite3.connect(path)
+    for stmt in db._statements(db._BASE):
+        conn.execute(stmt)
+    db.m002_draft_attempts_and_digest_counts(conn)
+    conn.execute(
+        "INSERT INTO observations(id, source, event_kind, session_id, started_at, ended_at, app, window_title, "
+        "screen_text, caption, content_hash, text_hash, created_at, updated_at) "
+        "VALUES (1, 'screen', 'click', 's', 1, 2, 'Code', 'main.py', 'refactor the storage layer', "
+        "'editing code', 'h', 'th', 1, 1)")
+    mh = MinHash(num_perm=128)
+    mh.update(b"refactor")
+    conn.execute("INSERT INTO obs_minhash(obs_id, sig) VALUES (1, ?)", (pickle.dumps(mh),))
+    conn.commit()
+    conn.close()
+
+    store = await Store.open(path)
+    try:
+        assert (await store.q1("PRAGMA user_version"))[0] == db.SCHEMA_VERSION
+        assert await store.get_meta("schema_version") == str(db.SCHEMA_VERSION)
+        row = await store.get_observation(1)
+        assert row["page_title"] == "" and row["enrich_state"] == ""
+        (sig,) = await store.q1("SELECT sig FROM obs_minhash WHERE obs_id=1")
+        assert (tk.minhash_from_bytes(sig) == mh.hashvalues).all()
+        assert await store.fts_ids("observation", "storage layer") == [1]  # FTS rebuilt with page_title
+    finally:
+        await store.close()
+    again = await Store.open(path)  # re-opening runs nothing new
+    await again.close()
+
+
+async def test_model_usage_is_recorded_per_component(tmp_db):
+    from discrete.llm import METER, flush_usage
+    from discrete.retrieval.store_card import usage_table
+
+    store = await Store.open(tmp_db)
+    try:
+        METER.drain()
+        METER.add("caption", calls=2)
+        METER.add_usage("caption", {"prompt_tokens": 1200, "completion_tokens": 80, "cost": 0.0003})
+        METER.add("embedding", calls=1, prompt_tokens=30)
+        await flush_usage(store)
+        await flush_usage(store)  # drained: nothing is counted twice
+        usage = await store.usage_by_component()
+        assert usage["caption"] == {"calls": 2, "prompt_tokens": 1200, "completion_tokens": 80, "cost": 0.0003}
+        table = await usage_table(store)
+        assert "caption" in table and "1,200" in table and "total" in table and "0.0003" in table
+    finally:
+        await store.close()
+
+
+async def test_alias_cache_sees_new_aliases(tmp_db):
+    store = await Store.open(tmp_db)
+    try:
+        assert await store.all_entity_aliases() == []
+        eid = await store.create_entity("Grainient", "software", "grainient")
+        assert [r["entity_id"] for r in await store.all_entity_aliases()] == [eid]
+        await store.add_alias(eid, "Grainient App", "grainient")
+        assert len(await store.all_entity_aliases()) == 2
+    finally:
+        await store.close()

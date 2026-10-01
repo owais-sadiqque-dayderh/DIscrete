@@ -9,7 +9,7 @@ from rapidfuzz import fuzz
 
 from .. import textkit as tk
 from ..config import T, insight_endpoint
-from ..llm import EXPECTED_ERRORS, complete_json
+from ..llm import EXPECTED_ERRORS, complete_json, try_embed
 from ..store import Store
 from .prompts import ADJUDICATE_PROMPT
 
@@ -101,6 +101,7 @@ async def resolve_existing(store: Store, name: str, *, use_embeddings: bool = Fa
     if (eid := await store.find_entity_by_key(key)) is not None:
         return eid
     if len(key) >= 5:
+        # The alias list is cached by the store until the alias table changes.
         best, best_score = None, 0.0
         for a in await store.all_entity_aliases():
             if len(a["norm_key"]) < 5:
@@ -113,13 +114,10 @@ async def resolve_existing(store: Store, name: str, *, use_embeddings: bool = Fa
         if best is not None and best_score >= T.FUZZY_ADJUDICATE and await _adjudicate(name, best["alias"]):
             return best["entity_id"]
     if use_embeddings:
-        from ..llm import embed
-
-        try:
-            vec = (await embed([name]))[0]
-        except EXPECTED_ERRORS:
+        vec = await try_embed(name)
+        if vec is None:
             return None
-        for eid, sim in await store.dense_search("entity", vec, limit=3, min_sim=T.ENTITY_EMBED_SIM):
+        for eid, _sim in await store.dense_search("entity", vec, limit=3, min_sim=T.ENTITY_EMBED_SIM):
             row = await store.get_entity(eid)
             if row and await _adjudicate(name, row["name"]):
                 return eid
@@ -134,22 +132,23 @@ async def note_candidates(store: Store, names: list[str], episode_id: int) -> No
 
 async def attach_claim_mentions(store: Store, claim_id: int, claim_text: str, quotes: list[str], names: list[str]) -> int:
     """planS2 §10.5: a claim mention requires the alias in the claim text or a quote."""
-    n = 0
+    found = []
     haystack = "\n".join([claim_text, *quotes])
     for name in {n.strip() for n in names if n and n.strip()}:
         if not tk.contains_phrase(haystack, name):
             continue
         eid = await resolve_existing(store, name)
         if eid is not None:
-            await store.record_mention(eid, "claim", claim_id)
-            n += 1
-    return n
+            found.append((eid, "claim", claim_id))
+    await store.record_mentions(found)
+    return len(found)
 
 
 async def promote_recurring(store: Store) -> int:
     """Candidates seen in ≥ ENTITY_MIN_EPISODES episodes become entities (or aliases),
-    then mentions are back-filled from live claims."""
+    then mentions are back-filled from live claims in one pass."""
     promoted = 0
+    resolved: list[tuple[int, str]] = []
     for row in await store.entity_candidates():
         eps = tk.parse_json_list(row["episodes"])
         if len(eps) < T.ENTITY_MIN_EPISODES or not promotable(row["name"]):
@@ -161,12 +160,18 @@ async def promote_recurring(store: Store) -> int:
         else:
             await store.add_alias(eid, row["name"], row["name_norm"])
         await store.delete_candidate(row["name_norm"])
-        await _backfill_mentions(store, eid, row["name"])
+        resolved.append((eid, row["name"]))
+    await _backfill_mentions(store, resolved)
     return promoted
 
 
-async def _backfill_mentions(store: Store, entity_id: int, name: str) -> None:
-    for c in await store.live_claims():
-        quotes = [e["quote"] for e in await store.evidence_for_claim(c["id"]) if e["quote"]]
-        if tk.contains_phrase("\n".join([c["text"], *quotes]), name):
-            await store.record_mention(entity_id, "claim", c["id"])
+async def _backfill_mentions(store: Store, resolved: list[tuple[int, str]]) -> None:
+    """Claims (text or supporting quotes) naming each newly resolved entity. Live
+    claims and their quotes are loaded once for the whole batch."""
+    if not resolved:
+        return
+    found = []
+    for cid, text, quotes in await store.live_claims_with_quotes():
+        haystack = "\n".join([text, *quotes])
+        found += [(eid, "claim", cid) for eid, name in resolved if tk.contains_phrase(haystack, name)]
+    await store.record_mentions(found)

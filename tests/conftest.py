@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import tempfile
 from pathlib import Path
 
@@ -29,20 +30,37 @@ class FakeBackend:
         self.relations: dict[int, str] = {}
         self.consolidation: dict = {"claims": []}
         self.writer_reply = ""
+        self.caption: dict | None = {"caption": "The user reads a page.", "useful": True}
         self.calls: list[str] = []
+        self.embedded: list[str] = []  # every text sent to the embeddings endpoint
+
+    caption_gate = None  # an asyncio.Event the caption call waits on, when a test sets one
 
     async def chat(self, ep, messages, *, temperature, max_tokens, json_mode) -> str:
         p = _prompt(messages)
+        if "You enrich a screen-capture record" in p and self.caption_gate is not None:
+            await self.caption_gate.wait()
         if "Memory records:" in p:
             self.calls.append("writer")
             return self.writer_reply
         if "one episode of a person's computer activity" in p:
             self.calls.append("draft")
             return json.dumps(self.draft)
-        if "Compare a NEW claim" in p:
+        if "You enrich a screen-capture record" in p:
+            self.calls.append("caption")
+            if self.caption is None:
+                raise llm.LLMError("caption model down")
+            return json.dumps(self.caption)
+        if "Compare NEW claims" in p:
             self.calls.append("relate")
-            ids = [int(x) for x in __import__("re").findall(r"\[id=(\d+)\]", p)]
-            return json.dumps({"relations": [{"id": i, "relation": self.relations.get(i, "unrelated")} for i in ids]})
+            rels, cur = [], None
+            for line in p.splitlines():
+                if m := re.match(r"NEW (\d+) \(", line):
+                    cur = int(m.group(1))
+                elif (m := re.match(r"\[id=(\d+)\]", line)) and cur is not None:
+                    i = int(m.group(1))
+                    rels.append({"new": cur, "id": i, "relation": self.relations.get(i, "unrelated")})
+            return json.dumps({"relations": rels})
         if "Rewrite them as a clear" in p:
             self.calls.append("consolidate")
             return json.dumps(self.consolidation)
@@ -58,6 +76,7 @@ class FakeBackend:
         return "{}"
 
     async def embed(self, ep, texts):
+        self.embedded += list(texts)
         return [bow_vector(t) for t in texts]
 
     async def rerank(self, ep, query, docs, top_n):
@@ -73,6 +92,13 @@ def bow_vector(text: str, dim: int = 256) -> list[float]:
     if not v.any():
         v[0] = 1.0
     return (v / np.linalg.norm(v)).tolist()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_data_dir(monkeypatch, tmp_path):
+    """Frames, logs and pending cases go to a temp dir, never the user's real one."""
+    monkeypatch.setenv("DISCRETE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("DISCRETE_DB", raising=False)
 
 
 @pytest.fixture

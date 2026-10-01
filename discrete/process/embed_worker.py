@@ -1,15 +1,34 @@
-"""Drain the embedding outbox through the API (planS2 §11, Rev 2)."""
+"""Embeddings through the API (planS2 §11, Rev 2).
+
+Rows are embedded once. Observations are embedded as they are segmented
+(`embed_row`) and durable claims as they are merged, with the vector stored
+straight away; the outbox only catches what those paths missed (a failed
+call, an event claim, an episode or entity page, retention edits).
+"""
 
 from __future__ import annotations
 
 import logging
+import time
+
+import numpy as np
 
 from .. import textkit as tk
 from ..config import T
 from ..llm import EXPECTED_ERRORS, NotConfigured, embed
+from ..perf import PERF, since_ms
 from ..store import Store
 
 log = logging.getLogger("discrete.process.embed")
+
+
+def observation_text(row) -> str:
+    parts = (row["window_title"], row["page_title"], row["site"], row["caption"], row["screen_text"])
+    return tk.truncate("\n".join(p for p in parts if p), T.EMBED_TEXT_CHARS)
+
+
+def claim_text(text: str, context: str) -> str:
+    return tk.truncate(f"{text}\n{context}".strip(), T.EMBED_TEXT_CHARS)
 
 
 async def text_for(store: Store, kind: str, rid: int) -> str | None:
@@ -18,23 +37,45 @@ async def text_for(store: Store, kind: str, rid: int) -> str | None:
         r = await store.get_observation(rid)
         if not r or r["origin"] != "user":
             return None
-        return "\n".join(p for p in (r["window_title"], r["site"], r["caption"], r["screen_text"]) if p)
+        return observation_text(r)
     if kind == "claim":
         r = await store.get_claim(rid)
         if not r or r["status"] != "live":
             return None
-        return f"{r['text']}\n{r['context']}".strip()
+        return claim_text(r["text"], r["context"])
     if kind == "episode":
         r = await store.get_episode(rid)
         if not r or r["status"] != "closed":
             return None
-        return f"{r['title']}\n{r['summary']}".strip()
+        return tk.truncate(f"{r['title']}\n{r['summary']}".strip(), T.EMBED_TEXT_CHARS)
     if kind == "entity":
         r = await store.get_entity(rid)
         if not r or r["merged_into"] is not None:
             return None
-        return f"{r['name']}\n{r['summary']}".strip()
+        return tk.truncate(f"{r['name']}\n{r['summary']}".strip(), T.EMBED_TEXT_CHARS)
     return None
+
+
+def _unit(v) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float32)
+    return v / max(float(np.linalg.norm(v)), 1e-9)
+
+
+async def embed_row(store: Store, kind: str, rid: int, text: str) -> np.ndarray | None:
+    """Unit vector for a row's text, stored once. Reuses a stored vector for the same
+    text; on failure returns None and leaves the row in the outbox for a retry."""
+    if not text.strip():
+        return None
+    th = tk.content_hash(text)
+    if (have := await store.get_vector(kind, rid, th)) is not None:
+        return _unit(have)
+    try:
+        vec = (await embed([text]))[0]
+    except (NotConfigured, *EXPECTED_ERRORS) as exc:
+        log.debug("embed %s:%s deferred to the outbox: %s", kind, rid, exc)
+        return None
+    await store.save_embeddings([(kind, rid, vec, th)])
+    return _unit(vec)
 
 
 async def drain_once(store: Store, *, limit: int | None = None) -> int:
@@ -48,7 +89,7 @@ async def drain_once(store: Store, *, limit: int | None = None) -> int:
         if not text or not text.strip():
             await store.outbox_discard(kind, rid)
             continue
-        texts.append(tk.truncate(text, T.EMBED_TEXT_CHARS))
+        texts.append(text)
         refs.append((kind, rid))
     if not texts:
         return 0
@@ -58,15 +99,17 @@ async def drain_once(store: Store, *, limit: int | None = None) -> int:
         log.warning("embed batch failed: %s", exc)
         await store.outbox_failed(refs)
         return 0
-    await store.save_embeddings([(k, r, v, tk.content_hash(t)) for (k, r), v, t in zip(refs, vectors, texts)])
+    await store.save_embeddings([(k, r, v, tk.content_hash(t)) for (k, r), v, t in zip(refs, vectors, texts, strict=True)])
     return len(vectors)
 
 
 async def drain_outbox(store: Store, *, max_batches: int = 50) -> int:
-    total = 0
+    total, t0 = 0, time.perf_counter()
     for _ in range(max_batches):
         n = await drain_once(store)
         if not n:
             break
         total += n
+    if total:
+        PERF.sample("embed.outbox", since_ms(t0), n=total)
     return total

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import yaml
 
-from ..config import golden_dir
-from ..store import ClaimDraft, Store
+from ..config import data_dir
+from ..models import ClaimDraft, RetrievalResult
+from ..store import Store
 from .grounding import evaluate
-from .search import RetrievalResult, brute_verify, retrieve
+from .hybrid import brute_verify, retrieve
 
 log = logging.getLogger("discrete.retrieval.gaps")
 
@@ -45,14 +47,18 @@ async def answer_and_learn(store: Store, gap_id: int, answer: str) -> dict:
         occurred_from=gap["answered_at"], occurred_to=gap["answered_at"],
     )
     cid = await store.create_claim(draft)
-    await store.execute("UPDATE gaps SET claim_id=? WHERE id=?", (cid, gap_id))
+    await store.link_gap_claim(gap_id, cid)
     return {"ok": True, "claim_id": cid, "gap_id": gap_id}
 
 
+def pending_cases_path() -> Path:
+    """Runtime output lives in the data directory, never in the source tree; reviewed
+    golden files are never touched (insights.md §4)."""
+    return data_dir() / "auto_cases.pending.yaml"
+
+
 def _append_pending_case(question: str, missed: str) -> None:
-    """Never touches reviewed golden files (insights.md §4)."""
-    path = golden_dir() / "auto_cases.pending.yaml"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = pending_cases_path()
     cases = (yaml.safe_load(path.read_text()) or []) if path.exists() else []
     cases.append({"question": question, "expect_ref": missed, "source": "retrieval_miss"})
     path.write_text(yaml.safe_dump(cases, sort_keys=False))

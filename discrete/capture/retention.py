@@ -31,4 +31,5 @@ async def run_retention(store) -> dict:
     return {
         "frames_removed": purge_frames(),
         "screen_text_cleared": await store.clear_old_screen_text(ttl_days=T.SCREEN_TEXT_TTL_DAYS),
+        "perf_rows_removed": await store.prune_perf(ttl_days=T.PERF_TTL_DAYS),
     }
