@@ -18,7 +18,8 @@ Phases 18–19).
 | `exp_discrete/` created from `Discrete/` (working tree incl. uncommitted changes, own `.git` history) | ✅ 2026-10-06 |
 | Separate data dir `~/.cache/exp_discrete` seeded with a snapshot of the live db | ✅ |
 | Own venv, tests | ✅ 112 passing |
-| Feature plan (dreaming, firmer beliefs + cleanup, graph, version history) | 💬 Under discussion (below) |
+| Feature plan (dreaming, firmer beliefs + cleanup, graph, version history) | ✅ Agreed with the user 2026-10-06 ~21:30; building on branch `feat/memory-evolution` |
+| Branch `feat/memory-evolution` (baseline `main` = `41e2f9f`) | 🚧 Phases 1–4 built and unit-tested; benchmarks pending |
 | Disk space | ⚠️ Fell to ~270 MB free during setup; ~6.9 GB free a few minutes later (macOS reclaimed purgeable space). Still 97% full |
 | OpenRouter credit | ⚠️ ~$3.35 left (shared with live DIscrete) |
 
@@ -71,7 +72,143 @@ This audit shows where each proposed feature starts from. Code paths are relativ
 
 ---
 
-## Feature plan (under discussion)
+## Phase 1 — Research, bench rebuild, branch (2026-10-06, ~21:30–23:30 IST)
+
+- **User decisions:** agreed order (change log before dreaming); dreaming interval as a `.env` option; Markdown
+  memory "whatever is good"; baseline commit yes (benchmarks before/after, fallback). Work on a branch, brief at the
+  end with setup notes; the user decides on merging. New goals during the phase:
+  - **deep "why" answers**: e.g. "why did I download Helium?" should give "you saw Theo's X post (his video showed
+    the Helium browser), searched for helium, then downloaded it";
+  - **audit the input side**: is the AX tree too long, OCR vs a VLM, is the schema right, is it enough for preferences;
+  - the reliability bar of a large company; delegate sub-tasks to other agents if useful; pause and ask when a
+    resource (credit, disk) runs out.
+- **Git:** `main` = baseline commit `41e2f9f` (the copy as-is). Branch `feat/memory-evolution`. Baseline worktree
+  `exp_hindsight/exp_discrete_main` (git-excluded from Hindsight) runs the old code on the same data
+  (`PYTHONPATH=../exp_discrete_main`).
+- **Research** (sources in the feature plan below):
+  - **Cognition memory repo:** Markdown + git; dreaming = add patterns, merge duplicates, remove outdated, check
+    sources.
+  - **Honcho's dreamer:** asynchronous; explicit → deductive → inductive → abductive; conclusions build only on more
+    certain ones; peer cards.
+  - **Claude Code's Auto Dream:** needs ≥24 h and ≥5 sessions; 4 phases; prunes contradictions and stale entries.
+  - **Letta:** sleep-time agents.
+  - **mem0:** ADD/UPDATE/DELETE; its resolver silently deleted still-true memories; V3 dropped it; `history()` can't
+    find deleted ids.
+  - **Graphiti:** bi-temporal, invalidates rather than deletes.
+  - **MoM/P-Mem (arXiv 2609.25054):** typed provenance (support / supersede / contest / revoke …); recovers
+    committed errors that CRUD stores can't.
+  - **A-MEM:** links and neighbour evolution.
+  - **Screenpipe:** raw capture + pipes on schedules.
+- **The bench session had been lost.** `~/.cache/discrete` was reset ~22:06 on 2026-10-06, so DIscrete's
+  Sep 30/Oct 1 store behind the 46-question bench was gone. Rebuilt it:
+  - Hindsight bank `bench-v0` still held every observation's full text (transcript v1) and all 132 frames.
+  - `bench/export_hindsight_session.py` → `bench/private/g46/manifest.jsonl` (136 observations, 132 frames).
+  - `tools/replay_session.py` replays it with any checkout's pipeline. The golden file is copied to
+    `bench/private/g46/cases.yaml`.
+  - `bench/private/` is git-ignored (real screen data).
+  - `bench/run_g46.py`: the same judged harness as the closed log (DeepSeek v4 pro judge, DIscrete's answer-check
+    prompt, expected strings). It scores any checkout (`--code`) on a copy of a db.
+- **Second eval session:** `bench/export_discrete_session.py` turned the 2026-10-06 live snapshot into
+  `bench/private/live1006/manifest.jsonl` (251 captures, 225 frames). A golden set with "why" questions is being
+  written by a delegated agent.
+- **Cost:** replaying 136 captures through DIscrete costs about $0.10 (captions dominate). Credit is $3.04.
+
+## Phase 2 — Security and reliability
+
+- **Secret redaction** (`capture/redact.py`, ported from the Hindsight agent with its tests, 25):
+  - redacts screen text, titles and URLs in `ScreenObserver._capture`; a capture with a secret keeps no frame (its
+    caption is written from the redacted text);
+  - also redacts captions from the VLM and Bubble's field text;
+  - `DISCRETE_REDACT_SECRETS` (default on). Capture-level test included.
+- **Transient provider errors:** OpenRouter's upstream `404 model_not_found` ("Provider returned error") and
+  502/503 are retried with backoff (`LLM_PROVIDER_RETRIES=3`), for streams only before the first word.
+  - Seen live in this phase: the baseline replay lost the drafts of episodes 8 and 11 to it. DIscrete retried them
+    only 15 minutes later, and a replay never.
+  - A wrong model name (no "provider" in the error) is not retried.
+
+## Phase 3 — Change log, corrections, causal trails, actions
+
+- **Change log** (`store/history.py`, migration 7, `memory_events` + `memory_event_refs`). Every decision is an
+  event with actor, reason, and each touched claim's before/after:
+  - draft add / reinforce (with the evidence it added) / refine / invalidate / contest;
+  - consolidation merge;
+  - unsupported expiry;
+  - user forget / correct / gap answer;
+  - dream / trail / profile / cleanup (Phase 4).
+  - `revert_event` undoes any of them (a revert is an event, so it can be reverted). It refuses when later events
+    touched the same claims, unless `--force`. Nothing is hard-deleted, so the data for every version already
+    existed; the log adds why and undo.
+  - CLI: `history`, `changes`, `revert`.
+- **Forget/correct** (`store/corrections.py`):
+  - Forget retires the whole lineage and adds a suppression (text + vector). Drafting then drops a claim that
+    matches it (norm text, Jaccard ≥ 0.8 or cosine ≥ 0.90), so it isn't re-learned.
+  - Correct writes a `stated` version in the same lineage.
+- **Completed actions are always drafted.** In the live snapshot, episode 5 drafted 5 events and none was the
+  Helium download/install, its most important action (cap of 5). Now:
+  - the prompt puts actions with consequences first, with an `action` verb (`claims.action`), under a separate cap
+    (6);
+  - long episodes get +1 event per 3 min past 5 (cap 10);
+  - an event's time is its cited moments, not the whole episode.
+- **Causal trails** (`process/trails.py`, `store/links.py`). For each action:
+  - the drafting model reads the 30 minutes before it and proposes trigger/step moments;
+  - code keeps only moments that precede the action, whose quote is really on that screen and names the action's
+    distinctive term (e.g. "helium", picked by rarity, action verbs and their inflections excluded);
+  - the verifier then confirms each.
+  - Links (`led_to` / `step`) + a `trail` event; revertible.
+- **"Why" retrieval:**
+  - "why did I…", "what made me…" plan as intent `why`;
+  - `expand_why` puts the trail right after the matched action, or without one the moments just before it naming
+    the same thing (left to the support check);
+  - the support check keeps pre-verified trail links only next to a kept action;
+  - writer mode `why`: a hedged, time-ordered reason, never a stated motive.
+
+## Phase 4 — Dreaming, beliefs, profile, graph
+
+- **Dreaming** (`process/dream.py`, `store/beliefs.py`). Runs when both `DREAM_INTERVAL_MIN` (default 1440) has
+  passed and `DREAM_MIN_NEW_EPISODES` (5) episodes closed, or with `discrete dream`. Steps are independent:
+  1. **Patterns:**
+     - categories: project, interest, habit, tool, relationship, preference;
+     - code gates: cited ids exist, support from ≥ `DREAM_MIN_EPISODES` (3) episodes, habits/preferences also
+       ≥ `DREAM_MIN_DAYS` (2) days, frequency words need ≥ 5 days, never resting on another pattern, starts "The
+       user", atomic;
+     - then the independent verifier;
+     - a restated pattern (cosine ≥ 0.85) confirms the old one.
+     - A pattern is a claim (`kind='pattern'`) with `derived_from` and its supports' evidence, so strength and
+       confidence come from the same episode/day count.
+  2. **Audit:** confirm / retire existing patterns (verified); patterns whose support was all withdrawn retire.
+  3. **Contradiction sweep:**
+     - checks lasting memories with cosine 0.55–0.82, each pair asked once (stored as `checked` links);
+     - a conflict goes to the stated > engaged > passive, then newer, claim; the loser is invalidated with the
+       reason;
+     - too close to call → both flagged contested.
+  4. **Staleness:** facts, preferences and patterns unseen for 45 days are flagged stale (cleared when seen again);
+     patterns unseen for 120 days retire; events never go stale.
+  5. **Profile** (`process/profile.py`):
+     - sectioned (work, tools, interests, habits, preferences, people);
+     - every point cites memories, is checked in code and by the verifier;
+     - stored in meta, revertible (`discrete profile`).
+- **Belief strength:** `store.strengths()` gives episodes, days, first/last and tier (tentative / recurring /
+  established). Shown on lasting claims in Bubble's records, and the writer is told to word tentative ones as recent.
+  Questions about the user as a whole (`about_user` in the plan) get the profile as a record.
+- **Graph:**
+  - entities are promoted and `entity_edges` rebuilt every `ENTITY_INTERVAL_MIN` (10) and at each merge. The live
+    snapshot had 0 entities: 80 candidates (Arc in 7 episodes, Helium in 3) were waiting for an hourly merge that a
+    40-minute session never reached. `entity_edges` was never written by any code.
+  - Search adds memories mentioning entities the question names as one more ranking list (`ENTITY_RECALL`), with
+    `GRAPH_EXPAND` also their neighbours'.
+  - `discrete graph [NAME]`.
+- **jarvis for the branch:** `exp_discrete/jarvis` (state in `~/.cache/jarvis-exp_discrete`) with profile, patterns,
+  dream, changes, history, forget, correct, revert, graph, export; `search` replaces `why` for debugging.
+- **Tests:** 166 passing (history 7, trails 6, dream 14, redaction 26, provider retry 1, plus the original suite);
+  ruff clean.
+- **Delegated (running):**
+  - input-source and schema audit (Claude Opus) → `docs/audit_inputs.md`;
+  - Markdown/Obsidian + git export (Codex GPT-6-Sol) → `discrete/export.py`;
+  - live-session golden questions incl. "why" (Claude Opus) → `bench/private/live1006/cases.yaml`.
+
+---
+
+## Feature plan (agreed; see Phases 1–4 for what was built)
 
 Sources: Cognition "agent memory repo" (cognition.com/agent-memory-repo), Hindsight (code in
 `exp_hindsight/`), mem0, Honcho, Screenpipe, Graphiti, and lessons from the closed log.
