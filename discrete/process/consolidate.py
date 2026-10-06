@@ -31,6 +31,7 @@ async def _consolidate(store: Store) -> dict:
     report: dict = {}
     report["embedded"] = await drain_outbox(store)
     report["entities_promoted"] = await promote_recurring(store)
+    report["entity_edges"] = await store.rebuild_edges()
     report["clusters_refined"] = await _cluster_refine(store)
     report["entity_pages"] = await _entity_pages(store)
     report["digests"] = await _digests(store)

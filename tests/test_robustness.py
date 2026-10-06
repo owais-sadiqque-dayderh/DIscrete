@@ -418,3 +418,43 @@ async def test_slow_support_check_leaves_results_unverified_instead_of_stalling(
     r = RetrievalResult("q", QueryPlan("q"), [Hit("observation", 1, "Notes", "Budget review")])
     await support.verify_support(r)
     assert [h.ref_id for h in r.hits] == [1] and not r.hits[0].strong
+
+
+async def test_a_provider_glitch_is_retried_but_a_wrong_model_is_not(fake, monkeypatch):
+    import httpx
+    import openai
+
+    from discrete import llm
+    from discrete.config import T, insight_endpoint
+
+    monkeypatch.setattr(T, "LLM_PROVIDER_RETRY_S", 0.0)
+    req = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+
+    def err(body: str) -> openai.NotFoundError:
+        return openai.NotFoundError(body, response=httpx.Response(404, request=req), body=None)
+
+    glitch = err("Error code: 404 - {'error': {'message': 'Provider returned error', 'code': 404, "
+                 "'metadata': {'raw': 'model_not_found', 'provider_name': 'Meta'}}}")
+    calls = []
+
+    async def flaky(ep, messages, **kw):
+        calls.append(1)
+        if len(calls) < 3:
+            raise glitch
+        return "ok"
+
+    monkeypatch.setattr(fake, "chat", flaky)
+    assert await llm.complete(insight_endpoint(), [{"role": "user", "content": "x"}]) == "ok"
+    assert len(calls) == 3
+
+    async def wrong(ep, messages, **kw):
+        calls.append(1)
+        raise err("Error code: 404 - {'error': {'message': 'No endpoints found for meta/does-not-exist'}}")
+
+    calls.clear()
+    monkeypatch.setattr(fake, "chat", wrong)
+    try:
+        await llm.complete(insight_endpoint(), [{"role": "user", "content": "x"}])
+    except openai.NotFoundError:
+        pass
+    assert len(calls) == 1

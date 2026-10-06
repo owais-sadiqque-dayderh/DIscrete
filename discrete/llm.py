@@ -273,14 +273,47 @@ def _tuned(ep: Endpoint, temperature: float | None, max_tokens: int | None) -> t
     return temperature, max_tokens
 
 
+def provider_glitch(exc: BaseException) -> bool:
+    """A routed provider failing transiently: OpenRouter reports an upstream that briefly
+    lost the model as 404 model_not_found ("Provider returned error"), or a 502/503 the
+    SDK already retried. The same request usually succeeds seconds later. Our own
+    mistakes (a wrong model name in .env, a bad request) are not retried."""
+    if not isinstance(exc, openai.APIStatusError):
+        return False
+    if exc.status_code in (502, 503, 529):
+        return True
+    text = str(exc)
+    return exc.status_code == 404 and (
+        "Provider returned error" in text or ("model_not_found" in text and "provider_name" in text))
+
+
+async def _with_glitch_retry(fn, ep: Endpoint):
+    for attempt in range(T.LLM_PROVIDER_RETRIES + 1):
+        try:
+            return await fn()
+        except openai.APIStatusError as exc:
+            if attempt == T.LLM_PROVIDER_RETRIES or not provider_glitch(exc):
+                raise
+            delay = T.LLM_PROVIDER_RETRY_S * (2 ** attempt)
+            log.info("%s: provider glitch (%s), retry %d in %.1fs", ep.name, exc.status_code, attempt + 1, delay)
+            PERF.count(f"llm.{ep.name}.provider_retry")
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
+
+
 async def complete(ep: Endpoint, messages: list[dict], *, temperature: float | None = 0.0,
                    max_tokens: int | None = None, json_mode: bool = False) -> str:
     if not ep.configured:
         raise NotConfigured(f"{ep.name} endpoint not configured")
     temperature, max_tokens = _tuned(ep, temperature, max_tokens)
     json_mode = json_mode and ep.json_mode
-    with _metered(ep):
-        return await _backend.chat(ep, messages, temperature=temperature, max_tokens=max_tokens, json_mode=json_mode)
+
+    async def _once() -> str:
+        with _metered(ep):
+            return await _backend.chat(ep, messages, temperature=temperature, max_tokens=max_tokens,
+                                       json_mode=json_mode)
+
+    return await _with_glitch_retry(_once, ep)
 
 
 async def complete_json(ep: Endpoint, messages: list[dict], *, temperature: float | None = 0.0,
@@ -324,18 +357,28 @@ async def stream(ep: Endpoint, messages: list[dict], *, temperature: float | Non
             rec.first_ms = (time.perf_counter() - t0) * 1000
             yield reply
             return
-        async with contextlib.aclosing(fn(ep, messages, temperature=temperature, max_tokens=max_tokens)) as inner:
-            while True:
-                token = _CURRENT.set(rec)
-                try:
-                    piece = await anext(inner)
-                except StopAsyncIteration:
-                    break
-                finally:
-                    _CURRENT.reset(token)
-                if rec.first_ms is None:
-                    rec.first_ms = (time.perf_counter() - t0) * 1000
-                yield piece
+        for attempt in range(T.LLM_PROVIDER_RETRIES + 1):
+            try:
+                async with contextlib.aclosing(fn(ep, messages, temperature=temperature,
+                                                  max_tokens=max_tokens)) as inner:
+                    while True:
+                        token = _CURRENT.set(rec)
+                        try:
+                            piece = await anext(inner)
+                        except StopAsyncIteration:
+                            break
+                        finally:
+                            _CURRENT.reset(token)
+                        if rec.first_ms is None:
+                            rec.first_ms = (time.perf_counter() - t0) * 1000
+                        yield piece
+                return
+            except openai.APIStatusError as exc:
+                # Only before the first word: text already typed at the cursor cannot be retried.
+                if rec.first_ms is not None or attempt == T.LLM_PROVIDER_RETRIES or not provider_glitch(exc):
+                    raise
+                PERF.count(f"llm.{ep.name}.provider_retry")
+                await asyncio.sleep(T.LLM_PROVIDER_RETRY_S * (2 ** attempt))
     except BaseException as exc:
         rec.status = _status(exc)
         raise

@@ -34,6 +34,7 @@ from .process.consolidate import run_consolidation
 from .process.dream import due as dream_due
 from .process.dream import run_dream
 from .process.embed_worker import drain_outbox, embed_row, observation_text
+from .process.entities import promote_recurring
 from .process.episodes import EpisodeTracker
 from .process.pipeline import ProcessPipeline
 from .process.trails import build_trails
@@ -215,6 +216,7 @@ class Runtime:
 
     async def _maint_loop(self) -> None:
         last_retention = 0.0
+        last_entities = 0.0
         while True:
             try:
                 await self.store.retry_failed_drafts(older_than_s=T.FAILED_WORK_RETRY_S)
@@ -222,6 +224,12 @@ class Runtime:
                 await drain_outbox(self.store)
                 if made := await build_trails(self.store):
                     log.info("causal trails: %d links", made)
+                if time.time() - last_entities >= T.ENTITY_INTERVAL_MIN * 60:
+                    # Entities and their links between full consolidations, so a session
+                    # shorter than the merge interval still gets a graph.
+                    if promoted := await promote_recurring(self.store):
+                        log.info("entities: +%d, %d links", promoted, await self.store.rebuild_edges())
+                    last_entities = time.time()
                 last = float(await self.store.get_meta("last_consolidation", "0") or 0)
                 if now() - last >= T.CONSOLIDATION_INTERVAL_S:
                     log.info("consolidation: %s", await run_consolidation(self.store))

@@ -168,3 +168,70 @@ class EntitiesMixin(StoreBase):
         return await self.q(
             "SELECT e.name, COUNT(DISTINCT m.ref_id) n FROM entities e JOIN mentions m ON m.entity_id=e.id "
             "WHERE e.merged_into IS NULL GROUP BY e.id ORDER BY n DESC LIMIT ?", (limit,))
+
+    # ------------------------------------------------------------------ graph
+
+    async def rebuild_edges(self) -> int:
+        """`entity_edges` from scratch: two entities are linked once per episode in which
+        live memories mention both (planS2 §10.5). Deterministic and cheap; returns edges."""
+
+        def _run() -> int:
+            with self._tx() as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT c.episode_id, m.entity_id, c.occurred_to FROM mentions m "
+                    "JOIN claims c ON m.ref_kind='claim' AND c.id=m.ref_id "
+                    "JOIN entities e ON e.id=m.entity_id AND e.merged_into IS NULL "
+                    "WHERE c.status='live' AND c.episode_id IS NOT NULL").fetchall()
+                by_ep: dict[int, dict[int, float]] = {}
+                for ep, eid, at in rows:
+                    seen = by_ep.setdefault(ep, {})
+                    seen[eid] = max(seen.get(eid, 0.0), at)
+                edges: dict[tuple[int, int], list[float]] = {}
+                for seen in by_ep.values():
+                    ids = sorted(seen)
+                    for i, a in enumerate(ids):
+                        for b in ids[i + 1:]:
+                            w = edges.setdefault((a, b), [0.0, 0.0])
+                            w[0] += 1
+                            w[1] = max(w[1], seen[a], seen[b])
+                conn.execute("DELETE FROM entity_edges")
+                conn.executemany("INSERT INTO entity_edges(a, b, weight, last_seen) VALUES (?,?,?,?)",
+                                 [(a, b, w, last) for (a, b), (w, last) in edges.items()])
+                return len(edges)
+
+        return await self._call(_run)
+
+    async def neighbors(self, entity_id: int, *, limit: int = 8, min_weight: float = 1.0) -> list[sqlite3.Row]:
+        return await self.q(
+            "SELECT e.*, x.weight FROM (SELECT b AS id, weight FROM entity_edges WHERE a=? AND weight>=? "
+            "UNION ALL SELECT a AS id, weight FROM entity_edges WHERE b=? AND weight>=?) x "
+            "JOIN entities e ON e.id=x.id WHERE e.merged_into IS NULL ORDER BY x.weight DESC, e.name LIMIT ?",
+            (entity_id, min_weight, entity_id, min_weight, limit))
+
+    async def claim_ids_mentioning(self, entity_ids: Sequence[int], *, limit: int = 60) -> list[int]:
+        """Live claims naming any of these entities, most recent first."""
+        if not entity_ids:
+            return []
+        rows = await self.q(
+            f"SELECT DISTINCT c.id FROM mentions m JOIN claims c ON m.ref_kind='claim' AND c.id=m.ref_id "
+            f"WHERE m.entity_id IN ({','.join('?' * len(entity_ids))}) AND c.status='live' "
+            f"ORDER BY c.occurred_to DESC LIMIT ?", (*entity_ids, limit))
+        return [r[0] for r in rows]
+
+    async def entity_ids_named(self, names: Sequence[str]) -> list[int]:
+        """Exact alias or key matches only (no model call): fast enough for Bubble."""
+        out: list[int] = []
+        for name in names:
+            eid = await self.find_entity_by_alias(tk.norm_key(name))
+            if eid is None and (key := tk.entity_key(name)):
+                eid = await self.find_entity_by_key(key)
+            if eid is not None and eid not in out:
+                out.append(eid)
+        return out
+
+    async def graph_overview(self, limit: int = 30) -> list[sqlite3.Row]:
+        return await self.q(
+            "SELECT e.id, e.name, e.kind, (SELECT COUNT(DISTINCT m.ref_id) FROM mentions m JOIN claims c "
+            "ON m.ref_kind='claim' AND c.id=m.ref_id AND c.status='live' WHERE m.entity_id=e.id) AS memories, "
+            "(SELECT COUNT(*) FROM entity_edges x WHERE x.a=e.id OR x.b=e.id) AS links "
+            "FROM entities e WHERE e.merged_into IS NULL ORDER BY memories DESC, links DESC LIMIT ?", (limit,))

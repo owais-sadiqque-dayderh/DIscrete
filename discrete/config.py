@@ -306,6 +306,10 @@ class T:
         ["figma", "illustrator", "photoshop", "sketch", "screen sharing", "remote desktop", "affinity"],
     )]
     LLM_TIMEOUT_S = _typed("LLM_TIMEOUT_S", 60.0)
+    # Transient provider failures behind a router (OpenRouter's upstream 404/502/503) are
+    # retried this many times, waiting LLM_PROVIDER_RETRY_S, then twice that, ...
+    LLM_PROVIDER_RETRIES = _typed("LLM_PROVIDER_RETRIES", 3)
+    LLM_PROVIDER_RETRY_S = _typed("LLM_PROVIDER_RETRY_S", 1.5)
     # Vision calls in flight at once; captures never wait for them (capture/enrich.py).
     ENRICH_CONCURRENCY = _typed("ENRICH_CONCURRENCY", 2)
     # Rows holding a caption task (and their images) at once; the rest wait on disk.
@@ -391,6 +395,9 @@ class T:
     SUPPRESS_SIM = _typed("SUPPRESS_SIM", 0.90)
     SUPPRESS_JACCARD = _typed("SUPPRESS_JACCARD", 0.8)
     ENTITY_MIN_EPISODES = _typed("ENTITY_MIN_EPISODES", 2)
+    # Entity promotion and the entity graph are refreshed this often (minutes), besides
+    # every consolidation.
+    ENTITY_INTERVAL_MIN = _typed("ENTITY_INTERVAL_MIN", 10.0)
     FUZZY_AUTO = _typed("FUZZY_AUTO", 96.0)
     FUZZY_ADJUDICATE = _typed("FUZZY_ADJUDICATE", 88.0)
     ENTITY_EMBED_SIM = _typed("ENTITY_EMBED_SIM", 0.80)
@@ -406,7 +413,11 @@ class T:
     # ---- Stage 3 (planS3 §11)
     DENSE_HIT_THRESHOLD = _typed("DENSE_HIT_THRESHOLD", 0.5)
     CANDIDATE_POOL = _typed("CANDIDATE_POOL", 60)
+    # Entities named in a question add the memories that mention them as one more
+    # ranking list (ENTITY_RECALL); GRAPH_EXPAND also adds their strongest neighbours'.
+    ENTITY_RECALL = _typed("ENTITY_RECALL", True)
     GRAPH_EXPAND = _typed("GRAPH_EXPAND", False)
+    GRAPH_NEIGHBORS = _typed("GRAPH_NEIGHBORS", 3)
     EXHAUSTIVE_MAX_SPAN_S = _typed("EXHAUSTIVE_MAX_SPAN_S", 86400.0)
     ECHO_THRESHOLD = _typed("ECHO_THRESHOLD", 0.55)
     COVERAGE_FLOOR = _typed("COVERAGE_FLOOR", 0.12)

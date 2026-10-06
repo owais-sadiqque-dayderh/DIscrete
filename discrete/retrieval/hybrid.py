@@ -139,8 +139,11 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> R
                             f"(seen in {row['episodes']} episodes)", score=1.0, strong=True))
 
     seen = {(h.ref_kind, h.ref_id) for h in pool}
+    graph_claims = await _graph_claims(store, plan)
     for kind in KINDS:
         rankings = [await store.fts_ids(kind, q, limit=T.CANDIDATE_POOL) for q in plan.queries[:8]]
+        if kind == "claim" and graph_claims:
+            rankings.append(graph_claims)
         dense: dict[int, float] = {}
         if qvec is not None:
             dense = dict(await store.dense_search(kind, qvec, limit=T.CANDIDATE_POOL))
@@ -238,6 +241,22 @@ def _trail_hit(r, quote: str, *, via: str) -> Hit:
     body = "\n".join(p for p in (r["caption"], f"> {quote}" if quote else "") if p)
     return Hit("observation", r["id"], title[:120], body, occurred_at=r["started_at"], occurred_to=r["ended_at"],
                untrusted=True, url=r["url"] or "", via=via)
+
+
+async def _graph_claims(store: Store, plan: QueryPlan) -> list[int]:
+    """Memories mentioning the entities the question names, and with GRAPH_EXPAND their
+    strongest neighbours' (the cheap analogue of Hindsight's link expansion), as one
+    more ranking list. They still pass the same relevance gates as any candidate."""
+    if not T.ENTITY_RECALL or not plan.entities:
+        return []
+    seeds = await store.entity_ids_named(plan.entities)
+    if not seeds:
+        return []
+    ids = await store.claim_ids_mentioning(seeds, limit=T.CANDIDATE_POOL)
+    if T.GRAPH_EXPAND:
+        near = [n["id"] for s in seeds for n in await store.neighbors(s, limit=T.GRAPH_NEIGHBORS)]
+        ids += [i for i in await store.claim_ids_mentioning(near, limit=T.CANDIDATE_POOL) if i not in ids]
+    return ids
 
 
 async def _rerank(query: str, pool: list[Hit], cold: bool) -> list[Hit]:
