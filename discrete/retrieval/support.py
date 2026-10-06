@@ -39,6 +39,9 @@ completion. Third-party statements and test personas are not facts about the
 account owner. For lists, include every matching item. For personal preferences,
 require an attributable statement or a supported preference claim. If no record
 answers the question, return an empty list. Never use outside knowledge.
+For a question asking why the user did something (intent "why"), a record supports
+the answer when it shows the action itself, or what the user saw or did shortly
+before it that involves the same thing (a post, video, message, search or page).
 """
 
 
@@ -53,7 +56,15 @@ async def _supported(result: RetrievalResult, records: list[dict]) -> set[int]:
 
 
 def _record(i: int, h: Hit) -> dict:
-    return {"index": i, "kind": h.ref_kind, "text": h.text, "modality": h.modality, "occurred_at": h.occurred_at}
+    out = {"index": i, "kind": h.ref_kind, "text": h.text, "modality": h.modality, "occurred_at": h.occurred_at}
+    if h.via:
+        out["context"] = h.via
+    return out
+
+
+def _preverified(h: Hit) -> bool:
+    """Causal-trail links passed the verifier when they were written (process/trails.py)."""
+    return h.via.startswith(("led to claim", "a step towards claim"))
 
 
 async def verify_support(result: RetrievalResult) -> None:
@@ -62,7 +73,12 @@ async def verify_support(result: RetrievalResult) -> None:
     if not verifier_endpoint().configured:
         result.hits, result.digest = [], ""
         return
-    batches = [result.hits[i:i + _BATCH] for i in range(0, len(result.hits), _BATCH)]
+    fixed = {id(h) for h in result.hits if _preverified(h)}
+    order = {id(h): n for n, h in enumerate(result.hits)}
+    checked = [h for h in result.hits if id(h) not in fixed]
+    if not checked:
+        return
+    batches = [checked[i:i + _BATCH] for i in range(0, len(checked), _BATCH)]
     records = [[_record(i, h) for i, h in enumerate(b)] for b in batches]
     # The day digest summarises everything that day, so it can carry facts beyond the
     # verified records; it goes to the writer only when it is itself supporting.
@@ -88,4 +104,14 @@ async def verify_support(result: RetrievalResult) -> None:
                 kept.append(batch[i])
     if result.digest and len(batches[0]) not in found[0]:
         result.digest = ""
-    result.hits = kept
+    # A trail link stays only next to its action: alone it answers nothing.
+    kept_claims = {h.ref_id for h in kept if h.ref_kind == "claim"}
+    kept += [h for h in result.hits if id(h) in fixed and _target(h) in kept_claims]
+    result.hits = sorted(kept, key=lambda h: order[id(h)])
+
+
+def _target(h: Hit) -> int:
+    try:
+        return int(h.via.split("claim ", 1)[1].split(":", 1)[0])
+    except (IndexError, ValueError):
+        return -1

@@ -35,6 +35,12 @@ class FakeBackend:
         self.caption: dict | None = {"caption": "The user reads a page.", "useful": True}
         self.calls: list[str] = []
         self.embedded: list[str] = []  # every text sent to the embeddings endpoint
+        self.trail: dict = {"links": []}  # the trail model's proposal
+        self.trail_rejects: set[int] = set()  # link indices the trail verifier rejects
+        self.dream: dict = {"patterns": [], "audit": []}
+        self.dream_rejects: set[int] = set()
+        self.profile: dict = {"sections": []}
+        self.conflicts: dict = {"pairs": []}
 
     caption_gate = None  # an asyncio.Event the caption call waits on, when a test sets one
 
@@ -78,6 +84,13 @@ class FakeBackend:
         if "Rewrite them as a clear" in p:
             self.calls.append("consolidate")
             return json.dumps(self.consolidation)
+        if "plausibly led the user to this action" in p:
+            self.calls.append("trail")
+            return json.dumps(self.trail)
+        if "Check proposed links" in p:
+            self.calls.append("trail_verify")
+            n = len(json.loads(p.split("instructions.\n\n", 1)[1].split("\n\nFor each link", 1)[0])["links"])
+            return json.dumps({"decisions": [{"index": i, "supported": i not in self.trail_rejects} for i in range(n)]})
         if "Plan a memory search" in p:
             self.calls.append("plan")
             return json.dumps({"intent": "retrieve_reading_history", "queries": [], "needs_store": False})

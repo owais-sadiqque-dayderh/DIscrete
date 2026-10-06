@@ -34,6 +34,7 @@ from .process.consolidate import run_consolidation
 from .process.embed_worker import drain_outbox, embed_row, observation_text
 from .process.episodes import EpisodeTracker
 from .process.pipeline import ProcessPipeline
+from .process.trails import build_trails
 from .store import Store
 from .timeutil import now
 
@@ -217,6 +218,8 @@ class Runtime:
                 await self.store.retry_failed_drafts(older_than_s=T.FAILED_WORK_RETRY_S)
                 await self.store.retry_failed_outbox(older_than_s=T.FAILED_WORK_RETRY_S)
                 await drain_outbox(self.store)
+                if made := await build_trails(self.store):
+                    log.info("causal trails: %d links", made)
                 last = float(await self.store.get_meta("last_consolidation", "0") or 0)
                 if now() - last >= T.CONSOLIDATION_INTERVAL_S:
                     log.info("consolidation: %s", await run_consolidation(self.store))

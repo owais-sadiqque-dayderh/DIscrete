@@ -19,6 +19,11 @@ from discrete.process.episodes import EpisodeTracker
 from discrete.process.pipeline import ProcessPipeline
 from discrete.store import Store
 
+try:  # older checkouts (the baseline) have no causal trails
+    from discrete.process.trails import build_trails
+except ImportError:
+    build_trails = None
+
 
 async def replay(args):
     PERF.source = "replay"
@@ -56,6 +61,8 @@ async def replay(args):
         await tracker.close_current()
         for result in await pipe.process_ready(limit=10_000):
             print(json.dumps(vars(result)), flush=True)
+        if build_trails is not None:
+            print(json.dumps({"trail_links": await build_trails(store, limit=10_000)}), flush=True)
         print(json.dumps({"consolidation": await run_consolidation(store)}), flush=True)
         print(json.dumps({"stats": await store.stats()}), flush=True)
     finally:

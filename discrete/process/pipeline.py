@@ -47,6 +47,24 @@ class _Durable:
     relations: dict[int, str] = field(default_factory=dict)
 
 
+ACTION_VERBS = frozenset(
+    "downloaded installed uninstalled purchased bought ordered booked paid sent posted replied published created "
+    "saved exported uploaded signed_up registered submitted subscribed unsubscribed deleted shared "
+    "scheduled accepted declined merged committed pushed deployed".split())
+
+
+def action_verb(item: dict) -> str:
+    """The drafted action verb, normalised, when it names a completed action we track."""
+    verb = str(item.get("action") or "").strip().lower().replace(" ", "_")
+    return verb if verb in ACTION_VERBS else ""
+
+
+def max_events(span_min: float) -> int:
+    """Event room for an episode of this length (long episodes do several things)."""
+    extra = int(max(0.0, span_min - 5) // max(T.DRAFT_EVENT_MINUTES, 0.5))
+    return max(T.DRAFT_MAX_EVENTS, min(T.DRAFT_MAX_EVENTS_CAP, T.DRAFT_MAX_EVENTS + extra))
+
+
 class ProcessPipeline:
     def __init__(self, store: Store):
         self.store = store
@@ -93,7 +111,9 @@ class ProcessPipeline:
         by_id = {r["id"]: r for r in rows}
         t0 = min(r["started_at"] for r in rows)
         t1 = max(r["ended_at"] for r in rows)
-        counts = {"event": 0, "durable": 0}
+        counts = {"event": 0, "durable": 0, "action": 0}
+        span_min = (t1 - t0) / 60
+        caps = {"event": max_events(span_min), "durable": T.DRAFT_MAX_DURABLE, "action": T.DRAFT_MAX_ACTIONS}
         names_seen: list[str] = []
         drafts: list[ClaimDraft] = []
         seen: set[tuple[str, str]] = set()
@@ -104,14 +124,15 @@ class ProcessPipeline:
             if kind not in _KINDS:
                 outcome.reject("bad_kind")
                 continue
-            bucket = "event" if kind == "event" else "durable"
-            cap = T.DRAFT_MAX_EVENTS if bucket == "event" else T.DRAFT_MAX_DURABLE
-            if counts[bucket] >= cap:
+            action = action_verb(item) if kind == "event" else ""
+            bucket = "action" if action else ("event" if kind == "event" else "durable")
+            if counts[bucket] >= caps[bucket]:
                 outcome.reject("over_cap")
                 continue
             cd = self._validate(item, kind, by_id, episode_id, t0, t1, outcome)
             if cd is None:
                 continue
+            cd.action = action
             key = (cd.kind, tk.norm_key(cd.text))
             if key in seen:
                 outcome.reject("duplicate")
@@ -176,8 +197,9 @@ class ProcessPipeline:
                 f"scrolls={r['scrolls']} copies={r['clipboard']})\n"
                 f"caption: {r['caption']}\n<<<DATA>>>\n{excerpt}\n<<<END>>>"
             )
+        span_min = (max(r["ended_at"] for r in rows) - min(r["started_at"] for r in rows)) / 60
         prompt = DRAFT_EPISODE_PROMPT.format(
-            observations="\n\n".join(blocks), max_events=T.DRAFT_MAX_EVENTS, max_durable=T.DRAFT_MAX_DURABLE
+            observations="\n\n".join(blocks), max_events=max_events(span_min), max_durable=T.DRAFT_MAX_DURABLE
         )
         data = await complete_json(self.ep, [{"role": "user", "content": prompt}], max_tokens=2500)
         if not isinstance(data, dict):
@@ -220,8 +242,10 @@ class ProcessPipeline:
         return ClaimDraft(
             kind=kind, text=text, context=str(item.get("context") or "")[:200],
             modality="engaged" if engaged else "passive", episode_id=episode_id,
-            occurred_from=t0 if kind == "event" else min(times),
-            occurred_to=t1 if kind == "event" else max(o["ended_at"] for o in cited),
+            # When it happened: the cited moments, not the whole episode. "Why did I…"
+            # orders an action against what came just before it (trails.py).
+            occurred_from=min(times),
+            occurred_to=max(max(o["ended_at"], o["started_at"]) for o in cited),
             entities=entities, evidence=evidence,
         )
 

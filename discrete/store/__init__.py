@@ -14,12 +14,13 @@ from .gaps import GapsMixin
 from .health import HealthMixin
 from .history import RevertConflict
 from .index import KINDS, IndexMixin
+from .links import LinksMixin
 from .observations import ObservationsMixin
 from .perf import PerfMixin
 
 
-class Store(ObservationsMixin, EpisodesMixin, DraftsMixin, CorrectionsMixin, EntitiesMixin, IndexMixin, GapsMixin,
-            HealthMixin, PerfMixin):
+class Store(ObservationsMixin, EpisodesMixin, DraftsMixin, CorrectionsMixin, LinksMixin, EntitiesMixin, IndexMixin,
+            GapsMixin, HealthMixin, PerfMixin):
     pass
 
 

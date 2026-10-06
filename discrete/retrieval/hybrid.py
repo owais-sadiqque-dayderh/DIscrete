@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 
@@ -14,6 +15,7 @@ from ..config import T
 from ..llm import EXPECTED_ERRORS, NotConfigured, rerank, try_embed
 from ..models import Hit, QueryPlan, RetrievalResult
 from ..perf import PERF, since_ms
+from ..process.trails import thing_terms
 from ..store import KINDS, Store
 from ..timeutil import age_days, day_key, now, to_local
 from .enumerate import enumerate_pages
@@ -39,7 +41,8 @@ async def materialize(store: Store, kind: str, ids: list[int]) -> dict[int, Hit]
             body = r["text"] + (f"\n> {q}" if q else "")
             out[r["id"]] = Hit("claim", r["id"], r["text"][:120], body, modality=r["modality"],
                                confidence=r["confidence"], status=r["status"], occurred_at=r["occurred_from"],
-                               occurred_to=r["occurred_to"], claim_kind=r["kind"], untrusted=bool(q))
+                               occurred_to=r["occurred_to"], claim_kind=r["kind"], untrusted=bool(q),
+                               action=r["action"] if "action" in r.keys() else "")
     elif kind == "observation":
         for r in rows:
             name = r["page_title"] or r["window_title"]
@@ -164,7 +167,63 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> R
         pool = await _rerank(query, pool, cold)
     with PERF.timer("retrieve.mmr"):
         result.hits = await _mmr(store, pool, T.TOP_K)
+    if plan.intent == "why":
+        with PERF.timer("retrieve.why"):
+            await expand_why(store, result)
     return result
+
+
+async def expand_why(store: Store, result: RetrievalResult) -> None:
+    """For "why did I …": put what led to the matched action right after it.
+
+    A causal-trail link (process/trails.py) was checked in code and by the verifier when
+    it was written, so it joins as a strong record. Without one, the moments just
+    before the action that name the same thing join, for the support check to judge."""
+    targets = [h for h in result.hits if h.ref_kind == "claim" and h.claim_kind == "event"][: T.WHY_TARGETS]
+    targets.sort(key=lambda h: not h.action)
+    if not targets:
+        return
+    have = {(h.ref_kind, h.ref_id) for h in result.hits}
+    added: dict[int, list[Hit]] = {}
+    links = await store.links_into("claim", [t.ref_id for t in targets])
+    rows = {r["id"]: r for r in await store.get_observations(list({lk["src_id"] for lk in links}), user_only=True)}
+    for lk in links:
+        r = rows.get(lk["src_id"])
+        if r is None or ("observation", r["id"]) in have:
+            continue
+        quote = json.loads(lk["evidence"] or "[]")
+        role = "led to" if lk["relation"] == "led_to" else "a step towards"
+        h = _trail_hit(r, quote[0]["quote"] if quote else "", via=f"{role} claim {lk['dst_id']}: {lk['reason']}")
+        h.strong = True  # verified when the link was written
+        added.setdefault(lk["dst_id"], []).append(h)
+        have.add(("observation", r["id"]))
+    target = targets[0]
+    if target.ref_id not in added and target.occurred_at:
+        terms = set(await thing_terms(store, target.title, [result.query]))
+        rows_before = await store.observations_started_within(target.occurred_at - T.WHY_BEFORE_MIN * 60,
+                                                              target.occurred_at)
+        before = [r for r in rows_before if ("observation", r["id"]) not in have
+                  and r["started_at"] < target.occurred_at
+                  and terms & set(tk.tokens(" ".join([r["window_title"], r["caption"], r["screen_text"]])))]
+        for r in before[-T.WHY_BEFORE_MAX:]:
+            added.setdefault(target.ref_id, []).append(
+                _trail_hit(r, "", via=f"shortly before claim {target.ref_id}"))
+    if not added:
+        return
+    out: list[Hit] = []
+    for h in result.hits:
+        out.append(h)
+        if h.ref_kind == "claim" and h.ref_id in added:
+            out += sorted(added[h.ref_id], key=lambda x: x.occurred_at)
+    result.hits = out
+
+
+def _trail_hit(r, quote: str, *, via: str) -> Hit:
+    name = r["page_title"] or r["window_title"]
+    title = f"{r['app']} — {name}".strip(" —") or r["caption"][:80]
+    body = "\n".join(p for p in (r["caption"], f"> {quote}" if quote else "") if p)
+    return Hit("observation", r["id"], title[:120], body, occurred_at=r["started_at"], occurred_to=r["ended_at"],
+               untrusted=True, url=r["url"] or "", via=via)
 
 
 async def _rerank(query: str, pool: list[Hit], cold: bool) -> list[Hit]:

@@ -149,8 +149,9 @@ class HistoryMixin(StoreBase):
                         out.append(self._set_state(conn, cid, **change["before"]))
                 for cid in created:
                     out.append(self._set_state(conn, cid, status="reverted", valid_to=now()))
-                # A forget's suppression goes with it.
+                # A forget's suppression and an event's links go with it.
                 conn.execute("DELETE FROM suppressions WHERE event_id=?", (event_id,))
+                conn.execute("UPDATE links SET status='reverted' WHERE event_id=?", (event_id,))
                 rid = self._log_event(conn, "revert", "user", claim_id=ev["claim_id"], changes=out,
                                       reason=reason or f"revert of #{event_id} ({ev['op']})",
                                       data={"reverts": event_id, "evidence_removed": [

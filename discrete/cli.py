@@ -26,6 +26,7 @@ from .perf import PERF
 from .process.consolidate import run_consolidation
 from .process.embed_worker import drain_outbox
 from .process.pipeline import ProcessPipeline
+from .process.trails import build_trails
 from .retrieval.gaps import answer_and_learn, maybe_record_gap
 from .retrieval.grounding import evaluate
 from .retrieval.hybrid import retrieve
@@ -212,6 +213,7 @@ async def cmd_process(args) -> int:
             "drafted": [{"episode": r.episode_id, "added": r.added, "reinforced": r.reinforced,
                          "invalidated": r.invalidated, "rejected": r.rejected} for r in drafted],
             "embedded": await drain_outbox(store),
+            "trail_links": await build_trails(store, limit=500),
         }
         if args.consolidate:
             out["consolidation"] = await run_consolidation(store)

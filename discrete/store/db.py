@@ -364,6 +364,7 @@ def m007_memory_evolution(conn: sqlite3.Connection) -> None:
       reason TEXT NOT NULL DEFAULT '',
       evidence TEXT NOT NULL DEFAULT '[]',
       status TEXT NOT NULL DEFAULT 'live',
+      event_id INTEGER,
       created_at REAL NOT NULL,
       UNIQUE (src_kind, src_id, dst_kind, dst_id, relation))""")
     conn.execute("CREATE INDEX ix_links_dst ON links(dst_kind, dst_id, relation)")
@@ -378,6 +379,7 @@ def m007_memory_evolution(conn: sqlite3.Connection) -> None:
       event_id INTEGER,
       created_at REAL NOT NULL)""")
     conn.execute("CREATE INDEX ix_suppressions_key ON suppressions(norm_key)")
+    _add_column(conn, "claims", "action", "TEXT NOT NULL DEFAULT ''")
 
 
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [

@@ -24,6 +24,8 @@ def evaluate(result: RetrievalResult) -> GroundingDecision:
         return GroundingDecision("continuation", strong, weak)
     if intent == "enumerate":
         return GroundingDecision("enumerate" if result.hits else "empty", strong, weak)
+    if intent == "why" and strong:
+        return GroundingDecision("why", strong, weak)
     if strong or (result.exhaustive and result.hits):
         return GroundingDecision("grounded", strong, weak)
     return GroundingDecision("thin" if weak else "empty", strong, weak)

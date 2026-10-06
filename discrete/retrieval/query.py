@@ -20,7 +20,7 @@ from ..llm import EXPECTED_ERRORS, complete_json
 from ..models import QueryPlan
 from ..timeutil import day_bounds, from_local, now, to_local
 
-INTENTS = frozenset({"edit", "recall", "temporal", "aggregate", "enumerate", "world", "continuation", "mixed"})
+INTENTS = frozenset({"edit", "recall", "temporal", "aggregate", "enumerate", "world", "continuation", "mixed", "why"})
 ENTITY_KINDS = frozenset({"person", "organization", "software", "website", "project", "file", "place", "topic"})
 
 _FILE = re.compile(r"[\w.-]+\.(?:py|js|ts|tsx|md|json|yaml|yml|txt|csv|pdf|png|jpg)\b", re.I)
@@ -32,6 +32,9 @@ _AGG = re.compile(r"\b(?:which|what)\b.*\b(?:have i|did i|do i)\b.*\b(?:use|used
 # record listed, not a synthesized summary or a count (planS3 §17).
 _ENUM = re.compile(r"\ball (?:the|of the)\b|\bevery\b|\blist\b|\bshow (?:me |all )\b"
                    r"|\bwhat .*\bdid i (?:open|read|visit|see|watch|look)\b", re.I)
+# "Why did I …", "what made me …": answered by following causal trails (trails.py).
+_WHY = re.compile(r"^\s*why\b|\bwhy (?:did|do|was|were|have|had) i\b|\bwhat (?:made|led|prompted|caused|got) me\b"
+                  r"|\bhow did i (?:end up|come to|get to|find|hear about|discover)\b|\breason (?:i|for my|why i)\b", re.I)
 _EDIT_VERBS = ("fix", "rewrite", "complete", "summarize", "translate", "format", "rephrase", "shorten")
 # The request's own scaffolding. Searching for "list" or "opened" matches any row that
 # says so (a todo list), not the pages being asked about (insights.md §7.36).
@@ -126,7 +129,9 @@ def fallback_plan(text: str) -> QueryPlan:
         intent = "continuation"
     interval = parse_interval(text)
     kind = ""
-    if intent == "recall" and _AGG.search(text):
+    if intent == "recall" and _WHY.search(text):
+        intent = "why"
+    elif intent == "recall" and _AGG.search(text):
         intent = "aggregate"
         words = set(tk.tokens(text))
         kind = next((k for k, vocab in KIND_VOCAB.items() if words & set(vocab)), "")

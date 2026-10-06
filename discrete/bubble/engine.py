@@ -128,7 +128,11 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
         used += len(blocks[-1])
     for h in result.hits:
         if h.ref_kind == "claim":
-            head = f"[claim {h.ref_id} · {h.claim_kind} · {h.modality}{_when(h)}]"
+            kind = f"{h.claim_kind} ({h.action})" if h.action else h.claim_kind
+            head = f"[claim {h.ref_id} · {kind} · {h.modality}{_when(h)}]"
+            body = h.body
+        elif h.ref_kind == "observation" and h.via:
+            head = f"[screen {h.ref_id}{_when(h)} · {h.title} · {h.via}]"
             body = h.body
         elif h.ref_kind == "observation":
             head = f"[screen {h.ref_id}{_when(h)} · {h.title}]"

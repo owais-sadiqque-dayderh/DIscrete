@@ -18,13 +18,21 @@ Return strict JSON:
       "text": "<string, one proposition about the user, at most 240 chars>",
       "context": "<string: when or where it applies, may be empty>",
       "entities": ["<proper noun the claim is about>"],
+      "action": "<for a completed action event, its verb (downloaded, installed, purchased, booked, sent, posted, created, saved, exported, signed up, submitted, subscribed, deleted, shared); otherwise empty>",
       "evidence": [{{"observation_id": <int>, "quote": "<verbatim substring of that observation>"}}]
     }}
   ]
 }}
 
 Rules:
-- At most {max_events} event claims and at most {max_durable} fact/preference claims.
+- Completed actions with consequences come first and are never skipped: downloading or
+  installing software, purchasing or booking, sending or posting a message, creating,
+  saving or exporting a file, signing up, submitting a form. Write each as its own event
+  with "action" set, only when the screen visibly confirms it happened (a download page
+  saying thank you, the file in Downloads, an installer or setup screen, a sent message,
+  a confirmation). Name the exact thing (app, file, recipient, item).
+- Besides actions: at most {max_events} other event claims and at most {max_durable}
+  fact/preference claims.
 - event = something the user did or viewed at this time ("the user compared three
   font pairings on MyFonts"). fact = durable state ("the user uses Adobe Illustrator
   for logo work"). preference = a taste or habit, only with clear support.

@@ -317,6 +317,11 @@ class T:
     CLAIM_MAX_CHARS = _typed("CLAIM_MAX_CHARS", 240)
     DRAFT_TEXT_CHARS_PER_OBS = _typed("DRAFT_TEXT_CHARS_PER_OBS", 1200)
     DRAFT_MAX_EVENTS = _typed("DRAFT_MAX_EVENTS", 5)
+    # Long episodes get room for more events: one more per this many minutes past five,
+    # up to DRAFT_MAX_EVENTS_CAP. Completed actions have their own cap.
+    DRAFT_EVENT_MINUTES = _typed("DRAFT_EVENT_MINUTES", 3.0)
+    DRAFT_MAX_EVENTS_CAP = _typed("DRAFT_MAX_EVENTS_CAP", 10)
+    DRAFT_MAX_ACTIONS = _typed("DRAFT_MAX_ACTIONS", 6)
     DRAFT_MAX_DURABLE = _typed("DRAFT_MAX_DURABLE", 5)
     DRAFT_MAX_OBS = _typed("DRAFT_MAX_OBS", 40)
     EVIDENCE_MIN_OVERLAP = _typed("EVIDENCE_MIN_OVERLAP", 0.2)
@@ -335,6 +340,13 @@ class T:
         if CONSOLIDATION_INTERVAL_MIN > 0
         else _typed("CONSOLIDATION_INTERVAL_S", 3600.0)
     )
+    # Causal trails (process/trails.py): what led to each completed action.
+    TRAILS = _typed("TRAILS", True)
+    TRAIL_WINDOW_MIN = _typed("TRAIL_WINDOW_MIN", 30.0)
+    TRAIL_MAX_TERMS = _typed("TRAIL_MAX_TERMS", 4)
+    TRAIL_MAX_MOMENTS = _typed("TRAIL_MAX_MOMENTS", 20)
+    TRAIL_RECENT = _typed("TRAIL_RECENT", 5)
+    TRAIL_MAX_AGE_DAYS = _typed("TRAIL_MAX_AGE_DAYS", 7.0)
     CONSOLIDATE_SIM = _typed("CONSOLIDATE_SIM", 0.82)
     CONSOLIDATE_MAX_CLUSTER = _typed("CONSOLIDATE_MAX_CLUSTER", 8)
     LINEAGE_MAX_VERSIONS = _typed("LINEAGE_MAX_VERSIONS", 12)
@@ -382,6 +394,11 @@ class T:
     SUPPORT_CHECK = _typed("SUPPORT_CHECK", True)
     SUPPORT_TIMEOUT_S = _typed("SUPPORT_TIMEOUT_S", 8.0)  # slower: results stay unverified
     TOP_K = _typed("TOP_K", 8)
+    # "Why did I …" (retrieval/hybrid.py expand_why): matched actions whose trails are
+    # followed, and, with no trail, how far back and how many moments before the action.
+    WHY_TARGETS = _typed("WHY_TARGETS", 3)
+    WHY_BEFORE_MIN = _typed("WHY_BEFORE_MIN", 10.0)
+    WHY_BEFORE_MAX = _typed("WHY_BEFORE_MAX", 4)
     # Enumeration ("list all …") bypasses TOP_K/MMR: it returns every distinct page.
     ENUMERATE_MAX = _typed("ENUMERATE_MAX", 200)
     ENUMERATE_POOL = _typed("ENUMERATE_POOL", 400)

@@ -78,12 +78,12 @@ class ClaimsMixin(HistoryMixin):
         cur = conn.execute(
             """INSERT INTO claims(lineage_id, version, kind, text, context, reasoning, modality,
                  occurred_from, occurred_to, valid_from, status, episode_id, refines_id, invalidates_id,
-                 confidence, derived_from, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,'live',?,?,?,0,?,?,?)""",
+                 confidence, derived_from, action, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,'live',?,?,?,0,?,?,?,?)""",
             (lineage_id, version, draft.kind, tk.truncate(draft.text, T.CLAIM_MAX_CHARS), draft.context,
              draft.reasoning, draft.modality, draft.occurred_from or ts, draft.occurred_to or ts,
              draft.occurred_from or ts, draft.episode_id, refines_id, invalidates_id,
-             json.dumps(derived_from or []), ts, ts),
+             json.dumps(derived_from or []), draft.action, ts, ts),
         )
         cid = rowid(cur)
         for ev in draft.evidence:

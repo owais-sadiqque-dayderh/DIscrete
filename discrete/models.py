@@ -68,6 +68,9 @@ class ClaimDraft:
     occurred_to: float = 0.0
     entities: list[str] = field(default_factory=list)
     evidence: list[dict] = field(default_factory=list)  # [{observation_id, quote}]
+    # A completed action with consequences ("downloaded", "installed", "sent"), or "".
+    # Actions are never dropped for the per-episode cap, and get a causal trail (trails.py).
+    action: str = ""
 
 
 @dataclass
@@ -118,6 +121,10 @@ class Hit:
     url: str = ""
     is_listing: bool = False
     navigated_from: str = ""
+    # How this record joined the result when it was not a search match: "led to claim 12:
+    # <why>" for a causal-trail link, "before claim 12" for the moments preceding it.
+    via: str = ""
+    action: str = ""
 
     @property
     def text(self) -> str:
