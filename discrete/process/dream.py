@@ -61,6 +61,9 @@ across separate sessions. The person is "the user". Memories are grouped by day;
 
 {memories}
 
+Where their time went in this window (estimated from every capture; context only, not citable):
+{attention}
+
 Existing patterns:
 {patterns}
 
@@ -159,6 +162,15 @@ async def _profile(store: Store, run_id: str) -> dict:
 # ---------------------------------------------------------------------- patterns
 
 
+async def attention_context(store: Store) -> str:
+    start = now() - T.DREAM_WINDOW_DAYS * 86400
+    sites = await store.attention(start, now() + 1, by="site", limit=10)
+    apps = await store.attention(start, now() + 1, by="app", limit=6)
+    if not sites:
+        return "(none)"
+    return "\n".join(f"- {a.describe()}" for a in [*sites, *apps])
+
+
 def _render(rows, episodes: dict[int, set[int]]) -> str:
     by_day: dict[str, list[str]] = {}
     for r in sorted(rows, key=lambda r: r["occurred_from"]):
@@ -254,7 +266,7 @@ async def _patterns(store: Store, run_id: str) -> dict:
     by_id = {r["id"]: r for r in rows}
     episodes = await store.episodes_of_claims(list(by_id))
     prompt = DREAM_PROMPT.format(
-        memories=_render(memories, episodes),
+        memories=_render(memories, episodes), attention=await attention_context(store),
         patterns="\n".join(f"[{p['id']}] ({p['context'] or 'pattern'}) {p['text']}" for p in patterns) or "(none)",
         min_episodes=T.DREAM_MIN_EPISODES, categories="|".join(CATEGORIES))
     data = await complete_json(ep, [{"role": "user", "content": prompt}], max_tokens=2500)

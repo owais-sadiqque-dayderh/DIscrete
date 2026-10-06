@@ -99,6 +99,8 @@ class QueryPlan:
     needs_store: bool = True
     # A question about the user as a whole ("what am I into"): the profile joins the records.
     about_user: bool = False
+    # "Where does my time go": answered from attention totals (store/attention.py).
+    time_spent: bool = False
 
 
 @dataclass

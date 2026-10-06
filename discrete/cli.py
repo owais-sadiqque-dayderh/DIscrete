@@ -457,6 +457,14 @@ async def cmd_export(args) -> int:
     return 0
 
 
+async def cmd_attention(args) -> int:
+    async with _session() as store:
+        start = _since(args.since) or 0.0
+        for a in await store.attention(start, time.time() + 1, by=args.by, limit=args.n):
+            _print(a.describe())
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="discrete")
     p.add_argument("--db", help="store path (default: $DISCRETE_DATA_DIR/discrete.db)")
@@ -573,6 +581,12 @@ def build_parser() -> argparse.ArgumentParser:
     px.add_argument("--dir", default="", help="default: DISCRETE_MEMORY_EXPORT_DIR or <data dir>/memory")
     px.add_argument("--no-git", action="store_true")
     px.set_defaults(func=cmd_export)
+
+    pat = sub.add_parser("attention", help="where your time went: per site, app or page")
+    pat.add_argument("--since", default="7d", help="90m / 6h / 2d / all (default 7d)")
+    pat.add_argument("--by", choices=["site", "app", "page"], default="site")
+    pat.add_argument("-n", type=int, default=20)
+    pat.set_defaults(func=cmd_attention)
     return p
 
 

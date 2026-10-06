@@ -132,6 +132,8 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
             strength = f" · {h.strength}" if h.strength else ""
             head = f"[claim {h.ref_id} · {kind} · {h.modality}{strength}{_when(h)}]"
             body = h.body
+        elif h.ref_kind == "attention":
+            head, body = "[attention: where their time went, computed from every capture]", h.body
         elif h.ref_kind == "profile":
             head, body = "[profile: what is known about them, each point backed by memories]", h.body
         elif h.ref_kind == "observation" and h.via:

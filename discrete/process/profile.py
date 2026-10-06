@@ -19,7 +19,7 @@ from ..config import dream_endpoint
 from ..llm import complete_json
 from ..store import Store
 from ..timeutil import now, to_local
-from .dream import _verify
+from .dream import _verify, attention_context
 
 log = logging.getLogger("discrete.process.profile")
 
@@ -30,6 +30,9 @@ behalf should know about them. Each memory line is [id] (kind, strength) text; s
 how many episodes and days it was seen.
 
 {memories}
+
+Where their time went (estimated from every capture; context for emphasis, not citable):
+{attention}
 
 Sections, in this order, omitting empty ones: {sections}.
 Rules:
@@ -61,7 +64,8 @@ async def write_profile(store: Store, *, run_id: str = "") -> dict:
         kind = f"{r['kind']} ({r['action']})" if r["action"] else r["kind"]
         lines.append(f"[{r['id']}] ({kind}, {st.describe() if st else 'stated'}) {r['text']}")
     data = await complete_json(ep, [{"role": "user", "content": PROFILE_PROMPT.format(
-        memories="\n".join(lines), sections="; ".join(SECTIONS))}], max_tokens=1800)
+        memories="\n".join(lines), sections="; ".join(SECTIONS),
+        attention=await attention_context(store))}], max_tokens=1800)
     by_id = {r["id"]: r for r in rows}
     points: list[dict] = []
     for sec in (data or {}).get("sections") or []:

@@ -178,7 +178,22 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> R
             await expand_why(store, result)
     if plan.about_user:
         await add_profile(store, result)
+    if plan.time_spent:
+        await add_attention(store, result)
     return result
+
+
+async def add_attention(store: Store, result: RetrievalResult) -> None:
+    """Time totals per site and app for the question's interval (default: the last week)."""
+    start, end = result.plan.interval or (now() - 7 * 86400, now())
+    sites = await store.attention(start, end, by="site", limit=12)
+    apps = await store.attention(start, end, by="app", limit=8)
+    if not sites:
+        return
+    span = f"{to_local(start):%a %b %d %H:%M} – {to_local(end):%a %b %d %H:%M}"
+    body = "\n".join([f"Time on screen, {span} (estimated from captures; active = scrolling, clicking or typing):",
+                      "By site:", *(f"- {a.describe()}" for a in sites), "By app:", *(f"- {a.describe()}" for a in apps)])
+    result.hits.insert(0, Hit("attention", 0, "time spent", body, occurred_at=start, occurred_to=end))
 
 
 async def add_profile(store: Store, result: RetrievalResult) -> None:

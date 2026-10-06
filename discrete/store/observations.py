@@ -41,7 +41,15 @@ class ObservationsMixin(StoreBase):
     async def add_observation(self, draft: ObservationDraft) -> tuple[int | None, bool]:
         """Insert, or collapse into an existing row. Returns (id, is_new)."""
 
+        def _sighting(conn, oid: int) -> None:
+            if draft.origin == "user":
+                ts = draft.started_at or now()
+                conn.execute("INSERT INTO sightings(obs_id, started_at, ended_at, keys, clicks, scrolls, clipboard) "
+                             "VALUES (?,?,?,?,?,?,?)", (oid, ts, max(draft.ended_at or ts, ts), draft.keys,
+                                                        draft.clicks, draft.scrolls, draft.clipboard))
+
         def _bump(conn, oid: int) -> None:
+            _sighting(conn, oid)
             conn.execute(
                 "UPDATE observations SET dup_count=dup_count+1, ended_at=MAX(ended_at, ?), updated_at=?, "
                 "keys=keys+?, clicks=clicks+?, scrolls=scrolls+?, clipboard=clipboard+? WHERE id=?",
@@ -94,6 +102,7 @@ class ObservationsMixin(StoreBase):
                     tk.content_hash(draft.world_text()), text_hash, now(), now(),
                 ))
                 oid = rowid(cur)
+                _sighting(conn, oid)
                 conn.execute("INSERT INTO obs_minhash(obs_id, sig) VALUES (?, ?)", (oid, tk.minhash_bytes(sig)))
                 if draft.origin == "user":
                     self._bump_df(conn, tk.content_tokens(draft.world_text()))

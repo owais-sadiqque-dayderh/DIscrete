@@ -382,6 +382,27 @@ def m007_memory_evolution(conn: sqlite3.Connection) -> None:
     _add_column(conn, "claims", "action", "TEXT NOT NULL DEFAULT ''")
 
 
+def m008_sightings(conn: sqlite3.Connection) -> None:
+    """Every time a window was seen, including captures collapsed into an earlier row as
+    duplicates, which used to keep only a widened interval. Attention (time on a site,
+    app or page, and whether the user was acting) is the strongest implicit preference
+    signal, and it needs these (store/attention.py)."""
+    conn.execute("""CREATE TABLE sightings(
+      id INTEGER PRIMARY KEY,
+      obs_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+      started_at REAL NOT NULL,
+      ended_at REAL NOT NULL,
+      keys INTEGER NOT NULL DEFAULT 0,
+      clicks INTEGER NOT NULL DEFAULT 0,
+      scrolls INTEGER NOT NULL DEFAULT 0,
+      clipboard INTEGER NOT NULL DEFAULT 0)""")
+    conn.execute("CREATE INDEX ix_sightings_at ON sightings(started_at)")
+    conn.execute("CREATE INDEX ix_sightings_obs ON sightings(obs_id)")
+    conn.execute("INSERT INTO sightings(obs_id, started_at, ended_at, keys, clicks, scrolls, clipboard) "
+                 "SELECT id, started_at, ended_at, keys, clicks, scrolls, clipboard FROM observations "
+                 "WHERE origin='user'")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_base,
     m002_draft_attempts_and_digest_counts,
@@ -390,6 +411,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m005_perf_log,
     m006_unsegmented_index,
     m007_memory_evolution,
+    m008_sightings,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

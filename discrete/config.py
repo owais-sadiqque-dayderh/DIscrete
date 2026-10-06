@@ -389,6 +389,9 @@ class T:
     # a pattern unseen for PATTERN_RETIRE_DAYS is retired. Events never go stale.
     STALE_DAYS = _typed("STALE_DAYS", 45.0)
     PATTERN_RETIRE_DAYS = _typed("PATTERN_RETIRE_DAYS", 120.0)
+    # Attention (store/attention.py): a sighting lasts until the next one, at most this long.
+    DWELL_GAP_CAP_S = _typed("DWELL_GAP_CAP_S", 180.0)
+    DWELL_LAST_S = _typed("DWELL_LAST_S", 30.0)
     # Belief strength shown to Bubble: "established" once seen on this many days and episodes.
     ESTABLISHED_DAYS = _typed("ESTABLISHED_DAYS", 3)
     ESTABLISHED_EPISODES = _typed("ESTABLISHED_EPISODES", 3)
