@@ -49,13 +49,14 @@ class ClaimsMixin(HistoryMixin):
         conn.execute("UPDATE claims SET confidence=?, modality=? WHERE id=?", (conf, modality, claim_id))
         return conf
 
-    def _link(self, conn, claim_id: int, observation_id: int, relation: str, quote: str) -> None:
+    def _link(self, conn, claim_id: int, observation_id: int, relation: str, quote: str, field: str = "") -> None:
         conn.execute(
-            """INSERT INTO evidence(claim_id, observation_id, relation, quote, created_at) VALUES (?,?,?,?,?)
+            """INSERT INTO evidence(claim_id, observation_id, relation, quote, field, created_at) VALUES (?,?,?,?,?,?)
                ON CONFLICT(claim_id, observation_id) DO UPDATE SET
                  relation=CASE WHEN excluded.relation='supports' THEN 'supports' ELSE evidence.relation END,
-                 quote=CASE WHEN excluded.relation='supports' THEN excluded.quote ELSE evidence.quote END""",
-            (claim_id, observation_id, relation, quote, now()),
+                 quote=CASE WHEN excluded.relation='supports' THEN excluded.quote ELSE evidence.quote END,
+                 field=CASE WHEN excluded.relation='supports' THEN excluded.field ELSE evidence.field END""",
+            (claim_id, observation_id, relation, quote, field, now()),
         )
 
     def _cap_evidence(self, conn, claim_id: int) -> None:
@@ -88,7 +89,7 @@ class ClaimsMixin(HistoryMixin):
         cid = rowid(cur)
         for ev in draft.evidence:
             self._link(conn, cid, int(ev["observation_id"]), "supports" if ev.get("quote") else "cooccurs",
-                       str(ev.get("quote") or ""))
+                       str(ev.get("quote") or ""), str(ev.get("field") or ""))
         self._cap_evidence(conn, cid)
         self._recompute_confidence(conn, cid)
         if vector is not None:
@@ -135,7 +136,8 @@ class ClaimsMixin(HistoryMixin):
         Returns the change for the event log: the observations newly linked."""
         had = {r[0] for r in conn.execute("SELECT observation_id FROM evidence WHERE claim_id=?", (claim_id,))}
         for ev in draft.evidence:
-            self._link(conn, claim_id, int(ev["observation_id"]), "supports", str(ev.get("quote") or ""))
+            self._link(conn, claim_id, int(ev["observation_id"]), "supports", str(ev.get("quote") or ""),
+                       str(ev.get("field") or ""))
         conn.execute("UPDATE claims SET occurred_to=MAX(occurred_to, ?), updated_at=? WHERE id=?",
                      (draft.occurred_to, now(), claim_id))
         self._cap_evidence(conn, claim_id)

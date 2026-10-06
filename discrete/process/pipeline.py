@@ -249,9 +249,9 @@ class ProcessPipeline:
             obs = by_id.get(oid)
             if obs is None:
                 continue
-            quote, ok = verify_evidence(text, str(ev.get("quote") or ""), obs)
+            quote, ok, found_in = verify_evidence(text, str(ev.get("quote") or ""), obs)
             if ok:
-                evidence.append({"observation_id": oid, "quote": quote})
+                evidence.append({"observation_id": oid, "quote": quote, "field": found_in})
                 cited.append(obs)
         if not evidence:
             outcome.reject("unsupported")

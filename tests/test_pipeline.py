@@ -470,3 +470,19 @@ async def test_a_long_episode_is_drafted_in_chunks_and_nothing_is_dropped(store,
     drafts = [p for p in prompts if "one episode of a person's computer activity" in p]
     assert len(drafts) == 3  # 10 + 10 + 5
     assert f"observation_id={ids[0]}]" in drafts[0] and f"observation_id={ids[-1]}]" in drafts[-1]
+
+
+async def test_evidence_records_where_the_quote_was_found(store, fake):
+    eid, (o1, o2) = await _one_episode(store, ["Exported dooran-final.svg for the client", "Viewing a moodboard"],
+                                       caption="The user looks at a design")
+    fake.draft = {"title": "t", "summary": "s", "claims": [
+        {"kind": "event", "text": "The user exported dooran-final.svg", "evidence": [
+            {"observation_id": o1, "quote": "Exported dooran-final.svg"}]},
+        {"kind": "event", "text": "The user looked at a design moodboard", "evidence": [
+            {"observation_id": o2, "quote": "looks at a design"}]}]}
+    await ProcessPipeline(store).draft_episode(eid)
+    fields = {}
+    for c in await store.live_claims():
+        for e in await store.evidence_for_claim(c["id"]):
+            fields[e["observation_id"]] = e["field"]
+    assert fields == {o1: "screen_text", o2: "caption"}

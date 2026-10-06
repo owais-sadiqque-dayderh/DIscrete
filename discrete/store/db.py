@@ -403,6 +403,12 @@ def m008_sightings(conn: sqlite3.Connection) -> None:
                  "WHERE origin='user'")
 
 
+def m009_evidence_field(conn: sqlite3.Connection) -> None:
+    """Which field of the observation a quote was found in (screen_text, caption, title,
+    url): screen text is what the user saw verbatim; a caption is a model's description."""
+    _add_column(conn, "evidence", "field", "TEXT NOT NULL DEFAULT ''")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_base,
     m002_draft_attempts_and_digest_counts,
@@ -412,6 +418,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m006_unsegmented_index,
     m007_memory_evolution,
     m008_sightings,
+    m009_evidence_field,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)
