@@ -102,7 +102,10 @@ class EpisodeTracker:
         st.last_obs_at = max(st.last_obs_at, row["ended_at"])
         if vec is not None and pair == st.pair and not st.low_sim:
             st.centroid = _update(st.centroid, vec, st.n)
-        if st.last_obs_at - st.started_at >= T.EPISODE_MAX_S:
+        # Close at the length the drafter reads in one call, or at the time cap: a longer
+        # episode used to lose its head before drafting (a whole download, install and the
+        # post that prompted it went unread in a 92-observation episode).
+        if st.last_obs_at - st.started_at >= T.EPISODE_MAX_S or st.n >= T.EPISODE_MAX_OBS:
             closed += await self.close_current()
         return closed
 

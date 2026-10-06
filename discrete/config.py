@@ -333,6 +333,8 @@ class T:
     EPISODE_SWITCH_MIN_S = _typed("EPISODE_SWITCH_MIN_S", 90.0)
     EPISODE_SHIFT_SIM = _typed("EPISODE_SHIFT_SIM", 0.55)
     EPISODE_MAX_S = _typed("EPISODE_MAX_S", 1800.0)
+    # An episode closes at this many observations: what the drafter reads in one call.
+    EPISODE_MAX_OBS = _typed("EPISODE_MAX_OBS", 40)
     EPISODE_IDLE_CLOSE_S = _typed("EPISODE_IDLE_CLOSE_S", 300.0)
     CLAIM_MAX_CHARS = _typed("CLAIM_MAX_CHARS", 240)
     DRAFT_TEXT_CHARS_PER_OBS = _typed("DRAFT_TEXT_CHARS_PER_OBS", 1200)

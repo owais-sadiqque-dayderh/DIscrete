@@ -91,32 +91,46 @@ class Redaction:
     text: str
     count: int
     #: The values that were removed, for :meth:`SecretMemory.remember`. In memory only.
+    #: Only confident matches: a catch-all hit (a document id, a flight-search token)
+    #: must not spread to every word sharing a fragment with it.
     secrets: tuple[str, ...] = ()
+    #: Matches of a credential *format* or a credential-named field, as opposed to the
+    #: catch-all for unnamed key material. Only these cost a capture its frame.
+    confident: int = 0
 
 
-def redact(text: str) -> Redaction:
-    """``text`` with every recognised secret replaced by ``[REDACTED]``."""
+def redact(text: str, *, catch_all: bool = True) -> Redaction:
+    """``text`` with every recognised secret replaced by ``[REDACTED]``.
+
+    ``catch_all`` also masks unnamed key material (long runs mixing many digits and
+    letters). That catches a garbled or unknown key, but also document ids and search
+    tokens, so its hits count toward ``count`` and not ``confident``."""
     if not text:
         return Redaction(text, 0)
-    count = 0
+    count = confident = 0
     secrets: list[str] = []
 
-    def _sub(pattern: re.Pattern[str], replace, value: str, group: int | str = 0) -> str:  # noqa: ANN001
-        nonlocal count
+    def _sub(pattern: re.Pattern[str], replace, value: str, group: int | str = 0, *,  # noqa: ANN001
+             sure: bool = True) -> str:
+        nonlocal count, confident
 
         def _one(match: re.Match[str]) -> str:
-            secrets.append(match.group(group))
+            if sure:
+                secrets.append(match.group(group))
             return replace(match) if callable(replace) else replace
 
         value, n = pattern.subn(_one, value)
         count += n
+        confident += n if sure else 0
         return value
 
-    for pattern in (*_TOKEN_PATTERNS, _KEY_MATERIAL):
+    for pattern in _TOKEN_PATTERNS:
         text = _sub(pattern, REDACTED, text)
+    if catch_all:
+        text = _sub(_KEY_MATERIAL, REDACTED, text, sure=False)
     text = _sub(_AUTH_HEADER, lambda m: f"{m.group('scheme')} {REDACTED}", text, "value")
     text = _sub(_ASSIGNMENT, lambda m: f"{m.group('key')}{m.group('quote')}{REDACTED}{m.group('quote')}", text, "value")
-    return Redaction(text, count, tuple(secrets))
+    return Redaction(text, count, tuple(secrets), confident)
 
 
 def redact_url(url: str) -> Redaction:
@@ -149,8 +163,10 @@ def redact_url(url: str) -> Redaction:
     rebuilt = urlunsplit(
         (parts.scheme, netloc, parts.path, urlencode(cleaned, safe="[]") if count else parts.query, parts.fragment)
     )
-    rest = redact(rebuilt)
-    return Redaction(rest.text, count + rest.count, (*secrets, *rest.secrets))
+    # Path and query ids (a Google Doc, a flight search) look like key material; a URL
+    # gets only the credential formats and credential-named parameters.
+    rest = redact(rebuilt, catch_all=False)
+    return Redaction(rest.text, count + rest.count, (*secrets, *rest.secrets), count + rest.confident)
 
 
 # A fragment is this many letters/digits of a secret, lower-cased. Long enough that a
@@ -206,4 +222,4 @@ class SecretMemory:
                 return REDACTED
             return word
 
-        return Redaction(_WORD.sub(_word, text), count)
+        return Redaction(_WORD.sub(_word, text), count, (), count)

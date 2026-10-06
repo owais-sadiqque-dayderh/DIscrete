@@ -272,7 +272,9 @@ class ScreenObserver:
         PERF.sample("capture.text", since_ms(t_text), n=len(screen_text))
         screen_text, n = self._redact_text(screen_text)
         if found or n:
-            # Text redaction cannot clean a frame: keep none, caption from the text alone.
+            # A credential was on screen and text redaction cannot clean a frame: keep
+            # none, caption from the text alone. (Catch-all hits such as document ids
+            # are masked in the text but keep the frame.)
             self.stats["redacted"] += 1
             before = after = None
         origin = classify_origin(ctx.app, ctx.window_title, screen_text)
@@ -321,15 +323,16 @@ class ScreenObserver:
             return title, url, 0
         t, u = redact(title), redact_url(url)
         self._secrets.remember((*t.secrets, *u.secrets))
-        return t.text, u.text, t.count + u.count
+        return t.text, u.text, t.confident + u.confident
 
     def _redact_text(self, text: str) -> tuple[str, int]:
+        """Redacted text, and how many *confident* secrets it held (those cost the frame)."""
         if not T.REDACT_SECRETS:
             return text, 0
         r = redact(text)
         self._secrets.remember(r.secrets)
         s = self._secrets.scrub(r.text)
-        return s.text, r.count + s.count
+        return s.text, r.confident + s.confident
 
     def _remember(self, sig: tuple, phash: str) -> None:
         self._last_kept[sig] = phash

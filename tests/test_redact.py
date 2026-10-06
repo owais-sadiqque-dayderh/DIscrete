@@ -162,3 +162,20 @@ async def test_a_capture_with_a_secret_stores_no_secret_and_no_frame(store, fake
     assert cap.draft.frame_path == "" and (cap.job is None or cap.job.frames == [])
     assert obs.stats["redacted"] == 1
     assert list(obs.dir.iterdir()) == []
+
+
+def test_ids_in_urls_and_text_are_not_confident_secrets():
+    flights = ("https://www.google.com/travel/flights/booking?tfs=CBwQAhqBARIKMjAyNi0xMC0wNiIfCgNERUwSCjIwMjYt"
+               "MTAtMDYaA0FVSCoCRVkyAzIxOSIeCgNBVUgSCjIwMjYtMTAtMDYaA09SRCoCRVkyAjExIiAKA09SRBIK")
+    assert redact_url(flights).count == 0 and redact_url(flights).text == flights
+    doc = "https://docs.google.com/document/d/1aB2cD3eF4gH5iJ6kL7mN8oP9qR0sT1uV2wX3yZ4/edit"
+    assert redact_url(doc).text == doc
+    r = redact("doc id 1aB2cD3eF4gH5iJ6kL7mN8oP9qR0sT1uV2wX3yZ4 shared")
+    assert r.count == 1 and r.confident == 0 and r.secrets == ()  # masked, but not a credential
+    key = redact("OPENROUTER_API_KEY=sk-or-v1-0123456789abcdef0123456789abcdef")
+    assert key.confident >= 1 and key.secrets
+
+
+def test_a_secret_in_the_url_is_still_confident():
+    r = redact_url("https://app.example.com/cb?code=abc123&token=ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+    assert r.confident >= 1 and "ghp_" not in r.text

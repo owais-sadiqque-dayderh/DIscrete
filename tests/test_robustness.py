@@ -458,3 +458,15 @@ async def test_a_provider_glitch_is_retried_but_a_wrong_model_is_not(fake, monke
     except openai.NotFoundError:
         pass
     assert len(calls) == 1
+
+
+def test_discretes_own_output_is_not_the_users_activity():
+    from discrete.capture.suppress import classify_origin
+
+    assert classify_origin("Terminal", 'jarvis ask "which browser did I use?" — zsh', "Helium") == "agent"
+    assert classify_origin("DB Browser for SQLite", "DB Browser for SQLite - /Users/x/.cache/discrete/discrete.db",
+                           "claims") == "agent"
+    records = "[claim 32 · event · engaged · Mon]\\nThe user ...\\n[screen 95 · Mon 22:22 · Helium Setup]"
+    assert classify_origin("Terminal", "zsh", records) == "agent"
+    # The user's own project named Jarvis is ordinary activity.
+    assert classify_origin("Arc", "Jarvis roadmap - Google Docs", "Jarvis plan for October") == "user"

@@ -10,6 +10,7 @@ from pathlib import Path
 from PIL import Image
 
 from discrete.capture.enrich import Enricher, EnrichJob
+from discrete.capture.suppress import classify_origin
 from discrete.llm import flush_usage
 from discrete.models import ObservationDraft
 from discrete.perf import PERF
@@ -40,6 +41,9 @@ async def replay(args):
                 await tracker.close_current()
             group = item["group"]
             draft = ObservationDraft(**item["draft"])
+            if draft.origin == "user":
+                # Live capture classifies origin before storing; a replay must too.
+                draft.origin = classify_origin(draft.app, draft.window_title, draft.screen_text)
             oid, new = await store.add_observation(draft)
             if not new or oid is None:
                 continue

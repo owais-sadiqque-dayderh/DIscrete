@@ -107,13 +107,22 @@ class ProcessPipeline:
                                            engaged_fraction=engaged)
             return outcome
 
-        data = await self._call_draft(rows)
+        # Every observation is read: an episode longer than one call (recovered, or from
+        # before EPISODE_MAX_OBS) is drafted in consecutive chunks, never truncated.
+        chunks = [rows[i:i + T.DRAFT_MAX_OBS] for i in range(0, len(rows), T.DRAFT_MAX_OBS)]
+        parts = [await self._call_draft(chunk) for chunk in chunks]
+        data = parts[0] if len(parts) == 1 else {
+            "title": " / ".join(dict.fromkeys(str(p.get("title") or "") for p in parts if p.get("title"))),
+            "summary": " ".join(str(p.get("summary") or "") for p in parts),
+            "claims": [c for p in parts for c in (p.get("claims") or [])],
+        }
         by_id = {r["id"]: r for r in rows}
         t0 = min(r["started_at"] for r in rows)
         t1 = max(r["ended_at"] for r in rows)
         counts = {"event": 0, "durable": 0, "action": 0}
         span_min = (t1 - t0) / 60
-        caps = {"event": max_events(span_min), "durable": T.DRAFT_MAX_DURABLE, "action": T.DRAFT_MAX_ACTIONS}
+        caps = {"event": max_events(span_min) * len(chunks), "durable": T.DRAFT_MAX_DURABLE * len(chunks),
+                "action": T.DRAFT_MAX_ACTIONS * len(chunks)}
         names_seen: list[str] = []
         drafts: list[ClaimDraft] = []
         seen: set[tuple[str, str]] = set()
@@ -181,7 +190,7 @@ class ProcessPipeline:
     async def _call_draft(self, rows) -> dict:
         seen_lines: set[str] = set()
         blocks = []
-        for r in rows[-T.DRAFT_MAX_OBS:]:
+        for r in rows:
             kept = []
             for line in (r["screen_text"] or "").splitlines():
                 k = tk.norm_key(line)
