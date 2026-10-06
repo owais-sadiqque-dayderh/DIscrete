@@ -206,6 +206,71 @@ This audit shows where each proposed feature starts from. Code paths are relativ
   - Markdown/Obsidian + git export (Codex GPT-6-Sol) → `discrete/export.py`;
   - live-session golden questions incl. "why" (Claude Opus) → `bench/private/live1006/cases.yaml`.
 
+## Phase 5 — Baseline score, the input audit, fixes from it (2026-10-07, ~00:15–01:30 IST)
+
+- **Session break:** the previous session ended at about 00:14 and killed two rebuilds mid-run (branch g46,
+  live baseline). Their partial dbs were deleted and the rebuilds restarted with `nohup`, so a session end no longer
+  kills them. Each writes `DONE` at the end of its log.
+- **Baseline score on the rebuilt g46 session** (main code, `results/g46-base.json`):
+
+  | Metric | Score |
+  |---|---|
+  | overall | **0.652** (30/46) |
+  | answers | 0.659 |
+  | refusals | 0.6 |
+  | supported | 0.717 |
+  | hit@8 | 0.707 |
+  | MRR | 0.386 |
+  | p50 latency | 15.9 s |
+  | cost for 46 answers | $0.10 |
+
+  By category: aggregate 2/2, enumerate 0/2, profile 1/3, recall 22/30, temporal 2/4, unanswerable 3/5.
+  - This is lower than the closed log's 0.717 on the original Sep 30/Oct 1 store. That store is gone; this one is
+    rebuilt from the same raw captures with new captions/drafts and muse as verifier. Only same-db comparisons
+    count from here.
+- **Verifier model (the user's question).** Every DIscrete `.env` already sets `VERIFY_LM_MODEL_NAME` to muse;
+  Gemini appears only in an old comment on `.env` line 36. So all runs here are muse end to end. An ablation is
+  running (`g46/branch-geminiverify.db`, `VERIFY_LM_MODEL_NAME=google/gemini-3.8-flash` in the env) to measure
+  whether an independent verifier matters. That matters most for the new self-checks: the dream verifier, the trail
+  verifier, the profile.
+- **Input audit delivered** (`docs/audit_inputs.md`, committed `11c1934`; delegated to Claude Opus, no paid calls).
+  Short answers:
+  - **AX:** the right primary source and not too long (median 1.7k chars, 1 row in 227 truncated), but noisy: 43%
+    single-word lines, 15% duplicate lines, median 26% of AX tokens not visible on screen. A hidden Notes preview
+    produced 4 fake "preferences".
+  - **OCR:** good (local, ~350 ms). It read "Helium" off Theo's video, but loses small text because it runs after
+    the frame is shrunk to 1600 px.
+  - **Captions:** 12/14 accurate, no hallucinated content, but 81% of claim evidence quotes the caption, not screen
+    text.
+  - **Don't replace AX/OCR with a VLM** (~30× the cost, loses exact text).
+  - **Schema:** sound core. Missing: sightings/dwell (attention), pages as objects, text provenance, revealed
+    choices/signals, tasks above episodes, preference slots.
+  - **Root cause of the Helium miss: the drafter read only an episode's last 40 observations**
+    (`rows[-DRAFT_MAX_OBS:]`). Episode 5 had 92, so 52 rows (the whole Helium chain) never reached the model.
+    Phase 3's "5-event cap" diagnosis was wrong.
+  - **Security:** obs 239 of the live snapshot shows `.env` in TextEdit with OpenRouter keys (before redaction
+    existed). **The user should rotate the OpenRouter key** and delete that row and frame from
+    `~/.cache/discrete` / `~/.cache/exp_discrete`.
+- **Fixed from the audit** (commit `28af5f4`):
+  1. **Drafting reads every observation:** episodes close at `EPISODE_MAX_OBS` (40), and longer ones are drafted in
+     consecutive chunks (claims combined, caps scaled).
+  2. **DIscrete's own output** (a terminal running jarvis/discrete commands, printed `[claim N ·` records, its
+     db in a viewer) is classified as agent output. The replay tool now applies `classify_origin` like live capture.
+  3. **Redaction precision.** The catch-all for unnamed key material was hitting Google Docs ids and Flights search
+     tokens, and every hit dropped the frame. Now only confident credential matches drop a frame; the catch-all
+     masks text only and never runs on URLs. On the two sessions only the two `.env` captures lose their frame.
+     `bench/redact_manifest.py` applies capture redaction to replay manifests (they were sending the key to the
+     caption model again).
+- **Delegated now** (Codex GPT-6-Sol, separate files, uncommitted until reviewed):
+  - audit #4 (clean AX at the source, visible-only text) + #7 (OCR at native resolution) → `capture/*.py`;
+  - audit #10 (deterministic action and choice detectors) → `process/actions.py`.
+- **Next (me):**
+  - audit #6 (filter chrome before the drafter and the caption);
+  - #11 (caption prompt: separate the page from embedded media, name brands in media);
+  - #5 (evidence provenance; lower weight for caption-only quotes);
+  - #9 (sightings, active dwell, pages; migration 8);
+  - then rebuild both sessions and score: baseline vs branch vs branch with the Gemini verifier.
+
 ---
 
 ## ▶ HANDOFF — read this first if you are picking up (written 2026-10-07 ~00:30 IST)
@@ -239,7 +304,7 @@ see Phases 2–4 above. Plus:
   dream);
 - the why fallback for any matched moment (commit `54b2afe`).
 
-**Jobs that were running at handoff** (all write under `bench/private/`; check whether they finished):
+**Jobs that were running at handoff** (superseded by Phase 5: rebuilds restarted with nohup; logs end in DONE) (all write under `bench/private/`; check whether they finished):
 1. **g46 baseline score:** `bench/private/g46/eval-base.log` → `bench/private/results/g46-base.json`. It scores the
    main code on `g46/base.db`.
 2. **g46 branch rebuild:** `bench/private/g46/replay-branch.log` → `g46/branch.db`. It replays with the branch
