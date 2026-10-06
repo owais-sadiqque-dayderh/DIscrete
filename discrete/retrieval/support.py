@@ -40,8 +40,9 @@ account owner. For lists, include every matching item. For personal preferences,
 require an attributable statement or a supported preference claim. If no record
 answers the question, return an empty list. Never use outside knowledge.
 For a question asking why the user did something (intent "why"), a record supports
-the answer when it shows the action itself, or what the user saw or did shortly
-before it that involves the same thing (a post, video, message, search or page).
+the answer when it shows the action itself, what the user saw or did shortly before
+it that involves the same thing (a post, video, message, search or page), or the
+page or step that led straight to it. Use each record's "context" for how it relates.
 """
 
 

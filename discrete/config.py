@@ -449,7 +449,8 @@ class T:
     # followed, and, with no trail, how far back and how many moments before the action.
     WHY_TARGETS = _typed("WHY_TARGETS", 3)
     WHY_BEFORE_MIN = _typed("WHY_BEFORE_MIN", 10.0)
-    WHY_BEFORE_MAX = _typed("WHY_BEFORE_MAX", 4)
+    WHY_BEFORE_MAX = _typed("WHY_BEFORE_MAX", 5)
+    WHY_IMMEDIATE = _typed("WHY_IMMEDIATE", 2)
     # Enumeration ("list all …") bypasses TOP_K/MMR: it returns every distinct page.
     ENUMERATE_MAX = _typed("ENUMERATE_MAX", 200)
     ENUMERATE_POOL = _typed("ENUMERATE_POOL", 400)

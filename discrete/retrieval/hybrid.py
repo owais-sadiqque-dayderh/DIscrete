@@ -191,18 +191,25 @@ async def add_profile(store: Store, result: RetrievalResult) -> None:
 
 
 async def expand_why(store: Store, result: RetrievalResult) -> None:
-    """For "why did I …": put what led to the matched action right after it.
+    """For "why did I …": put what led to the matched moment right after it.
 
-    A causal-trail link (process/trails.py) was checked in code and by the verifier when
-    it was written, so it joins as a strong record. Without one, the moments just
-    before the action that name the same thing join, for the support check to judge."""
-    targets = [h for h in result.hits if h.ref_kind == "claim" and h.claim_kind == "event"][: T.WHY_TARGETS]
-    targets.sort(key=lambda h: not h.action)
-    if not targets:
+    The anchor is a matched event memory (completed actions first) or, failing that, a
+    matched screen. A causal-trail link (process/trails.py) was checked in code and by
+    the verifier when it was written, so it joins as a strong record. Without one, the
+    moments before the anchor that plausibly lead to it join for the support check to
+    judge: those naming the same thing (with the matching line of screen text, since
+    the caption often misses it: a browser's menu bar inside a video), the page it was
+    reached from, and the moment or two just before."""
+    anchors = [h for h in result.hits if h.ref_kind == "claim" and h.claim_kind == "event"][: T.WHY_TARGETS]
+    anchors.sort(key=lambda h: not h.action)
+    if not anchors:
+        anchors = [h for h in result.hits if h.ref_kind == "observation" and not h.via][:1]
+    if not anchors:
         return
     have = {(h.ref_kind, h.ref_id) for h in result.hits}
-    added: dict[int, list[Hit]] = {}
-    links = await store.links_into("claim", [t.ref_id for t in targets])
+    added: dict[tuple[str, int], list[Hit]] = {}
+    claim_ids = [a.ref_id for a in anchors if a.ref_kind == "claim"]
+    links = await store.links_into("claim", claim_ids)
     rows = {r["id"]: r for r in await store.get_observations(list({lk["src_id"] for lk in links}), user_only=True)}
     for lk in links:
         r = rows.get(lk["src_id"])
@@ -212,27 +219,51 @@ async def expand_why(store: Store, result: RetrievalResult) -> None:
         role = "led to" if lk["relation"] == "led_to" else "a step towards"
         h = _trail_hit(r, quote[0]["quote"] if quote else "", via=f"{role} claim {lk['dst_id']}: {lk['reason']}")
         h.strong = True  # verified when the link was written
-        added.setdefault(lk["dst_id"], []).append(h)
+        added.setdefault(("claim", lk["dst_id"]), []).append(h)
         have.add(("observation", r["id"]))
-    target = targets[0]
-    if target.ref_id not in added and target.occurred_at:
-        terms = set(await thing_terms(store, target.title, [result.query]))
-        rows_before = await store.observations_started_within(target.occurred_at - T.WHY_BEFORE_MIN * 60,
-                                                              target.occurred_at)
-        before = [r for r in rows_before if ("observation", r["id"]) not in have
-                  and r["started_at"] < target.occurred_at
-                  and terms & set(tk.tokens(" ".join([r["window_title"], r["caption"], r["screen_text"]])))]
-        for r in before[-T.WHY_BEFORE_MAX:]:
-            added.setdefault(target.ref_id, []).append(
-                _trail_hit(r, "", via=f"shortly before claim {target.ref_id}"))
-    if not added:
+    anchor = anchors[0]
+    key = (anchor.ref_kind, anchor.ref_id)
+    if key not in added and anchor.occurred_at:
+        added[key] = await _moments_before(store, anchor, result.query, have)
+    if not any(added.values()):
         return
     out: list[Hit] = []
     for h in result.hits:
         out.append(h)
-        if h.ref_kind == "claim" and h.ref_id in added:
-            out += sorted(added[h.ref_id], key=lambda x: x.occurred_at)
+        out += sorted(added.get((h.ref_kind, h.ref_id), []), key=lambda x: x.occurred_at)
     result.hits = out
+
+
+async def _moments_before(store: Store, anchor: Hit, query: str, have: set) -> list[Hit]:
+    t = anchor.occurred_at
+    label = f"{'claim' if anchor.ref_kind == 'claim' else 'screen'} {anchor.ref_id}"
+    rows = [r for r in await store.observations_started_within(t - T.WHY_BEFORE_MIN * 60, t)
+            if r["started_at"] < t and ("observation", r["id"]) not in have]
+    if not rows:
+        return []
+    terms = await thing_terms(store, f"{anchor.title} {anchor.body[:300]}", [query])
+    own = await store.get_observations(
+        [r["observation_id"] for r in await store.evidence_for_claim(anchor.ref_id)] if anchor.ref_kind == "claim"
+        else [anchor.ref_id])
+    came_from = {tk.norm_key(o["navigated_from"]) for o in own if o["navigated_from"]}
+    picked: dict[int, str] = {}
+    for r in rows:
+        text = " ".join([r["window_title"], r["page_title"], r["caption"], r["screen_text"]])
+        name = tk.norm_key(r["page_title"] or r["window_title"])
+        if came_from and name and any(name in c or c in name for c in came_from):
+            picked[r["id"]] = f"the page {label} was reached from"
+        elif terms and set(terms) & set(tk.tokens(text)):
+            picked.setdefault(r["id"], f"before {label}, about the same thing")
+    named = [r for r in rows if r["id"] in picked][-T.WHY_BEFORE_MAX:]
+    for r in rows[-T.WHY_IMMEDIATE:]:
+        picked.setdefault(r["id"], f"just before {label}")
+    keep = {r["id"] for r in named} | {r["id"] for r in rows[-T.WHY_IMMEDIATE:]}
+    out = []
+    for r in rows:
+        if r["id"] in keep:
+            snippet = tk.best_window(r["screen_text"] or "", set(terms), width=24)[0] if terms else ""
+            out.append(_trail_hit(r, snippet, via=picked[r["id"]]))
+    return out
 
 
 def _trail_hit(r, quote: str, *, via: str) -> Hit:

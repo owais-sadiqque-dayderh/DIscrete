@@ -114,6 +114,10 @@ async def test_without_a_trail_the_moments_before_the_action_are_offered(store, 
     result = RetrievalResult(query="why did I download helium",
                              plan=QueryPlan(raw="", intent="why", terms=["download", "helium"]), hits=[action])
     await expand_why(store, result)
-    added = [h for h in result.hits if h.ref_kind == "observation"]
-    assert {h.ref_id for h in added} == {theo, search} and all(h.via.startswith("shortly before") for h in added)
-    assert not any(h.strong for h in added)  # left for the support check to judge
+    via = {h.ref_id: h.via for h in result.hits if h.ref_kind == "observation"}
+    assert via == {theo: f"before claim {cid}, about the same thing",
+                   music: f"just before claim {cid}",
+                   search: f"before claim {cid}, about the same thing"}
+    theo_hit = next(h for h in result.hits if h.ref_id == theo and h.ref_kind == "observation")
+    assert "Helium File Edit" in theo_hit.body  # the screen line naming it, not just the caption
+    assert not any(h.strong for h in result.hits if h.ref_kind == "observation")  # the support check judges
