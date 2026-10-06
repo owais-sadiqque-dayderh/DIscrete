@@ -40,7 +40,7 @@ import numpy as np
 
 from .. import textkit as tk
 from ..config import T, dream_endpoint, memory_export_dir, verifier_endpoint
-from ..llm import EXPECTED_ERRORS, complete_json, try_embed
+from ..llm import EXPECTED_ERRORS, complete_obj, try_embed
 from ..perf import PERF
 from ..store import Store
 from ..timeutil import day_key, now, to_local
@@ -132,16 +132,22 @@ async def due(store: Store) -> bool:
 async def run_dream(store: Store) -> dict:
     run_id = uuid4().hex[:12]
     report: dict = {"run_id": run_id}
-    with PERF.timer("dream.run"):
-        for name, step in (("patterns", _patterns), ("conflicts", _conflicts), ("stale", _stale),
-                           ("profile", _profile)):
-            try:
-                with PERF.timer(f"dream.{name}"):
-                    report[name] = await step(store, run_id)
-            except EXPECTED_ERRORS as exc:
-                log.warning("dream step %s failed: %s", name, exc)
-                report[name] = {"error": str(exc)[:200]}
-    await store.set_meta("last_dream", str(now()))
+    try:
+        with PERF.timer("dream.run"):
+            for name, step in (("patterns", _patterns), ("conflicts", _conflicts), ("stale", _stale),
+                               ("profile", _profile)):
+                try:
+                    with PERF.timer(f"dream.{name}"):
+                        report[name] = await step(store, run_id)
+                except EXPECTED_ERRORS as exc:
+                    log.warning("dream step %s failed: %s", name, exc)
+                    report[name] = {"error": str(exc)[:200]}
+                except Exception as exc:  # one broken step must not stop the others
+                    log.exception("dream step %s crashed", name)
+                    report[name] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
+    finally:
+        # Even a failed dream waits a full interval: a crash must not re-run paid steps every minute.
+        await store.set_meta("last_dream", str(now()))
     if (out := memory_export_dir()) is not None:
         # The Markdown mirror follows each dream, so its git log is the history of beliefs.
         from ..export import export_markdown
@@ -220,9 +226,9 @@ async def _verify(items: list[dict], by_id: dict) -> list[bool]:
         "memories": [{"text": by_id[s]["text"], "day": f"{to_local(by_id[s]['occurred_from']):%a %b %d}",
                       "modality": by_id[s]["modality"]} for s in it["support"] if s in by_id]}
         for i, it in enumerate(items)]}
-    data = await complete_json(ep, [{"role": "user", "content": VERIFY_PATTERNS_PROMPT.format(
+    data = await complete_obj(ep, [{"role": "user", "content": VERIFY_PATTERNS_PROMPT.format(
         payload=json.dumps(payload, ensure_ascii=False))}], max_tokens=120 + 60 * len(items))
-    ok = {d.get("index") for d in (data or {}).get("decisions") or []
+    ok = {d.get("index") for d in data.get("decisions") or []
           if isinstance(d, dict) and d.get("supported") is True}
     return [i in ok for i in range(len(items))]
 
@@ -269,9 +275,7 @@ async def _patterns(store: Store, run_id: str) -> dict:
         memories=_render(memories, episodes), attention=await attention_context(store),
         patterns="\n".join(f"[{p['id']}] ({p['context'] or 'pattern'}) {p['text']}" for p in patterns) or "(none)",
         min_episodes=T.DREAM_MIN_EPISODES, categories="|".join(CATEGORIES))
-    data = await complete_json(ep, [{"role": "user", "content": prompt}], max_tokens=2500)
-    if not isinstance(data, dict):
-        return report | {"skipped": "malformed"}
+    data = await complete_obj(ep, [{"role": "user", "content": prompt}], max_tokens=2500)
 
     def reject(why: str) -> None:
         report["rejected"][why] = report["rejected"].get(why, 0) + 1
@@ -367,9 +371,9 @@ async def _conflicts(store: Store, run_id: str) -> dict:
     if not pairs or not ep.configured:
         return report
     payload = {"pairs": [{"index": i, "a": a["text"], "b": b["text"]} for i, (_, a, b) in enumerate(pairs)]}
-    data = await complete_json(ep, [{"role": "user", "content": CONFLICT_PROMPT.format(
+    data = await complete_obj(ep, [{"role": "user", "content": CONFLICT_PROMPT.format(
         payload=json.dumps(payload, ensure_ascii=False))}], max_tokens=100 + 50 * len(pairs))
-    verdicts = {d.get("index"): d for d in (data or {}).get("pairs") or [] if isinstance(d, dict)}
+    verdicts = {d.get("index"): d for d in data.get("pairs") or [] if isinstance(d, dict)}
     for i, (_, a, b) in enumerate(pairs):
         d = verdicts.get(i)
         if d is None:

@@ -117,8 +117,71 @@ class HistoryMixin(StoreBase):
 
     # ------------------------------------------------------------------- revert
 
+    # -------------------------------------------------------------- evidence/fields
+
+    def _evidence_rows(self, conn, claim_id: int) -> dict[int, dict]:
+        return {r["observation_id"]: dict(r) for r in conn.execute(
+            "SELECT observation_id, relation, quote, field, created_at FROM evidence WHERE claim_id=?", (claim_id,))}
+
+    def _evidence_change(self, conn, claim_id: int, before: dict[int, dict], *, fields_before: dict | None = None,
+                         fields_after: dict | None = None) -> dict:
+        """The evidence rows a change added and evicted (in full, so a revert can put them
+        back), plus untracked columns it changed (occurred_to, derived_from, flag)."""
+        after = self._evidence_rows(conn, claim_id)
+        change: dict = {"id": claim_id,
+                        "evidence_added_rows": [after[o] for o in sorted(set(after) - set(before))],
+                        "evidence_removed_rows": [before[o] for o in sorted(set(before) - set(after))]}
+        if fields_before is not None:
+            change["fields_before"], change["fields_after"] = fields_before, fields_after or {}
+        return change
+
+    def _invert(self, conn, change: dict) -> dict | None:
+        """Undo one recorded change; returns the change that undoes the undo (for redo)."""
+        cid = change["id"]
+        inv: dict = {"id": cid}
+        added = change.get("evidence_added_rows") or [{"observation_id": o} for o in change.get("evidence_added", [])]
+        if added:
+            have = self._evidence_rows(conn, cid)
+            inv["evidence_removed_rows"] = [have[r["observation_id"]] for r in added if r["observation_id"] in have]
+            for r in added:
+                conn.execute("DELETE FROM evidence WHERE claim_id=? AND observation_id=?", (cid, r["observation_id"]))
+        if removed := change.get("evidence_removed_rows"):
+            for r in removed:
+                conn.execute("INSERT OR REPLACE INTO evidence(claim_id, observation_id, relation, quote, field, "
+                             "created_at) VALUES (?,?,?,?,?,?)", (cid, r["observation_id"], r["relation"], r["quote"],
+                                                                  r.get("field", ""), r["created_at"]))
+            inv["evidence_added_rows"] = removed
+        if fields := change.get("fields_before"):
+            row = conn.execute(f"SELECT {', '.join(fields)} FROM claims WHERE id=?", (cid,)).fetchone()
+            inv["fields_before"], inv["fields_after"] = dict(row) if row else {}, fields
+            conn.execute(f"UPDATE claims SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",
+                         (*fields.values(), cid))
+        if added or removed:
+            self._recompute_after_revert(conn, cid)
+        if change.get("before"):
+            if (c := self._set_state(conn, cid, **change["before"])) is not None:
+                inv["before"], inv["after"] = c["before"], c["after"]
+        return inv if len(inv) > 1 else None
+
+    # ------------------------------------------------------------------- revert
+
+    def _set_profile(self, conn, profile: dict | None) -> None:
+        if profile is None:
+            conn.execute("DELETE FROM meta WHERE key='profile'")
+        else:
+            conn.execute("INSERT INTO meta(key, value) VALUES ('profile', ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(profile),))
+
+    def _current_profile(self, conn) -> dict | None:
+        row = conn.execute("SELECT value FROM meta WHERE key='profile'").fetchone()
+        return json.loads(row[0]) if row else None
+
     async def revert_event(self, event_id: int, *, force: bool = False, reason: str = "") -> int:
-        """Undo one event; returns the id of the revert event."""
+        """Undo one event; returns the id of the event that records the undo.
+
+        Reverting a `revert` re-applies the original (op `redo`) and makes the original
+        active again, so it can later be reverted the ordinary way. A redo itself is not
+        reverted; revert the original event again instead."""
 
         def _run() -> int:
             with self._tx() as conn:
@@ -127,43 +190,62 @@ class HistoryMixin(StoreBase):
                     raise KeyError(f"no event {event_id}")
                 if ev["undone_by"] is not None:
                     raise RevertConflict(f"event {event_id} was already reverted by event {ev['undone_by']}")
-                created = json.loads(ev["created"])
+                data = json.loads(ev["data"] or "{}")
+                if ev["op"] == "redo":
+                    raise RevertConflict(f"#{event_id} re-applied #{data.get('reapplies')}; revert that event instead")
                 changes = json.loads(ev["changes"])
+                created = [] if ev["op"] == "revert" else json.loads(ev["created"])
                 touched = list({*created, *(c["id"] for c in changes)})
-                if touched and not force:
+                if not force:
                     later = conn.execute(
                         f"SELECT DISTINCT e.id, e.op FROM memory_events e JOIN memory_event_refs r ON r.event_id=e.id "
                         f"WHERE e.id > ? AND e.undone_by IS NULL AND e.op != 'revert' "
-                        f"AND r.claim_id IN ({_ph(touched)})", (event_id, *touched)).fetchall()
+                        f"AND NOT (e.op = 'redo' AND json_extract(e.data, '$.reapplies') = ?) "
+                        f"AND r.claim_id IN ({_ph(touched)})", (event_id, event_id, *touched)).fetchall() \
+                        if touched else []
+                    if ev["op"] == "profile":
+                        later += conn.execute("SELECT id, op FROM memory_events WHERE id > ? AND op='profile' "
+                                              "AND undone_by IS NULL", (event_id,)).fetchall()
                     if later:
-                        raise RevertConflict("later changes touch the same claims: "
+                        raise RevertConflict("later changes touch the same memories: "
                                              + ", ".join(f"#{r['id']} {r['op']}" for r in later))
-                out: list[dict | None] = []
-                for change in changes:
-                    cid = change["id"]
-                    for obs_id in change.get("evidence_added", []):
-                        conn.execute("DELETE FROM evidence WHERE claim_id=? AND observation_id=?", (cid, obs_id))
-                    if change.get("evidence_added"):
-                        self._recompute_after_revert(conn, cid)
-                    if change.get("before"):
-                        out.append(self._set_state(conn, cid, **change["before"]))
-                for cid in created:
-                    out.append(self._set_state(conn, cid, status="reverted", valid_to=now()))
-                # A forget's suppression and an event's links go with it.
+                out: list[dict | None] = [self._invert(conn, c) for c in changes]
+                out += [self._set_state(conn, cid, status="reverted", valid_to=now()) for cid in created]
+                if ev["op"] == "revert":
+                    # Redo: put back the side effects the revert took away.
+                    original = data["reverts"]
+                    for r in data.get("suppressions", []):
+                        conn.execute("INSERT OR REPLACE INTO suppressions(id, kind, text, norm_key, vector, claim_id, "
+                                     "event_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                                     (r["id"], r["kind"], r["text"], r["norm_key"],
+                                      bytes.fromhex(r["vector"]) if r["vector"] else None, r["claim_id"],
+                                      r["event_id"], r["created_at"]))
+                    if data.get("links"):
+                        conn.execute(f"UPDATE links SET status='live' WHERE id IN ({_ph(data['links'])})",
+                                     data["links"])
+                    if "profile_was" in data:
+                        self._set_profile(conn, data["profile_set"])
+                    rid = self._log_event(conn, "redo", "user", claim_id=ev["claim_id"], changes=out,
+                                          reason=reason or f"re-applied #{original} (reverted by #{event_id})",
+                                          data={"reapplies": original, "undoes": event_id})
+                    conn.execute("UPDATE memory_events SET undone_by=NULL WHERE id=?", (original,))
+                    conn.execute("UPDATE memory_events SET undone_by=? WHERE id=?", (rid, event_id))
+                    return rid
+                side: dict = {"reverts": event_id}
+                # A forget's suppression, an event's links and a profile rewrite go with it.
+                sup = conn.execute("SELECT * FROM suppressions WHERE event_id=?", (event_id,)).fetchall()
+                side["suppressions"] = [dict(r) | {"vector": r["vector"].hex() if r["vector"] else ""} for r in sup]
                 conn.execute("DELETE FROM suppressions WHERE event_id=?", (event_id,))
-                conn.execute("UPDATE links SET status='reverted' WHERE event_id=?", (event_id,))
+                links = [r[0] for r in conn.execute("SELECT id FROM links WHERE event_id=? AND status='live'",
+                                                    (event_id,))]
+                side["links"] = links
+                if links:
+                    conn.execute(f"UPDATE links SET status='reverted' WHERE id IN ({_ph(links)})", links)
                 if ev["op"] == "profile":
-                    prev = json.loads(ev["data"] or "{}").get("previous")
-                    if prev is None:
-                        conn.execute("DELETE FROM meta WHERE key='profile'")
-                    else:
-                        conn.execute("INSERT INTO meta(key, value) VALUES ('profile', ?) "
-                                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(prev),))
+                    side["profile_was"], side["profile_set"] = data.get("previous"), self._current_profile(conn)
+                    self._set_profile(conn, data.get("previous"))
                 rid = self._log_event(conn, "revert", "user", claim_id=ev["claim_id"], changes=out,
-                                      reason=reason or f"revert of #{event_id} ({ev['op']})",
-                                      data={"reverts": event_id, "evidence_removed": [
-                                          {"id": c["id"], "observations": c["evidence_added"]}
-                                          for c in changes if c.get("evidence_added")]})
+                                      reason=reason or f"revert of #{event_id} ({ev['op']})", data=side)
                 conn.execute("UPDATE memory_events SET undone_by=? WHERE id=?", (rid, event_id))
                 return rid
 

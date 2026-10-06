@@ -215,34 +215,53 @@ class Runtime:
             await asyncio.sleep(5.0)
 
     async def _maint_loop(self) -> None:
-        last_retention = 0.0
-        last_entities = 0.0
+        last = {"retention": 0.0, "entities": 0.0}
+
+        async def consolidation() -> None:
+            if now() - float(await self.store.get_meta("last_consolidation", "0") or 0) >= T.CONSOLIDATION_INTERVAL_S:
+                log.info("consolidation: %s", await run_consolidation(self.store))
+
+        async def trails() -> None:
+            if made := await build_trails(self.store):
+                log.info("causal trails: %d links", made)
+
+        async def entities() -> None:
+            # Entities and their links between full consolidations, so a session shorter
+            # than the merge interval still gets a graph.
+            if time.time() - last["entities"] >= T.ENTITY_INTERVAL_MIN * 60:
+                last["entities"] = time.time()
+                if promoted := await promote_recurring(self.store):
+                    log.info("entities: +%d, %d links", promoted, await self.store.rebuild_edges())
+
+        async def dream() -> None:
+            if await dream_due(self.store):
+                log.info("dream: %s", await run_dream(self.store))
+
+        async def retention() -> None:
+            if time.time() - last["retention"] >= 3600:
+                last["retention"] = time.time()
+                log.info("retention: %s", await run_retention(self.store))
+
+        async def housekeeping() -> None:
+            await self.store.retry_failed_drafts(older_than_s=T.FAILED_WORK_RETRY_S)
+            await self.store.retry_failed_outbox(older_than_s=T.FAILED_WORK_RETRY_S)
+            await drain_outbox(self.store)
+
+        steps = (housekeeping, trails, entities, consolidation, dream, retention)
         while True:
+            # Each step on its own: one failing (a model outage, a bad reply) must not
+            # starve the others, as a single shared try did.
+            for step in steps:
+                try:
+                    await step()
+                except Exception:
+                    log.exception("maintenance step %s failed", step.__name__)
+                    await self.store.bump_metric(f"maint_errors_{step.__name__}")
             try:
-                await self.store.retry_failed_drafts(older_than_s=T.FAILED_WORK_RETRY_S)
-                await self.store.retry_failed_outbox(older_than_s=T.FAILED_WORK_RETRY_S)
-                await drain_outbox(self.store)
-                if made := await build_trails(self.store):
-                    log.info("causal trails: %d links", made)
-                if time.time() - last_entities >= T.ENTITY_INTERVAL_MIN * 60:
-                    # Entities and their links between full consolidations, so a session
-                    # shorter than the merge interval still gets a graph.
-                    if promoted := await promote_recurring(self.store):
-                        log.info("entities: +%d, %d links", promoted, await self.store.rebuild_edges())
-                    last_entities = time.time()
-                last = float(await self.store.get_meta("last_consolidation", "0") or 0)
-                if now() - last >= T.CONSOLIDATION_INTERVAL_S:
-                    log.info("consolidation: %s", await run_consolidation(self.store))
-                if await dream_due(self.store):
-                    log.info("dream: %s", await run_dream(self.store))
-                if time.time() - last_retention >= 3600:
-                    log.info("retention: %s", await run_retention(self.store))
-                    last_retention = time.time()
                 self._flush_counters()
                 await flush_usage(self.store)
             except Exception:
-                log.exception("maintenance failed")
-                await self.store.bump_metric("maint_errors")
+                log.exception("usage flush failed")
             await asyncio.sleep(60.0)
 
     async def _heartbeat_loop(self) -> None:

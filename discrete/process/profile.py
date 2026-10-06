@@ -16,7 +16,7 @@ import logging
 
 from .. import textkit as tk
 from ..config import dream_endpoint
-from ..llm import complete_json
+from ..llm import complete_obj
 from ..store import Store
 from ..timeutil import now, to_local
 from .dream import _verify, attention_context
@@ -63,12 +63,12 @@ async def write_profile(store: Store, *, run_id: str = "") -> dict:
         st = strengths.get(r["id"])
         kind = f"{r['kind']} ({r['action']})" if r["action"] else r["kind"]
         lines.append(f"[{r['id']}] ({kind}, {st.describe() if st else 'stated'}) {r['text']}")
-    data = await complete_json(ep, [{"role": "user", "content": PROFILE_PROMPT.format(
+    data = await complete_obj(ep, [{"role": "user", "content": PROFILE_PROMPT.format(
         memories="\n".join(lines), sections="; ".join(SECTIONS),
         attention=await attention_context(store))}], max_tokens=1800)
     by_id = {r["id"]: r for r in rows}
     points: list[dict] = []
-    for sec in (data or {}).get("sections") or []:
+    for sec in data.get("sections") or []:
         if not isinstance(sec, dict) or sec.get("heading") not in SECTIONS:
             continue
         for pt in (sec.get("points") or [])[:6]:

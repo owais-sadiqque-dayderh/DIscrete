@@ -322,10 +322,15 @@ def _since(text: str) -> float:
 def _event_line(e) -> str:
     created = json.loads(e["created"])
     changes = json.loads(e["changes"])
-    touched = ", ".join(
-        [f"+#{c}" for c in created]
-        + [f"#{c['id']} {c['before'].get('status', '')}→{c['after'].get('status', '')}".rstrip("→")
-           if c.get("before") else f"#{c['id']} +{len(c.get('evidence_added', []))} evidence" for c in changes])
+    def _one(c: dict) -> str:
+        if c.get("before") and "status" in c["before"]:
+            return f"#{c['id']} {c['before']['status']}→{c['after'].get('status', '')}"
+        added = len(c.get("evidence_added_rows") or c.get("evidence_added") or [])
+        removed = len(c.get("evidence_removed_rows") or [])
+        return f"#{c['id']} " + " ".join(p for p in (f"+{added} evidence" if added else "",
+                                                      f"-{removed} evidence" if removed else "") if p) or f"#{c['id']}"
+
+    touched = ", ".join([f"+#{c}" for c in created] + [_one(c) for c in changes])
     undone = f"  (reverted by #{e['undone_by']})" if e["undone_by"] else ""
     when = time.strftime("%b %d %H:%M", time.localtime(e["at"]))
     return f"#{e['id']:<5} {when}  {e['actor']:<11} {e['op']:<10} {touched}  — {e['reason']}{undone}"

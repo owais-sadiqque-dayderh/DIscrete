@@ -32,7 +32,7 @@ import logging
 
 from .. import textkit as tk
 from ..config import T, insight_endpoint, verifier_endpoint
-from ..llm import EXPECTED_ERRORS, complete_json
+from ..llm import EXPECTED_ERRORS, NotConfigured, complete_obj
 from ..perf import PERF
 from ..store import Store
 from ..timeutil import now, to_local
@@ -152,8 +152,8 @@ def check_link(link: dict, by_id: dict, claim, terms: list[str]) -> dict | None:
         return None
     if not any(tk.norm_key(quote) in tk.norm_key(f) for f in _fields(r)):
         return None
-    if terms and not _mentions(quote, terms):
-        return None  # the quote must name the thing the action is about
+    if not terms or not _mentions(quote, terms):
+        return None  # the quote must name the thing the action is about (no named thing: no link)
     try:
         conf = min(1.0, max(0.0, float(link.get("confidence") or 0)))
     except (TypeError, ValueError):
@@ -164,14 +164,16 @@ def check_link(link: dict, by_id: dict, claim, terms: list[str]) -> dict | None:
 
 async def _verify(claim, links: list[dict]) -> list[dict]:
     ep = verifier_endpoint()
-    if not links or not ep.configured:
-        return []  # fails closed: an unverified "why" is worse than none
+    if not links:
+        return []
+    if not ep.configured:
+        raise NotConfigured("trails need VERIFY_LM to check links")  # retried; unverified is worse than none
     payload = {"action": {"text": claim["text"], "at": f"{to_local(claim['occurred_from']):%H:%M:%S}"},
                "links": [{"index": i, "role": lk["relation"], "at": f"{to_local(lk['at']):%H:%M:%S}",
                           "quote": lk["quote"], "explanation": lk["explanation"]} for i, lk in enumerate(links)]}
-    data = await complete_json(ep, [{"role": "user", "content": VERIFY_TRAIL_PROMPT.format(
+    data = await complete_obj(ep, [{"role": "user", "content": VERIFY_TRAIL_PROMPT.format(
         payload=json.dumps(payload, ensure_ascii=False))}], max_tokens=60 + 30 * len(links))
-    ok = {d.get("index") for d in (data or {}).get("decisions") or []
+    ok = {d.get("index") for d in data.get("decisions") or []
           if isinstance(d, dict) and d.get("supported") is True}
     return [lk for i, lk in enumerate(links) if i in ok]
 
@@ -184,9 +186,9 @@ async def trail_for(store: Store, claim) -> list[dict]:
         return []
     prompt = TRAIL_PROMPT.format(when=f"{to_local(claim['occurred_from']):%a %b %d %H:%M:%S}", action=claim["text"],
                                  minutes=int(T.TRAIL_WINDOW_MIN), moments="\n\n".join(_moment(r, terms) for r in rows))
-    data = await complete_json(insight_endpoint(), [{"role": "user", "content": prompt}], max_tokens=900)
+    data = await complete_obj(insight_endpoint(), [{"role": "user", "content": prompt}], max_tokens=900)
     by_id = {r["id"]: r for r in rows}
-    proposed = [x for x in (data or {}).get("links") or [] if isinstance(x, dict)]
+    proposed = [x for x in data.get("links") or [] if isinstance(x, dict)]
     checked = [lk for lk in (check_link(x, by_id, claim, terms) for x in proposed) if lk]
     triggers = sorted([lk for lk in checked if lk["relation"] == "led_to"], key=lambda x: -x["confidence"])[:2]
     steps = sorted([lk for lk in checked if lk["relation"] == "step"], key=lambda x: x["at"])[:4]
@@ -211,7 +213,13 @@ async def build_trails(store: Store, *, limit: int = 20) -> int:
                 links = await trail_for(store, claim)
                 t.n = len(links)
             made += len(links)
-        except EXPECTED_ERRORS as exc:
-            log.warning("trail for claim %s failed: %s", claim["id"], exc)
-            await store.record_trail(claim["id"], [], reason=f"failed: {exc}"[:200])
+        except Exception as exc:  # noqa: BLE001 - one action must not stop the others
+            if not isinstance(exc, EXPECTED_ERRORS):
+                log.exception("trail for claim %s crashed", claim["id"])
+            key = f"trail_attempts:{claim['id']}"
+            attempts = int(await store.get_meta(key, "0") or 0) + 1
+            await store.set_meta(key, str(attempts))
+            log.warning("trail for claim %s failed (attempt %d): %s", claim["id"], attempts, exc)
+            if attempts >= T.TRAIL_MAX_ATTEMPTS:  # give up for good, visibly
+                await store.record_trail(claim["id"], [], reason=f"failed {attempts} times: {exc}"[:200])
     return made

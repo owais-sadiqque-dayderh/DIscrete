@@ -133,8 +133,9 @@ class ClaimsMixin(HistoryMixin):
 
     def _reinforce_claim(self, conn, claim_id: int, draft: ClaimDraft) -> dict:
         """REINFORCE: add verified evidence, extend occurred_to; text untouched (planS2 §6.2).
-        Returns the change for the event log: the observations newly linked."""
-        had = {r[0] for r in conn.execute("SELECT observation_id FROM evidence WHERE claim_id=?", (claim_id,))}
+        Returns the change for the event log: evidence added and evicted by the cap, in full."""
+        before = self._evidence_rows(conn, claim_id)
+        old_to = conn.execute("SELECT occurred_to FROM claims WHERE id=?", (claim_id,)).fetchone()[0]
         for ev in draft.evidence:
             self._link(conn, claim_id, int(ev["observation_id"]), "supports", str(ev.get("quote") or ""),
                        str(ev.get("field") or ""))
@@ -142,8 +143,9 @@ class ClaimsMixin(HistoryMixin):
                      (draft.occurred_to, now(), claim_id))
         self._cap_evidence(conn, claim_id)
         self._recompute_confidence(conn, claim_id)
-        now_has = {r[0] for r in conn.execute("SELECT observation_id FROM evidence WHERE claim_id=?", (claim_id,))}
-        return {"id": claim_id, "evidence_added": sorted(now_has - had)}
+        new_to = conn.execute("SELECT occurred_to FROM claims WHERE id=?", (claim_id,)).fetchone()[0]
+        return self._evidence_change(conn, claim_id, before, fields_before={"occurred_to": old_to},
+                                     fields_after={"occurred_to": new_to})
 
     def _recompute_after_revert(self, conn, claim_id: int) -> None:
         self._recompute_confidence(conn, claim_id)

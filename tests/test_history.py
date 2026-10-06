@@ -115,9 +115,58 @@ async def test_draft_decisions_are_logged_and_reinforcement_is_undoable(store):
                                      writes=[ClaimWrite(draft, operation="reinforced", target_id=cid)],
                                      candidates=[], rejected={})
     [reinforce] = await store.recent_events(op="reinforce")
-    assert json.loads(reinforce["changes"]) == [{"id": cid, "evidence_added": [oid]}]
+    [change] = json.loads(reinforce["changes"])
+    assert [r["observation_id"] for r in change["evidence_added_rows"]] == [oid]
     assert (await store.get_claim(cid))["confidence"] > before
 
     await store.revert_event(reinforce["id"])
     assert oid not in {r["observation_id"] for r in await store.evidence_for_claim(cid)}
     assert (await store.get_claim(cid))["confidence"] == pytest.approx(before)
+
+
+async def test_reverting_a_reinforce_restores_evidence_the_cap_evicted(store, monkeypatch):
+    """Review #3: the cap's evicted rows were lost for good on revert."""
+    from discrete.config import T
+
+    monkeypatch.setattr(T, "EVIDENCE_MAX_SUPPORTS", 1)
+    cid = await _claim(store, "The user prefers dark mode", n=1)
+    old = [r["observation_id"] for r in await store.evidence_for_claim(cid)]
+    new = await _obs(store, "dark mode again", n=9)
+    draft = ClaimDraft(kind="preference", text="The user prefers dark mode", modality="engaged",
+                       evidence=[{"observation_id": new, "quote": "dark mode again"}])
+
+    def _go():
+        with store._tx() as conn:
+            change = store._reinforce_claim(conn, cid, draft)
+            return store._log_event(conn, "reinforce", "draft", claim_id=cid, changes=[change])
+
+    eid = await store._call(_go)
+    assert [r["observation_id"] for r in await store.evidence_for_claim(cid)] == [new]  # old one evicted
+    await store.revert_event(eid)
+    assert [r["observation_id"] for r in await store.evidence_for_claim(cid)] == old
+
+
+async def test_an_old_profile_cannot_overwrite_a_newer_one(store):
+    """Review #6."""
+    a = await store.save_profile({"written_at": 1.0, "sections": []}, run_id="r1")
+    await store.save_profile({"written_at": 2.0, "sections": []}, run_id="r2")
+    with pytest.raises(RevertConflict):
+        await store.revert_event(a)
+    assert (await store.get_profile())["written_at"] == 2.0
+
+
+async def test_redo_of_a_forget_restores_its_suppression_and_the_forget_can_be_reverted_again(store):
+    """Review #7."""
+    cid = await _claim(store, "The user prefers aisle seats")
+    forget = await store.forget_claim(cid)
+    undo = await store.revert_event(forget)
+    redo = await store.revert_event(undo)
+    assert (await store.get_event(redo))["op"] == "redo"
+    assert (await store.get_claim(cid))["status"] == "forgotten"
+    assert await store.suppressed("preference", "The user prefers aisle seats")
+    assert (await store.get_event(forget))["undone_by"] is None
+    with pytest.raises(RevertConflict):
+        await store.revert_event(redo)  # revert the original instead
+    await store.revert_event(forget)
+    assert (await store.get_claim(cid))["status"] == "live"
+    assert not await store.suppressed("preference", "The user prefers aisle seats")

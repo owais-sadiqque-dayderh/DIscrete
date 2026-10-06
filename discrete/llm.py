@@ -334,6 +334,16 @@ async def complete_json(ep: Endpoint, messages: list[dict], *, temperature: floa
     return parsed
 
 
+async def complete_obj(ep: Endpoint, messages: list[dict], *, temperature: float | None = 0.0,
+                       max_tokens: int | None = None) -> dict:
+    """A JSON *object* reply, or LLMError: a model that answers with a list or a bare
+    value is a failed call, never an AttributeError deep in the caller."""
+    data = await complete_json(ep, messages, temperature=temperature, max_tokens=max_tokens)
+    if not isinstance(data, dict):
+        raise LLMError(f"{ep.name}: expected a JSON object, got {type(data).__name__}")
+    return data
+
+
 async def stream(ep: Endpoint, messages: list[dict], *, temperature: float | None = 0.2,
                  max_tokens: int | None = None):
     """Yield text deltas. Backends without streaming yield one whole reply.

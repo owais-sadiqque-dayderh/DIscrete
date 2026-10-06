@@ -106,7 +106,9 @@ class BeliefsMixin(LinksMixin):
                 mods = {r["modality"] for r in rows}
                 draft = ClaimDraft(
                     kind="pattern", text=text, context=category, reasoning=f"dreamed from {len(rows)} memories",
-                    modality="stated" if "stated" in mods else ("engaged" if "engaged" in mods else "passive"),
+                    # A pattern is an induction, never testimony: "stated" would exempt it from
+                    # staleness and make it win every conflict.
+                    modality="engaged" if mods & {"engaged", "stated"} else "passive",
                     occurred_from=min(r["occurred_from"] for r in rows),
                     occurred_to=max(r["occurred_to"] for r in rows),
                     evidence=[{"observation_id": r[0], "quote": r[1]} for r in ev])
@@ -131,8 +133,8 @@ class BeliefsMixin(LinksMixin):
                 new = sorted(set(support) - old)
                 if not new:
                     return False
-                had = {r[0] for r in conn.execute("SELECT observation_id FROM evidence WHERE claim_id=?",
-                                                  (pattern_id,))}
+                had = self._evidence_rows(conn, pattern_id)
+                fields_before = {"derived_from": p["derived_from"], "occurred_to": p["occurred_to"], "flag": p["flag"]}
                 for oid, quote in conn.execute(
                         f"SELECT observation_id, quote FROM evidence WHERE relation='supports' "
                         f"AND claim_id IN ({_ph(new)})", new).fetchall():
@@ -142,11 +144,12 @@ class BeliefsMixin(LinksMixin):
                              "WHERE id=?", (json.dumps(sorted(old | set(new))), last or 0, now(), pattern_id))
                 self._cap_evidence(conn, pattern_id)
                 self._recompute_confidence(conn, pattern_id)
-                has = {r[0] for r in conn.execute("SELECT observation_id FROM evidence WHERE claim_id=?",
-                                                  (pattern_id,))}
-                change = {"id": pattern_id, "evidence_added": sorted(has - had)}
                 if p["flag"] == "stale":
                     conn.execute("UPDATE claims SET flag='' WHERE id=?", (pattern_id,))
+                now_row = conn.execute("SELECT derived_from, occurred_to, flag FROM claims WHERE id=?",
+                                       (pattern_id,)).fetchone()
+                change = self._evidence_change(conn, pattern_id, had, fields_before=fields_before,
+                                               fields_after=dict(now_row))
                 self._log_event(conn, "dream_confirm", "dream", claim_id=pattern_id, changes=[change],
                                 reason=reason, run_id=run_id, data={"support_added": new})
                 return True
@@ -157,12 +160,13 @@ class BeliefsMixin(LinksMixin):
                            by_id: int | None = None) -> bool:
         def _run() -> bool:
             with self._tx() as conn:
+                if by_id is not None and conn.execute("SELECT status FROM claims WHERE id=?",
+                                                      (by_id,)).fetchone()[0] != "live":
+                    return False  # the winner was itself retired earlier in this run
                 fields = {"status": "retired" if by_id is None else "invalidated", "valid_to": now()}
                 change = self._set_state(conn, claim_id, only_if_live=True, **fields)
                 if change is None:
                     return False
-                if by_id is not None:
-                    conn.execute("UPDATE claims SET invalidates_id=? WHERE id=?", (claim_id, by_id))
                 self._log_event(conn, op, actor, claim_id=claim_id, changes=[change], reason=reason, run_id=run_id,
                                 data={"by": by_id} if by_id else None)
                 return True
