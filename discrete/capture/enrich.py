@@ -26,8 +26,8 @@ from ..models import ObservationDraft
 from ..perf import PERF, since_ms
 from ..store import Store
 from .frames import downscale
-from .redact import redact
 from .prompts import CAPTURE_PROMPT
+from .redact import redact
 
 log = logging.getLogger("discrete.capture.enrich")
 
