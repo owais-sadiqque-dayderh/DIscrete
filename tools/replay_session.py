@@ -33,27 +33,37 @@ async def replay(args):
     tracker = EpisodeTracker(store)
     pipe = ProcessPipeline(store)
     try:
-        group = None
+        # 1. Store every capture in order, as live capture would (origin, dedup).
         lines = await asyncio.to_thread(Path(args.manifest).read_text)
+        stored: list[tuple[int, dict, ObservationDraft]] = []
         for line in lines.splitlines():
             item = json.loads(line)
-            if group is not None and group != item["group"]:
-                await tracker.close_current()
-            group = item["group"]
             draft = ObservationDraft(**item["draft"])
             if draft.origin == "user":
                 # Live capture classifies origin before storing; a replay must too.
                 draft.origin = classify_origin(draft.app, draft.window_title, draft.screen_text)
             oid, new = await store.add_observation(draft)
-            if not new or oid is None:
-                continue
-            if item.get("image"):
-                with Image.open(item["image"]) as im:
-                    job = EnrichJob([im.convert("RGB")], draft.app, draft.window_title, draft.url, draft.screen_text,
-                                   {k: getattr(draft, k) for k in ("keys", "clicks", "scrolls", "clipboard")})
-                task = enricher.submit(oid, job)
-                if task is not None:
-                    await task
+            if new and oid is not None:
+                stored.append((oid, item, draft))
+
+        # 2. Captions, DISCRETE_ENRICH_CONCURRENCY at a time (live capture also captions
+        # asynchronously; each caption only reads captures before it).
+        async def caption(oid: int, item: dict, draft: ObservationDraft) -> None:
+            if not item.get("image"):
+                return
+            with Image.open(item["image"]) as im:
+                job = EnrichJob([im.convert("RGB")], draft.app, draft.window_title, draft.url, draft.screen_text,
+                                {k: getattr(draft, k) for k in ("keys", "clicks", "scrolls", "clipboard")})
+            await enricher._run(oid, job)
+
+        await asyncio.gather(*(caption(*x) for x in stored))
+
+        # 3. Segment in capture order, keeping the manifest's episode boundaries.
+        group = None
+        for oid, item, _ in stored:
+            if group is not None and group != item["group"]:
+                await tracker.close_current()
+            group = item["group"]
             row = await store.get_observation(oid)
             if row is None:
                 print(json.dumps({"label": item["label"], "discarded": True}), flush=True)
