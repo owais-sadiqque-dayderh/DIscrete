@@ -311,6 +311,54 @@ This audit shows where each proposed feature starts from. Code paths are relativ
   - #9 (sightings, active dwell, pages; migration 8);
   - then rebuild both sessions and score: baseline vs branch vs branch with the Gemini verifier.
 
+## Phase 6 — Independent review and its fixes; capture text round 2 (2026-10-07, ~02:00–03:30 IST)
+
+- **Code review of the whole branch** (delegated, Claude Opus, report-only; 19 findings, 9 reproduced with
+  scripts). All fixed except #18, with regression tests (222 pass). Commits `cfcc7ee`, `99abe03`:
+  - **#1/#2 containment.** A list/bare JSON reply crashed trails with an AttributeError, re-sent the same paid
+    prompt every minute, and starved all later maintenance; a crashing dream step left the dream "due" forever.
+    Fixes:
+    - `llm.complete_obj` turns a non-object reply into an ordinary failed call;
+    - each maintenance and dream step is isolated;
+    - `last_dream` is set in `finally`;
+    - trails retry up to `TRAIL_MAX_ATTEMPTS`, then give up visibly.
+  - **#3/#6/#7 lossless undo.**
+    - Changes record evidence added and evicted by the cap in full, plus untracked columns (`occurred_to`,
+      `derived_from`, `flag`).
+    - Reverting a revert is a `redo` that restores suppressions, links and the profile, and re-activates the
+      original event.
+    - An old profile can't overwrite a newer one without `--force`.
+  - **#4 forget reaches everything.**
+    - Profile points citing a dead memory are hidden at once.
+    - `forget` refreshes the Markdown export.
+    - Git history for the export is now opt-in (`DISCRETE_MEMORY_EXPORT_GIT`): git would keep forgotten memories
+      forever.
+  - **#5:** `correct` targets the lineage's live version, keeps `action`, and carries the trail.
+  - **#9/#10:** the conflict winner must still be live; patterns are never `stated`.
+  - **#11:** patterns need `DREAM_MIN_OCCASIONS` (2) separate sittings (≥60 min apart). 40-capture episodes made one
+    long read look like several sessions.
+  - **#12/#13:** one `redact_capture` policy shared by live capture and replay. The frame is dropped on a confident
+    credential or a catch-all hit in OCR'd text. Replay decodes a frame only when a caption slot is free.
+  - **#14:** attention is aggregated in SQL with `LEAD()` over a capped interval; the time-spent regex was
+    tightened.
+  - **#15/#16/#17/#19:** trail links only in `links_into`; actions sorted before slicing; no distinctive term → no
+    link; `rebuild_edges` computed on the reader.
+  - **Open, low (#18):** a failed later chunk discards earlier chunks' paid calls on retry.
+- **Capture text round 2** (Codex; commit `98ab3b9`):
+  - the node walk drops container labels repeated by their children and skips tiny description-only icons;
+  - a Chromium text-marker fast path (visible text in one call). The Mac locked mid-measurement, so it is
+    **off** (`DISCRETE_AX_TEXT_MARKERS=false`) until verified on real pages.
+  - Arc's arc tree: per-run AXStaticText under AXGroup/AXLink/AXHeading; no AXInlineTextBox.
+- **First look at `g46/branch.db`** (rebuilt at `45fe056`):
+  - **Actions:** 9 action claims (downloaded ChatGPT.dmg, chose Engineering in onboarding, created docs/PDF, sent
+    PMO.pdf / the UCL PDF).
+  - **Trails:** 8 links, all sensible steps; e.g. the typed `amo run … send PMO.pdf to Yacine` command → the send.
+  - **Issues to fix next:**
+    1. **Actor:** sends executed by the user's AMO agent are written "the user sent" (the closed log saw the same
+       wording question).
+    2. **Duplicate action events:** #33/#37 and #38/#48 say the same thing. Events skip the merge, so actions
+       need a dedup (same action + object within an episode window).
+
 ---
 
 ## ▶ HANDOFF — read this first if you are picking up (written 2026-10-07 ~00:30 IST)
