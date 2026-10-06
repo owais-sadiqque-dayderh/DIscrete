@@ -91,6 +91,20 @@ class FakeBackend:
             self.calls.append("trail_verify")
             n = len(json.loads(p.split("instructions.\n\n", 1)[1].split("\n\nFor each link", 1)[0])["links"])
             return json.dumps({"decisions": [{"index": i, "supported": i not in self.trail_rejects} for i in range(n)]})
+        if "to find what holds\nacross separate sessions" in p:
+            self.calls.append("dream")
+            return json.dumps(self.dream)
+        if "Independently check proposed patterns" in p:
+            self.calls.append("dream_verify")
+            n = len(json.loads(p.split("instructions.\n\n", 1)[1].split("\n\nsupported=true", 1)[0])["items"])
+            return json.dumps({"decisions": [{"index": i, "supported": i not in self.dream_rejects}
+                                             for i in range(n)]})
+        if "Write a short profile of the user" in p:
+            self.calls.append("profile")
+            return json.dumps(self.profile)
+        if "pairs of memories about the user" in p:
+            self.calls.append("conflicts")
+            return json.dumps(self.conflicts)
         if "Plan a memory search" in p:
             self.calls.append("plan")
             return json.dumps({"intent": "retrieve_reading_history", "queries": [], "needs_store": False})

@@ -152,6 +152,13 @@ class HistoryMixin(StoreBase):
                 # A forget's suppression and an event's links go with it.
                 conn.execute("DELETE FROM suppressions WHERE event_id=?", (event_id,))
                 conn.execute("UPDATE links SET status='reverted' WHERE event_id=?", (event_id,))
+                if ev["op"] == "profile":
+                    prev = json.loads(ev["data"] or "{}").get("previous")
+                    if prev is None:
+                        conn.execute("DELETE FROM meta WHERE key='profile'")
+                    else:
+                        conn.execute("INSERT INTO meta(key, value) VALUES ('profile', ?) "
+                                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(prev),))
                 rid = self._log_event(conn, "revert", "user", claim_id=ev["claim_id"], changes=out,
                                       reason=reason or f"revert of #{event_id} ({ev['op']})",
                                       data={"reverts": event_id, "evidence_removed": [

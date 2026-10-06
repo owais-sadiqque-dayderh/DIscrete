@@ -394,6 +394,31 @@ async def cmd_correct(args) -> int:
     return 0
 
 
+async def cmd_dream(args) -> int:
+    from .process.dream import due, run_dream
+
+    async with _session() as store:
+        if not args.force and not await due(store):
+            _print("not due (DISCRETE_DREAM_INTERVAL_MIN / DREAM_MIN_NEW_EPISODES); use --force")
+            return 0
+        _print(json.dumps(await run_dream(store), indent=2, default=str))
+    return 0
+
+
+async def cmd_profile(args) -> int:
+    from .process.profile import render_profile, write_profile
+
+    async with _session() as store:
+        if args.rewrite:
+            _print(json.dumps(await write_profile(store), default=str))
+        profile = await store.get_profile()
+        if args.json:
+            _print(json.dumps(profile, indent=1, ensure_ascii=False))
+        else:
+            _print(render_profile(profile, with_ids=args.ids) or "(no profile yet: discrete dream --force)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="discrete")
     p.add_argument("--db", help="store path (default: $DISCRETE_DATA_DIR/discrete.db)")
@@ -490,6 +515,16 @@ def build_parser() -> argparse.ArgumentParser:
     pco.add_argument("text")
     pco.add_argument("--reason", default="")
     pco.set_defaults(func=cmd_correct)
+
+    pdr = sub.add_parser("dream", help="find patterns across episodes, resolve conflicts, refresh the profile")
+    pdr.add_argument("--force", action="store_true", help="run now even if not due")
+    pdr.set_defaults(func=cmd_dream)
+
+    ppr = sub.add_parser("profile", help="what DIscrete has learned about you, with sources")
+    ppr.add_argument("--ids", action="store_true", help="show the memories behind each point")
+    ppr.add_argument("--json", action="store_true")
+    ppr.add_argument("--rewrite", action="store_true", help="rewrite it now from current memories")
+    ppr.set_defaults(func=cmd_profile)
     return p
 
 

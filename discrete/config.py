@@ -196,6 +196,12 @@ def verifier_endpoint() -> Endpoint:
     return _ep("verifier", "VERIFY_LM", "INSIGHT_LM")
 
 
+def dream_endpoint() -> Endpoint:
+    """Dreaming (process/dream.py): patterns across episodes, conflicts, the profile.
+    Runs rarely and reads a lot: a stronger model pays off here."""
+    return _ep("dream", "DREAM_LM", "CONSOLIDATE_LM", "INSIGHT_LM")
+
+
 def utility_endpoint() -> Endpoint:
     """Query planning, listwise rerank fallback (planS3)."""
     return _ep("utility", "UTILITY_LM")
@@ -227,6 +233,7 @@ def all_endpoints() -> list[Endpoint]:
         insight_endpoint(),
         verifier_endpoint(),
         consolidate_endpoint(),
+        dream_endpoint(),
         utility_endpoint(),
         embedding_endpoint(),
         rerank_endpoint(),
@@ -340,6 +347,30 @@ class T:
         if CONSOLIDATION_INTERVAL_MIN > 0
         else _typed("CONSOLIDATION_INTERVAL_S", 3600.0)
     )
+    # Dreaming (process/dream.py). Runs when BOTH this many minutes have passed since
+    # the last dream AND at least DREAM_MIN_NEW_EPISODES episodes closed since; 0 = never
+    # (run it by hand: discrete dream). Default: once a day.
+    DREAM_INTERVAL_MIN = _typed("DREAM_INTERVAL_MIN", 1440.0)
+    DREAM_MIN_NEW_EPISODES = _typed("DREAM_MIN_NEW_EPISODES", 5)
+    DREAM_WINDOW_DAYS = _typed("DREAM_WINDOW_DAYS", 30.0)
+    DREAM_MAX_MEMORIES = _typed("DREAM_MAX_MEMORIES", 400)
+    # A pattern rests on memories from at least this many episodes; habits and
+    # preferences also need this many days; "usually"/"daily" wording needs more.
+    DREAM_MIN_EPISODES = _typed("DREAM_MIN_EPISODES", 3)
+    DREAM_MIN_DAYS = _typed("DREAM_MIN_DAYS", 2)
+    DREAM_FREQUENCY_DAYS = _typed("DREAM_FREQUENCY_DAYS", 5)
+    DREAM_DUPLICATE_SIM = _typed("DREAM_DUPLICATE_SIM", 0.85)
+    # Contradiction sweep: pairs this similar (but below CONSOLIDATE_SIM) are checked.
+    CONFLICT_SIM = _typed("CONFLICT_SIM", 0.55)
+    CONFLICT_MIN_GAP_S = _typed("CONFLICT_MIN_GAP_S", 3600.0)
+    DREAM_MAX_PAIRS = _typed("DREAM_MAX_PAIRS", 25)
+    # Facts, preferences and patterns not seen again for STALE_DAYS are flagged stale;
+    # a pattern unseen for PATTERN_RETIRE_DAYS is retired. Events never go stale.
+    STALE_DAYS = _typed("STALE_DAYS", 45.0)
+    PATTERN_RETIRE_DAYS = _typed("PATTERN_RETIRE_DAYS", 120.0)
+    # Belief strength shown to Bubble: "established" once seen on this many days and episodes.
+    ESTABLISHED_DAYS = _typed("ESTABLISHED_DAYS", 3)
+    ESTABLISHED_EPISODES = _typed("ESTABLISHED_EPISODES", 3)
     # Causal trails (process/trails.py): what led to each completed action.
     TRAILS = _typed("TRAILS", True)
     TRAIL_WINDOW_MIN = _typed("TRAIL_WINDOW_MIN", 30.0)

@@ -35,6 +35,12 @@ _ENUM = re.compile(r"\ball (?:the|of the)\b|\bevery\b|\blist\b|\bshow (?:me |all
 # "Why did I …", "what made me …": answered by following causal trails (trails.py).
 _WHY = re.compile(r"^\s*why\b|\bwhy (?:did|do|was|were|have|had) i\b|\bwhat (?:made|led|prompted|caused|got) me\b"
                   r"|\bhow did i (?:end up|come to|get to|find|hear about|discover)\b|\breason (?:i|for my|why i)\b", re.I)
+# Questions about the user as a whole, answered best with the profile (process/profile.py).
+_ABOUT_USER = re.compile(
+    r"\babout me\b|\bmy (?:interests|hobbies|habits|routines?|projects|preferences|work|tools)\b"
+    r"|\b(?:what|which) (?:kinds?|sorts?|types?) of\b.*\b(?:i|me)\b"
+    r"|\b(?:am i|do i|i'm)\b.*\b(?:interested|into|building|working on|usually|tend to|often|prefer|rely on)\b"
+    r"|\bwho am i\b|\bdescribe me\b", re.I)
 _EDIT_VERBS = ("fix", "rewrite", "complete", "summarize", "translate", "format", "rephrase", "shorten")
 # The request's own scaffolding. Searching for "list" or "opened" matches any row that
 # says so (a todo list), not the pages being asked about (insights.md §7.36).
@@ -142,7 +148,8 @@ def fallback_plan(text: str) -> QueryPlan:
     elif intent == "recall" and interval:
         intent = "temporal"
     return QueryPlan(raw=text, intent=intent, queries=queries, entities=ents + files, terms=terms,
-                     interval=interval, entity_kind_filter=kind, needs_store=intent != "edit")
+                     interval=interval, entity_kind_filter=kind, needs_store=intent != "edit",
+                     about_user=intent not in ("edit", "continuation") and bool(_ABOUT_USER.search(text)))
 
 
 def parse_interval(text: str, ref: float | None = None) -> tuple[float, float] | None:

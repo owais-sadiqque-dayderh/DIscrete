@@ -31,6 +31,8 @@ from .config import T
 from .llm import flush_usage
 from .perf import PERF, since_ms
 from .process.consolidate import run_consolidation
+from .process.dream import due as dream_due
+from .process.dream import run_dream
 from .process.embed_worker import drain_outbox, embed_row, observation_text
 from .process.episodes import EpisodeTracker
 from .process.pipeline import ProcessPipeline
@@ -223,6 +225,8 @@ class Runtime:
                 last = float(await self.store.get_meta("last_consolidation", "0") or 0)
                 if now() - last >= T.CONSOLIDATION_INTERVAL_S:
                     log.info("consolidation: %s", await run_consolidation(self.store))
+                if await dream_due(self.store):
+                    log.info("dream: %s", await run_dream(self.store))
                 if time.time() - last_retention >= 3600:
                     log.info("retention: %s", await run_retention(self.store))
                     last_retention = time.time()

@@ -36,6 +36,7 @@ async def materialize(store: Store, kind: str, ids: list[int]) -> dict[int, Hit]
     rows = await store.live_rows(kind, ids)
     if kind == "claim":
         quotes = await store.first_quotes([r["id"] for r in rows])
+        strengths = await store.strengths([r["id"] for r in rows if r["kind"] != "event"])
         for r in rows:
             q = quotes.get(r["id"])
             body = r["text"] + (f"\n> {q}" if q else "")
@@ -43,6 +44,8 @@ async def materialize(store: Store, kind: str, ids: list[int]) -> dict[int, Hit]
                                confidence=r["confidence"], status=r["status"], occurred_at=r["occurred_from"],
                                occurred_to=r["occurred_to"], claim_kind=r["kind"], untrusted=bool(q),
                                action=r["action"] if "action" in r.keys() else "")
+            if (st := strengths.get(r["id"])) is not None:
+                out[r["id"]].strength = f"{st.tier}: {st.describe()}"
     elif kind == "observation":
         for r in rows:
             name = r["page_title"] or r["window_title"]
@@ -170,7 +173,18 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> R
     if plan.intent == "why":
         with PERF.timer("retrieve.why"):
             await expand_why(store, result)
+    if plan.about_user:
+        await add_profile(store, result)
     return result
+
+
+async def add_profile(store: Store, result: RetrievalResult) -> None:
+    """The profile (process/profile.py) as the first record, for the support check to judge."""
+    from ..process.profile import render_profile
+
+    text = render_profile(await store.get_profile())
+    if text:
+        result.hits.insert(0, Hit("profile", 0, "profile", text, occurred_at=0.0))
 
 
 async def expand_why(store: Store, result: RetrievalResult) -> None:

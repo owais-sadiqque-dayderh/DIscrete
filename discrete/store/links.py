@@ -53,3 +53,14 @@ class LinksMixin(ClaimsMixin):
         return await self.q(
             f"SELECT * FROM links WHERE status='live' AND dst_kind=? AND dst_id IN ({_ph(ids)}) "
             f"ORDER BY relation='led_to' DESC, confidence DESC", (dst_kind, *ids))
+
+    async def checked_pairs(self) -> set[tuple[int, int]]:
+        """Claim pairs the contradiction sweep already judged (asked once)."""
+        rows = await self.q("SELECT src_id, dst_id FROM links WHERE relation='checked' AND src_kind='claim'")
+        return {(min(a, b), max(a, b)) for a, b in rows}
+
+    async def mark_pair_checked(self, a: int, b: int, verdict: str, reason: str) -> None:
+        lo, hi = min(a, b), max(a, b)
+        await self.execute(
+            "INSERT OR IGNORE INTO links(src_kind, src_id, dst_kind, dst_id, relation, reason, status, created_at) "
+            "VALUES ('claim', ?, 'claim', ?, 'checked', ?, 'live', ?)", (lo, hi, f"{verdict}: {reason}", now()))

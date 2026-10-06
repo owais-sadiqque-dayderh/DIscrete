@@ -97,6 +97,8 @@ class QueryPlan:
     interval: tuple[float, float] | None = None
     entity_kind_filter: str = ""
     needs_store: bool = True
+    # A question about the user as a whole ("what am I into"): the profile joins the records.
+    about_user: bool = False
 
 
 @dataclass
@@ -125,6 +127,8 @@ class Hit:
     # <why>" for a causal-trail link, "before claim 12" for the moments preceding it.
     via: str = ""
     action: str = ""
+    # For lasting claims: "established: seen in 4 episodes over 3 days" (store/beliefs.py).
+    strength: str = ""
 
     @property
     def text(self) -> str:

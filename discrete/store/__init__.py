@@ -6,6 +6,7 @@ connections, locks and write helpers in `base.StoreBase`.
 
 from __future__ import annotations
 
+from .beliefs import BeliefsMixin, Strength
 from .corrections import CorrectionsMixin
 from .drafts import DraftConflict, DraftsMixin
 from .entities import EntitiesMixin
@@ -14,14 +15,13 @@ from .gaps import GapsMixin
 from .health import HealthMixin
 from .history import RevertConflict
 from .index import KINDS, IndexMixin
-from .links import LinksMixin
 from .observations import ObservationsMixin
 from .perf import PerfMixin
 
 
-class Store(ObservationsMixin, EpisodesMixin, DraftsMixin, CorrectionsMixin, LinksMixin, EntitiesMixin, IndexMixin,
-            GapsMixin, HealthMixin, PerfMixin):
+class Store(ObservationsMixin, EpisodesMixin, DraftsMixin, CorrectionsMixin, BeliefsMixin, EntitiesMixin,
+            IndexMixin, GapsMixin, HealthMixin, PerfMixin):
     pass
 
 
-__all__ = ["KINDS", "DraftConflict", "RevertConflict", "Store"]
+__all__ = ["KINDS", "DraftConflict", "RevertConflict", "Store", "Strength"]
