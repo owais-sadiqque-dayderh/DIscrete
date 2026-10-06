@@ -337,7 +337,13 @@ class T:
     EPISODE_MAX_OBS = _typed("EPISODE_MAX_OBS", 40)
     EPISODE_IDLE_CLOSE_S = _typed("EPISODE_IDLE_CLOSE_S", 300.0)
     CLAIM_MAX_CHARS = _typed("CLAIM_MAX_CHARS", 240)
-    DRAFT_TEXT_CHARS_PER_OBS = _typed("DRAFT_TEXT_CHARS_PER_OBS", 1200)
+    DRAFT_TEXT_CHARS_PER_OBS = _typed("DRAFT_TEXT_CHARS_PER_OBS", 2000)
+    # Lines recurring in more than CHROME_SHARE of the last CHROME_WINDOW captures of the
+    # same app and site (navigation, toolbars) are left out of what the drafter and the
+    # caption model read, never out of what is stored. 0 = off.
+    CHROME_SHARE = _typed("CHROME_SHARE", 0.3)
+    CHROME_WINDOW = _typed("CHROME_WINDOW", 50)
+    CHROME_MIN_CAPTURES = _typed("CHROME_MIN_CAPTURES", 5)
     DRAFT_MAX_EVENTS = _typed("DRAFT_MAX_EVENTS", 5)
     # Long episodes get room for more events: one more per this many minutes past five,
     # up to DRAFT_MAX_EVENTS_CAP. Completed actions have their own cap.

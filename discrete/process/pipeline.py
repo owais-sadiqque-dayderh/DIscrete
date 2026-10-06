@@ -110,7 +110,8 @@ class ProcessPipeline:
         # Every observation is read: an episode longer than one call (recovered, or from
         # before EPISODE_MAX_OBS) is drafted in consecutive chunks, never truncated.
         chunks = [rows[i:i + T.DRAFT_MAX_OBS] for i in range(0, len(rows), T.DRAFT_MAX_OBS)]
-        parts = [await self._call_draft(chunk) for chunk in chunks]
+        chrome = await self._chrome(rows)
+        parts = [await self._call_draft(chunk, chrome) for chunk in chunks]
         data = parts[0] if len(parts) == 1 else {
             "title": " / ".join(dict.fromkeys(str(p.get("title") or "") for p in parts if p.get("title"))),
             "summary": " ".join(str(p.get("summary") or "") for p in parts),
@@ -187,12 +188,24 @@ class ProcessPipeline:
             setattr(outcome, op, getattr(outcome, op) + 1)
         return outcome
 
-    async def _call_draft(self, rows) -> dict:
+    async def _chrome(self, rows) -> dict[tuple[str, str], set[str]]:
+        """Per (app, site): lines that are navigation/toolbar, not content (textkit.chrome_lines)."""
+        if T.CHROME_SHARE <= 0:
+            return {}
+        out = {}
+        for app, site in {(r["app"], r["site"]) for r in rows}:
+            texts = await self.store.recent_texts(app, site, before=max(r["ended_at"] for r in rows),
+                                                  limit=T.CHROME_WINDOW)
+            out[(app, site)] = tk.chrome_lines(texts, share=T.CHROME_SHARE, min_texts=T.CHROME_MIN_CAPTURES)
+        return out
+
+    async def _call_draft(self, rows, chrome: dict[tuple[str, str], set[str]] | None = None) -> dict:
         seen_lines: set[str] = set()
         blocks = []
         for r in rows:
             kept = []
-            for line in (r["screen_text"] or "").splitlines():
+            text = tk.without_lines(r["screen_text"] or "", (chrome or {}).get((r["app"], r["site"]), set()))
+            for line in text.splitlines():
                 k = tk.norm_key(line)
                 if k and k not in seen_lines:
                     seen_lines.add(k)

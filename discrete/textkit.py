@@ -268,3 +268,24 @@ def site_from_url(url: str) -> str:
     except Exception:
         pass
     return ""
+
+
+def chrome_lines(texts: list[str], *, share: float, min_texts: int) -> set[str]:
+    """Normalized lines recurring in more than `share` of `texts` (captures of one app and
+    site): navigation, toolbars, trending lists. Fewer than `min_texts` captures say
+    nothing reliable, so then nothing is chrome. Recurrence also catches content that
+    stays on screen (a chat transcript); callers drop chrome only where a repeat adds
+    nothing (the drafter and the caption prompt), never from what is stored."""
+    if len(texts) < min_texts:
+        return set()
+    counts: dict[str, int] = {}
+    for text in texts:
+        for key in {norm_key(line) for line in (text or "").splitlines() if line.strip()}:
+            counts[key] = counts.get(key, 0) + 1
+    return {k for k, n in counts.items() if n / len(texts) > share}
+
+
+def without_lines(text: str, drop: set[str]) -> str:
+    if not drop:
+        return text
+    return "\n".join(line for line in (text or "").splitlines() if norm_key(line) not in drop)

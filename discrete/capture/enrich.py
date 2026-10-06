@@ -10,6 +10,7 @@ against an existing row costs no model call at all.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import io
 import logging
 import time
@@ -45,6 +46,9 @@ class EnrichJob:
     screen_text: str
     counts: dict[str, int]
     prior_caption: str = ""  # backfill only: the row's existing caption, as extra context
+    # The screen text minus this app/site's navigation chrome, for the prompt (set by the
+    # Enricher; the stored row keeps the full text).
+    content_text: str | None = None
 
 
 @dataclass
@@ -139,6 +143,7 @@ class Enricher:
             async with self._sem:
                 PERF.sample("enrich.wait", since_ms(t0), ref_id=oid)  # queued behind other vision calls
                 t_call = time.perf_counter()
+                job = await self._declutter(oid, job)
                 data = await self.vlm(job)
                 PERF.sample("enrich.vision", since_ms(t_call), n=len(job.frames), ref_id=oid)
             await self._apply(oid, job, data)
@@ -151,6 +156,18 @@ class Enricher:
             await self.store.enrichment_failed(oid)
         finally:
             PERF.sample("enrich.total", since_ms(t0), ref_id=oid)  # stored → final caption
+
+    async def _declutter(self, oid: int, job: EnrichJob) -> EnrichJob:
+        """Drop this app/site's recurring chrome from what the caption model reads."""
+        if T.CHROME_SHARE <= 0 or not job.screen_text:
+            return job
+        row = await self.store.get_observation(oid)
+        if row is None:
+            return job
+        texts = await self.store.recent_texts(row["app"], row["site"], before=row["started_at"],
+                                              limit=T.CHROME_WINDOW)
+        chrome = tk.chrome_lines(texts, share=T.CHROME_SHARE, min_texts=T.CHROME_MIN_CAPTURES)
+        return dataclasses.replace(job, content_text=tk.without_lines(job.screen_text, chrome)) if chrome else job
 
     async def _apply(self, oid: int, job: EnrichJob, data: dict | None) -> None:
         if data is None:
@@ -202,7 +219,8 @@ def vlm_messages(job: EnrichJob) -> list[dict]:
             for f in job.frames if f is not None]
     prompt = CAPTURE_PROMPT.format(
         app=job.app, window_title=job.window_title, url=job.url,
-        screen_text=tk.truncate(job.screen_text, 4000), **job.counts,
+        screen_text=tk.truncate(job.content_text if job.content_text is not None else job.screen_text, 4000),
+        **job.counts,
     )
     if job.prior_caption:
         prompt += ("\nAn earlier description of this moment (data, may be imprecise):\n<<<DATA>>>\n"

@@ -470,3 +470,13 @@ def test_discretes_own_output_is_not_the_users_activity():
     assert classify_origin("Terminal", "zsh", records) == "agent"
     # The user's own project named Jarvis is ordinary activity.
     assert classify_origin("Arc", "Jarvis roadmap - Google Docs", "Jarvis plan for October") == "user"
+
+
+def test_chrome_is_lines_recurring_across_captures_of_one_site():
+    from discrete import textkit as tk
+
+    pages = [f"Home timeline\nSearch and explore\nDirect messages\nPost number {i} about topic {i}" for i in range(8)]
+    chrome = tk.chrome_lines(pages, share=0.3, min_texts=5)
+    assert chrome == {"home timeline", "search and explore", "direct messages"}
+    assert tk.without_lines(pages[3], chrome) == "Post number 3 about topic 3"
+    assert tk.chrome_lines(pages[:4], share=0.3, min_texts=5) == set()  # too few captures to tell

@@ -163,6 +163,13 @@ class ObservationsMixin(StoreBase):
                 [episode_id, *obs_ids],
             )
 
+    async def recent_texts(self, app: str, site: str, *, before: float, limit: int) -> list[str]:
+        """Screen text of the latest captures of one (app, site): the baseline for chrome."""
+        rows = await self.q("SELECT screen_text FROM observations WHERE origin='user' AND app=? AND site=? "
+                            "AND started_at <= ? AND screen_text != '' ORDER BY started_at DESC LIMIT ?",
+                            (app, site, before, limit))
+        return [r[0] for r in rows]
+
     async def observation_count(self) -> int:
         return await self.scalar("SELECT COUNT(*) FROM observations WHERE origin='user'")
 
