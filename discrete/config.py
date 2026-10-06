@@ -261,6 +261,15 @@ def frames_dir() -> Path:
     return p
 
 
+def memory_export_dir() -> Path | None:
+    """Where the Markdown mirror of memory goes (export.py): DISCRETE_MEMORY_EXPORT_DIR,
+    default <data dir>/memory; "off" turns the automatic export after each dream off."""
+    raw = env("DISCRETE_MEMORY_EXPORT_DIR")
+    if raw and raw.lower() in ("off", "none", "false", "0"):
+        return None
+    return Path(os.path.expanduser(raw)) if raw else data_dir() / "memory"
+
+
 def golden_dir() -> Path:
     """Reviewed evaluation cases (read-only at runtime)."""
     return ROOT / "golden"

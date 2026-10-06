@@ -39,7 +39,7 @@ from uuid import uuid4
 import numpy as np
 
 from .. import textkit as tk
-from ..config import T, dream_endpoint, verifier_endpoint
+from ..config import T, dream_endpoint, memory_export_dir, verifier_endpoint
 from ..llm import EXPECTED_ERRORS, complete_json, try_embed
 from ..perf import PERF
 from ..store import Store
@@ -139,6 +139,14 @@ async def run_dream(store: Store) -> dict:
                 log.warning("dream step %s failed: %s", name, exc)
                 report[name] = {"error": str(exc)[:200]}
     await store.set_meta("last_dream", str(now()))
+    if (out := memory_export_dir()) is not None:
+        # The Markdown mirror follows each dream, so its git log is the history of beliefs.
+        from ..export import export_markdown
+
+        try:
+            report["export"] = await export_markdown(store, out)
+        except OSError as exc:
+            log.warning("memory export failed: %s", exc)
     return report
 
 

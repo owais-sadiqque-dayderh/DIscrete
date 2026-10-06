@@ -18,7 +18,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from . import textkit as tk
-from .config import ConfigError, T, all_endpoints, db_path
+from .config import ConfigError, T, all_endpoints, data_dir, db_path
 from .evaluation import bench
 from .evaluation.harness import compare, default_cases, run_suite, save_baseline
 from .llm import flush_usage
@@ -440,6 +440,23 @@ async def cmd_graph(args) -> int:
     return 0
 
 
+def _export_dir(arg: str) -> Path:
+    from .config import memory_export_dir
+
+    return Path(arg).expanduser() if arg else (memory_export_dir() or data_dir() / "memory")
+
+
+async def cmd_export(args) -> int:
+    from .export import export_markdown
+
+    out = _export_dir(args.dir)
+    async with _session() as store:
+        report = await export_markdown(store, out, git=not args.no_git)
+    _print(json.dumps(report, indent=2, default=str))
+    _print(f"open {out}/MEMORY.md (or the folder as an Obsidian vault)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="discrete")
     p.add_argument("--db", help="store path (default: $DISCRETE_DATA_DIR/discrete.db)")
@@ -551,6 +568,11 @@ def build_parser() -> argparse.ArgumentParser:
     pg.add_argument("name", nargs="?", default="")
     pg.add_argument("-n", type=int, default=25)
     pg.set_defaults(func=cmd_graph)
+
+    px = sub.add_parser("export", help="write memory as Markdown (git history, opens as an Obsidian vault)")
+    px.add_argument("--dir", default="", help="default: DISCRETE_MEMORY_EXPORT_DIR or <data dir>/memory")
+    px.add_argument("--no-git", action="store_true")
+    px.set_defaults(func=cmd_export)
     return p
 
 
