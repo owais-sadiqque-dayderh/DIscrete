@@ -282,8 +282,19 @@ This audit shows where each proposed feature starts from. Code paths are relativ
     `g46/branch-geminiverify.db` (`VERIFY_LM_MODEL_NAME=google/gemini-3.8-flash`), `live1006/branch.db`. Use
     `DISCRETE_ENRICH_CONCURRENCY=6 .venv/bin/python tools/replay_session.py --manifest … --db …`, then
     `discrete --db … process --recover --consolidate`, then the HANDOFF eval protocol.
-- **Delegated, still running:** capture text (audit #4/#7) and action detectors (audit #10); both Codex,
-  uncommitted until reviewed.
+- **Action and choice detectors** (audit #10, Codex; commit `45fe056`): quote-backed rules. On the live rows:
+  5/5 correct and none wrong (Helium download, `.dmg`, install, DuckDuckGo chosen, Helium as default), 0.14 ms per
+  row. Their hints follow the drafter's observations as leads it must still quote. New action verb `chose`.
+- **Final rebuilds launched at `45fe056`** (`DISCRETE_ENRICH_CONCURRENCY=4`): `g46/branch.db`,
+  `g46/branch-geminiverify.db`, `live1006/branch.db`, plus `live1006/base.db` (main). A background watcher
+  reports when every log ends in `DONE`.
+- **Then run `bench/run_matrix.sh`.** It dreams on copies, then scores g46-base / g46-branch /
+  g46-branch-geminiverify / g46-base+branchretrieval (drafting held fixed) / live-base / live-branch, and prints both
+  comparisons.
+- **Delegated, running:**
+  - capture text (audit #4/#7, Codex);
+  - an independent code review of the whole branch (Claude Opus, report-only).
+    taskId `node:delegated-task:command%3Amcp%3A0d191c62-be5f-41f9-bdd3-072cde8bb4de%3Adelegate-task%3Aexp-discrete-branch-review-r1`.
 - **Next (me):**
   - audit #6 (filter chrome before the drafter and the caption);
   - #11 (caption prompt: separate the page from embedded media, name brands in media);
