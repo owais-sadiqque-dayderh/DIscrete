@@ -291,8 +291,17 @@ This audit shows where each proposed feature starts from. Code paths are relativ
 - **Then run `bench/run_matrix.sh`.** It dreams on copies, then scores g46-base / g46-branch /
   g46-branch-geminiverify / g46-base+branchretrieval (drafting held fixed) / live-base / live-branch, and prints both
   comparisons.
+- **Capture text, round 1** (audit #4/#7, Codex; commit `f2fdff5`):
+  - adjacent runs merged; descriptions only without text children;
+  - text views read through `AXVisibleCharacterRange` (Terminal 16,000 → 1,199 chars);
+  - nav landmarks skipped, offscreen text culled;
+  - OCR on native pixels (+56 ms median).
+  - My review added: the native copy is capped at 2× the storage width and kept only on the newest cached frame
+    (memory).
+  - **Arc unchanged** (38.6% single-word lines). Round 2 delegated (Codex): Chromium text markers / line grouping.
+    Capture changes affect live capture only; replays reuse stored text.
 - **Delegated, running:**
-  - capture text (audit #4/#7, Codex);
+  - capture text round 2, Chromium/Arc (Codex);
   - an independent code review of the whole branch (Claude Opus, report-only).
     taskId `node:delegated-task:command%3Amcp%3A0d191c62-be5f-41f9-bdd3-072cde8bb4de%3Adelegate-task%3Aexp-discrete-branch-review-r1`.
 - **Next (me):**
