@@ -60,6 +60,39 @@ set per component in `.env`, with request settings (`_EXTRA_TOKENS`,
 OpenAI-compatible model, reasoning models included, needs no code change. Check a
 new model with `discrete doctor --models`.
 
+## Memory that learns, explains and can be undone
+
+- **Why did I…?** Completed actions (downloads, installs, purchases, sent messages) are always remembered, with
+  their own time. For each one, DIscrete finds what led to it in the half hour before: the post, search or page
+  that names the same thing.
+  - Every link is checked in code (the moment came first, the quote is really on screen, it names the thing) and by
+    the verifier.
+  - Asked "why did I download Helium?", Bubble answers with the likely reason in time order.
+  - Without a stored link, it offers the moments just before, for the writer to reason over.
+- **Dreaming** (`discrete dream`; automatic once `DREAM_INTERVAL_MIN` has passed *and* `DREAM_MIN_NEW_EPISODES`
+  new episodes closed):
+  - **Patterns:** projects, interests, habits, tools, people and preferences that hold across sessions. Each rests on
+    memories from several episodes (habits and preferences on several days) and is checked by the verifier.
+  - **Audit:** old patterns are confirmed or retired.
+  - **Contradictions:** resolved toward what you stated or did, then the newer memory. Each pair is checked once.
+  - **Staleness:** lasting memories not seen for a while go stale. Events never do.
+  - **Profile** (`discrete profile --ids`): written from all this. Every point cites the memories behind it.
+- **How firmly something is held:** lasting memories carry how many episodes and days they were seen on
+  (tentative, recurring, established). Bubble words tentative ones as recent.
+- **Every change has a reason and an undo:**
+  - `discrete changes` shows what changed, who changed it (draft, consolidate, dream, cleanup, you) and why.
+  - `discrete history ID` shows every version of a memory.
+  - `discrete revert EVENT` undoes a change (and can be undone).
+  - `discrete forget ID` removes a memory and stops it being re-learned. `discrete correct ID "…"` replaces its
+    wording with yours.
+- **Graph:** people, projects and tools are linked when they appear in the same episodes (`discrete graph [NAME]`).
+  Questions naming one also search the memories that mention it.
+- **Markdown mirror:** `discrete export` writes memory as Markdown with `[[links]]` into a git folder (default
+  `<data dir>/memory`). Open it as an Obsidian vault. It is re-exported after every dream, so `git log` there is
+  the history of what DIscrete believes.
+- **Secrets never stored:** API keys, tokens, passwords, JWTs and private keys are removed from screen text,
+  titles, URLs, captions and Bubble's field before storage or any model call (`DISCRETE_REDACT_SECRETS`).
+
 ## Layout
 
 ```
