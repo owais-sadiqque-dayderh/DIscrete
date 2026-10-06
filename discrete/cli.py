@@ -419,6 +419,27 @@ async def cmd_profile(args) -> int:
     return 0
 
 
+async def cmd_graph(args) -> int:
+    async with _session() as store:
+        if not args.name:
+            for r in await store.graph_overview(args.n):
+                _print(f"{r['name']:<40} {r['kind']:<12} {r['memories']:>3} memories  {r['links']:>3} links")
+            return 0
+        ids = await store.entity_ids_named([args.name])
+        if not ids:
+            _err(f"no entity named {args.name!r} (discrete graph lists them)")
+            return 1
+        e = await store.get_entity(ids[0])
+        _print(f"{e['name']} ({e['kind']})\n{e['summary'] or '(no page yet)'}")
+        _print("\nRelated:")
+        for n in await store.neighbors(e["id"], limit=args.n):
+            _print(f"  {n['name']:<38} together in {int(n['weight'])} episode(s)")
+        _print("\nMemories:")
+        for c in await store.claims_for_entity(e["id"], limit=args.n):
+            _print(f"  #{c['id']} [{c['kind']}] {c['text']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="discrete")
     p.add_argument("--db", help="store path (default: $DISCRETE_DATA_DIR/discrete.db)")
@@ -525,6 +546,11 @@ def build_parser() -> argparse.ArgumentParser:
     ppr.add_argument("--json", action="store_true")
     ppr.add_argument("--rewrite", action="store_true", help="rewrite it now from current memories")
     ppr.set_defaults(func=cmd_profile)
+
+    pg = sub.add_parser("graph", help="entities and how they connect; with a name, one entity's neighbourhood")
+    pg.add_argument("name", nargs="?", default="")
+    pg.add_argument("-n", type=int, default=25)
+    pg.set_defaults(func=cmd_graph)
     return p
 
 
