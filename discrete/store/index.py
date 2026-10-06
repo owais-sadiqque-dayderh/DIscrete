@@ -10,6 +10,7 @@ import numpy as np
 
 from .. import textkit as tk
 from ..config import T, embedding_endpoint
+from ..timeutil import now
 from .base import StoreBase
 
 log = logging.getLogger("discrete.store.index")
@@ -70,9 +71,9 @@ class IndexMixin(StoreBase):
                 for kind, (table, live) in _LIVE.items():
                     rows = conn.execute(
                         f"""SELECT id FROM {table} t WHERE {live}
-                            AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.ref_kind=? AND e.ref_id=t.id)
+                            AND NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.ref_kind=? AND e.ref_id=t.id AND e.model=?)
                             AND NOT EXISTS (SELECT 1 FROM index_outbox x WHERE x.ref_kind=? AND x.ref_id=t.id)""",
-                        (kind, kind),
+                        (kind, embedding_endpoint().model or "unknown", kind),
                     ).fetchall()
                     for (rid,) in rows:
                         self._enqueue(conn, kind, rid)
@@ -95,10 +96,17 @@ class IndexMixin(StoreBase):
     async def outbox_failed(self, refs: Sequence[tuple[str, int]]) -> None:
         def _run():
             with self._tx() as conn:
-                conn.executemany("UPDATE index_outbox SET attempts=attempts+1 WHERE ref_kind=? AND ref_id=?", refs)
+                conn.executemany("UPDATE index_outbox SET attempts=attempts+1, enqueued_at=? WHERE ref_kind=? AND ref_id=?",
+                                 [(now(), kind, rid) for kind, rid in refs])
 
         if refs:
             await self._call(_run)
+
+    async def retry_failed_outbox(self, *, older_than_s: float = 0.0) -> None:
+        await self.execute(
+            "UPDATE index_outbox SET attempts=0, enqueued_at=? WHERE attempts>=? AND enqueued_at<=?",
+            (now(), T.OUTBOX_MAX_ATTEMPTS, now() - older_than_s),
+        )
 
     async def outbox_discard(self, kind: str, rid: int) -> None:
         await self.execute("DELETE FROM index_outbox WHERE ref_kind=? AND ref_id=?", (kind, rid))
@@ -120,11 +128,14 @@ class IndexMixin(StoreBase):
 
     async def dense_index(self, kind: str) -> tuple[np.ndarray, np.ndarray]:
         """(ids, L2-normalized matrix) for a kind, cached until its vectors change."""
-        version = self._dense_version.get(kind, 0)
+        model = embedding_endpoint().model or "unknown"
+        # The stored version also changes on writes by another process (the daemon
+        # while the CLI or an eval run reads); the model, when EMBED_LM changes.
+        stored = await self.q1("SELECT value FROM meta WHERE key=?", (f"vectors:{kind}",))
+        version = (self._dense_version.get(kind, 0), model, stored[0] if stored else "0")
         cached = self._dense.get(kind)
         if cached and cached[0] == version:
             return cached[1], cached[2]
-        model = embedding_endpoint().model or "unknown"
         rows = await self.q("SELECT ref_id, vector FROM embeddings WHERE ref_kind=? AND model=?", (kind, model))
         if rows:
             ids = np.array([r[0] for r in rows], dtype=np.int64)

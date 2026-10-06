@@ -191,6 +191,11 @@ def consolidate_endpoint() -> Endpoint:
     return _ep("consolidate", "CONSOLIDATE_LM", "INSIGHT_LM")
 
 
+def verifier_endpoint() -> Endpoint:
+    """Independent semantic support verification before committing memories."""
+    return _ep("verifier", "VERIFY_LM", "INSIGHT_LM")
+
+
 def utility_endpoint() -> Endpoint:
     """Query planning, listwise rerank fallback (planS3)."""
     return _ep("utility", "UTILITY_LM")
@@ -220,6 +225,7 @@ def all_endpoints() -> list[Endpoint]:
     return [
         caption_endpoint(),
         insight_endpoint(),
+        verifier_endpoint(),
         consolidate_endpoint(),
         utility_endpoint(),
         embedding_endpoint(),
@@ -280,6 +286,9 @@ class T:
     VLM_MAX_WIDTH = _typed("VLM_MAX_WIDTH", 1024)
     VLM_IMAGE_DETAIL = _typed("VLM_IMAGE_DETAIL", "low")
     SELF_APPS = [s.lower() for s in _typed("SELF_APPS", [])]
+    # Never watched at all: nothing stored, Bubble off there (capture/privacy.py).
+    DENIED_APPS = _typed("DENIED_APPS", [])
+    DENIED_SITES = _typed("DENIED_SITES", [])
     SELF_WINDOW_PATTERNS = [s.lower() for s in _typed("SELF_WINDOW_PATTERNS", ["bin/discrete", "discrete run"])]
     CANVAS_APPS = [s.lower() for s in _typed(
         "CANVAS_APPS",
@@ -288,6 +297,8 @@ class T:
     LLM_TIMEOUT_S = _typed("LLM_TIMEOUT_S", 60.0)
     # Vision calls in flight at once; captures never wait for them (capture/enrich.py).
     ENRICH_CONCURRENCY = _typed("ENRICH_CONCURRENCY", 2)
+    # Rows holding a caption task (and their images) at once; the rest wait on disk.
+    ENRICH_MAX_PENDING = _typed("ENRICH_MAX_PENDING", 8)
     # Windows remembered for the frame-duplicate check.
     LAST_KEPT_MAX = _typed("LAST_KEPT_MAX", 512)
 
@@ -306,11 +317,20 @@ class T:
     DRAFT_MAX_OBS = _typed("DRAFT_MAX_OBS", 40)
     EVIDENCE_MIN_OVERLAP = _typed("EVIDENCE_MIN_OVERLAP", 0.2)
     DRAFT_MAX_ATTEMPTS = _typed("DRAFT_MAX_ATTEMPTS", 3)
+    # Failed drafts/embeddings are retried after this, then with doubling waits (outages).
+    FAILED_WORK_RETRY_S = _typed("FAILED_WORK_RETRY_S", 900.0)
     RELATE_CANDIDATES = _typed("RELATE_CANDIDATES", 5)
     OUTBOX_MAX_ATTEMPTS = _typed("OUTBOX_MAX_ATTEMPTS", 5)
     CANDIDATE_LIMIT = _typed("CANDIDATE_LIMIT", 8)
     RRF_K = _typed("RRF_K", 60.0)
-    CONSOLIDATION_INTERVAL_S = _typed("CONSOLIDATION_INTERVAL_S", 3600.0)
+    # In minutes when CONSOLIDATION_INTERVAL_MIN is set (it wins); the maintenance loop
+    # checks once a minute, so that is the finest step that means anything.
+    CONSOLIDATION_INTERVAL_MIN = _typed("CONSOLIDATION_INTERVAL_MIN", 0.0)
+    CONSOLIDATION_INTERVAL_S = (
+        CONSOLIDATION_INTERVAL_MIN * 60.0
+        if CONSOLIDATION_INTERVAL_MIN > 0
+        else _typed("CONSOLIDATION_INTERVAL_S", 3600.0)
+    )
     CONSOLIDATE_SIM = _typed("CONSOLIDATE_SIM", 0.82)
     CONSOLIDATE_MAX_CLUSTER = _typed("CONSOLIDATE_MAX_CLUSTER", 8)
     LINEAGE_MAX_VERSIONS = _typed("LINEAGE_MAX_VERSIONS", 12)
@@ -351,6 +371,9 @@ class T:
     LLM_RERANK = _typed("LLM_RERANK", False)
     LLM_RERANK_POOL = _typed("LLM_RERANK_POOL", 24)
     QUERY_LLM_PLAN = _typed("QUERY_LLM_PLAN", True)
+    # Verifier pass that drops related-but-unsupporting records (retrieval/support.py).
+    SUPPORT_CHECK = _typed("SUPPORT_CHECK", True)
+    SUPPORT_TIMEOUT_S = _typed("SUPPORT_TIMEOUT_S", 8.0)  # slower: results stay unverified
     TOP_K = _typed("TOP_K", 8)
     # Enumeration ("list all …") bypasses TOP_K/MMR: it returns every distinct page.
     ENUMERATE_MAX = _typed("ENUMERATE_MAX", 200)

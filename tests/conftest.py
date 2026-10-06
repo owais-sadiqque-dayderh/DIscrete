@@ -27,6 +27,8 @@ class FakeBackend:
 
     def __init__(self) -> None:
         self.draft: dict = {"title": "t", "summary": "s", "claims": []}
+        self.verification: dict[int, bool] = {}
+        self.support_indices: list[int] | None = None
         self.relations: dict[int, str] = {}
         self.consolidation: dict = {"claims": []}
         self.writer_reply = ""
@@ -51,6 +53,18 @@ class FakeBackend:
             if self.caption is None:
                 raise llm.LLMError("caption model down")
             return json.dumps(self.caption)
+        if "Independently verify candidate memories" in p:
+            self.calls.append("verify")
+            block = p.split("\n\n", 1)[1].split("\n\nFor each", 1)[0]
+            candidates = json.loads(block)
+            return json.dumps({"decisions": [{"index": c["index"],
+                                "supported": self.verification.get(c["index"], True), "reason": "test decision"}
+                               for c in candidates]})
+        if "Select records that directly support" in p:
+            self.calls.append("support")
+            payload = json.loads(p.split("instructions:\n", 1)[1].split("\nReturn strict JSON", 1)[0])
+            return json.dumps({"supports": self.support_indices if self.support_indices is not None
+                              else [r["index"] for r in payload["records"]]})
         if "Compare NEW claims" in p:
             self.calls.append("relate")
             rels, cur = [], None
@@ -116,7 +130,8 @@ def fake(monkeypatch):
     }.items():
         monkeypatch.setenv(k, v)
     for k in ("CAPTION_LM_MODEL_NAME", "INSIGHT_LM_MODEL_NAME", "UTILITY_LM_MODEL_NAME", "CONSOLIDATE_LM_MODEL_NAME",
-              "CAPTION_LM_API_KEY", "INSIGHT_LM_API_KEY", "UTILITY_LM_API_KEY", "EMBED_LM_API_BASE"):
+              "CAPTION_LM_API_KEY", "INSIGHT_LM_API_KEY", "UTILITY_LM_API_KEY", "EMBED_LM_API_BASE",
+              "VERIFY_LM_MODEL_NAME", "VERIFY_LM_API_KEY", "VERIFY_LM_API_BASE"):
         monkeypatch.delenv(k, raising=False)
     backend = FakeBackend()
     prev = llm.get_backend()

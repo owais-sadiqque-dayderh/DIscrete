@@ -17,6 +17,7 @@ from ..store import Store
 from .pages import canon_url, is_generic_title, names_overlap, page_identity, page_label
 
 _OPENED_QUERY = re.compile(r"\b(?:open|opened|read|visit|visited|click|clicked|saw|seen)\b", re.I)
+_SOURCE_QUERY = re.compile(r"\b(?:from|on|in|via|through)\s+\S+", re.I)
 
 
 def wants_opened_items(plan: QueryPlan) -> bool:
@@ -59,7 +60,7 @@ async def enumerate_pages(store: Store, plan: QueryPlan, result: RetrievalResult
     # their union: the planner adds sibling queries, whose union is never in one title.
     wants = [w for w in (set(tk.content_tokens(q)) for q in plan.queries[:8]) if w]
     linked: dict[int, object] = {}
-    if wants:
+    if wants and _SOURCE_QUERY.search(plan.raw):
         def cov(text: str) -> float:
             toks = set(tk.tokens(text))
             return max(len(w & toks) / len(w) for w in wants)

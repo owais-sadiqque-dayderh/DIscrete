@@ -28,11 +28,12 @@ from ..config import (
     insight_endpoint,
     rerank_endpoint,
     utility_endpoint,
+    verifier_endpoint,
     writer_endpoint,
 )
 from ..llm import EXPECTED_ERRORS, NotConfigured, TokenLimit, complete_json, embed, image_part, rerank, stream
 from ..perf import PERF
-from ..process.prompts import ADJUDICATE_PROMPT
+from ..process.prompts import ADJUDICATE_PROMPT, VERIFY_CLAIMS_PROMPT
 from ..retrieval.query import _PLAN_PROMPT
 
 
@@ -80,6 +81,16 @@ async def check_models(img: Image.Image | None, *, app: str = "", title: str = "
                         f"DISCRETE_PLAN_TIMEOUT_S or use a faster UTILITY_LM model")
         return out
 
+    async def verifier() -> str:
+        candidates = [{"index": 0, "kind": "event", "text": "The user exported the report.",
+                       "observations": [{"screen_text": "I did not export the report."}]}]
+        data = await complete_json(verifier_endpoint(), [{"role": "user", "content": VERIFY_CLAIMS_PROMPT.format(
+            candidates=json.dumps(candidates))}], max_tokens=600)
+        decisions = data.get("decisions", []) if isinstance(data, dict) else []
+        if len(decisions) != 1 or decisions[0].get("index") != 0 or decisions[0].get("supported") is not False:
+            raise ValueError("verifier accepted a negated action or returned malformed decisions")
+        return "negated action rejected"
+
     async def consolidate() -> str:  # entity pages / clusters: 400-token JSON
         data = await complete_json(consolidate_endpoint(), [{"role": "user", "content":
             'Summarise in one sentence what "Linear" is to a software engineer. '
@@ -111,6 +122,7 @@ async def check_models(img: Image.Image | None, *, app: str = "", title: str = "
         (caption_endpoint(), VLM_MAX_TOKENS, caption),
         (bubble_vision_endpoint(), 800, bubble_vision),
         (insight_endpoint(), 30, insight),
+        (verifier_endpoint(), 600, verifier),
         (utility_endpoint(), 300, utility),
         (consolidate_endpoint(), 400, consolidate),
         (writer_endpoint(), T.BUBBLE_WRITER_MAX_TOKENS, writer),

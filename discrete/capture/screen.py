@@ -29,12 +29,24 @@ from . import ocr
 from .browser import browser_url
 from .enrich import Capture, EnrichJob
 from .frames import FrameGrabber, is_blank
+from .privacy import denied
 from .session import SessionTracker
 from .suppress import classify_origin, is_suppressed
 
 log = logging.getLogger("discrete.capture.screen")
 
 _COUNTED = {"click": "clicks", "scroll": "scrolls", "keyboard": "keys", "clipboard": "clipboard"}
+
+
+def _novel_lines(ocr_text: str, ax_text: str) -> list[str]:
+    """OCR lines carrying words the AX text does not already have."""
+    known = set(tk.content_tokens(ax_text))
+    out: list[str] = []
+    for line in dict.fromkeys(x.strip() for x in ocr_text.splitlines()):
+        toks = set(tk.content_tokens(line))
+        if toks and len(toks - known) / len(toks) >= 0.5:
+            out.append(line)
+    return out
 
 
 class ScreenObserver:
@@ -46,6 +58,7 @@ class ScreenObserver:
         self.grabber = FrameGrabber()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._listeners: list = []
+        self._tasks: set[asyncio.Task] = set()
         self._pending: dict | None = None
         self._timer: asyncio.TimerHandle | None = None
         self._capture_lock = asyncio.Lock()
@@ -63,7 +76,7 @@ class ScreenObserver:
         self._warned_blank = False
         self.away = False
         self.stats = {k: 0 for k in ("captured", "light", "frame_dup", "dropped_failed", "degraded",
-                                     "suppressed", "aborted_drift", "self")}
+                                     "suppressed", "aborted_drift", "self", "denied")}
 
     # ------------------------------------------------------------ lifecycle
 
@@ -89,6 +102,7 @@ class ScreenObserver:
         log.info("screen observer armed")
 
     async def stop(self) -> None:
+        self._loop = None
         if self._frame_task:
             self._frame_task.cancel()
             await asyncio.gather(self._frame_task, return_exceptions=True)
@@ -100,6 +114,10 @@ class ScreenObserver:
         self._listeners.clear()
         if self._timer:
             self._timer.cancel()
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         self.grabber.close()
 
     # -------------------------------------------------------------- triggers
@@ -110,6 +128,8 @@ class ScreenObserver:
             self._loop.call_soon_threadsafe(self.arm, kind)
 
     def arm(self, kind: str) -> None:
+        if self._loop is None:
+            return  # a listener callback queued before stop()
         mono = time.monotonic()
         if mono - self._last_event_mono > T.SESSION_GAP_S:
             self.session.new_session()
@@ -150,7 +170,7 @@ class ScreenObserver:
         self._timer = self._loop.call_later(delay, self._flush_soon)
 
     def _flush_soon(self) -> None:
-        spawn(self._flush(), name="discrete-flush")
+        spawn(self._flush(), name="discrete-flush", owner=self._tasks)
 
     # ---------------------------------------------------------------- frames
 
@@ -158,7 +178,7 @@ class ScreenObserver:
         while True:
             try:
                 ctx = await asyncio.to_thread(ax.window_context)
-                img = await asyncio.to_thread(self.grabber.grab, ctx.bounds, max_width=T.FRAME_MAX_WIDTH)
+                img = await asyncio.to_thread(self.grabber.grab, ctx.bounds, max_width=T.FRAME_MAX_WIDTH, window_id=ctx.window_id)
                 if img is not None:
                     self._latest = (img, ctx)
                     self._recent.append((img, ctx))
@@ -194,7 +214,7 @@ class ScreenObserver:
         after = own if own is not None else pending["before_img"]
         if after is None:
             self.stats["dropped_failed"] += 1  # degraded: no frame, but still segment the boundary
-        spawn(self._finalize(pending, ctx, after, stale=True), name="discrete-rotate")
+        spawn(self._finalize(pending, ctx, after, stale=True), name="discrete-rotate", owner=self._tasks)
 
     async def _flush(self) -> None:
         pending, self._pending = self._pending, None
@@ -207,7 +227,7 @@ class ScreenObserver:
             self.stats["aborted_drift"] += 1
             self.arm("app")
             return
-        after = await asyncio.to_thread(self.grabber.grab, ctx.bounds, max_width=T.FRAME_MAX_WIDTH)
+        after = await asyncio.to_thread(self.grabber.grab, ctx.bounds, max_width=T.FRAME_MAX_WIDTH, window_id=ctx.window_id)
         await self._finalize(pending, ctx, after, stale=False)
 
     async def _finalize(self, pending: dict, ctx: ax.WindowContext, after, *, stale: bool) -> None:
@@ -221,6 +241,10 @@ class ScreenObserver:
         # The tab URL comes from the web view (window_context); AppleScript is a slow fallback.
         t0 = time.perf_counter()
         url = ctx.url or ("" if stale else await asyncio.to_thread(browser_url, ctx.app))
+        if denied(ctx.app, ctx.bundle_id, url):
+            # Before any text is read or any frame saved: a denied window leaves nothing.
+            self.stats["denied"] += 1
+            return
         counts: dict[str, Any] = pending["counts"]
         started, ended = pending["started"], time.time()
         phash = str(imagehash.phash(after)) if after is not None else ""
@@ -290,15 +314,17 @@ class ScreenObserver:
         # only faithful text for the old article is OCR of its captured frame.
         text = "" if stale else ax.read_screen_text(
             ctx.pid, max_nodes=T.AX_WALK_MAX_NODES, timeout_ms=T.AX_WALK_TIMEOUT_MS,
-            max_chars=T.SCREEN_TEXT_MAX_CHARS)
-        source = "ax" if text else ""
-        canvas = any(c in (ctx.app or "").lower() for c in T.CANVAS_APPS)
-        if stale or len(text) < T.AX_TEXT_MIN_CHARS or canvas:
-            ocr_text = ocr.ocr_image(after)
-            if ocr_text:
-                text = f"{text}\n{ocr_text}".strip()
-                source = "ax+ocr" if source else "ocr"
-        return tk.truncate(text, T.SCREEN_TEXT_MAX_CHARS), source
+            max_chars=T.SCREEN_TEXT_MAX_CHARS, viewport=ctx.bounds)
+        # A long AX tree can still be only chrome while the document is a scanned page
+        # or a canvas, so its length cannot establish coverage: OCR every frame
+        # (~0.2-0.3 s, off the event loop). Only OCR lines that AX lacks are kept, and
+        # they go first so a long chrome tree cannot truncate them away; on an ordinary
+        # page that is a few lines, and the exact AX text follows.
+        ocr_lines = _novel_lines(ocr.ocr_image(after), text)
+        if not ocr_lines:
+            return tk.truncate(text, T.SCREEN_TEXT_MAX_CHARS), "ax" if text else ""
+        merged = "\n".join(ocr_lines + ([text] if text else []))
+        return tk.truncate(merged, T.SCREEN_TEXT_MAX_CHARS), "ax+ocr" if text else "ocr"
 
     # ------------------------------------------------------------- heartbeat
 
@@ -308,7 +334,7 @@ class ScreenObserver:
             return
         async with self._capture_lock:
             ctx = await asyncio.to_thread(ax.window_context)
-            img = await asyncio.to_thread(self.grabber.grab, ctx.bounds, max_width=T.FRAME_MAX_WIDTH)
+            img = await asyncio.to_thread(self.grabber.grab, ctx.bounds, max_width=T.FRAME_MAX_WIDTH, window_id=ctx.window_id)
             if img is None:
                 return
             pending = {"kind": "heartbeat", "started": time.time(),

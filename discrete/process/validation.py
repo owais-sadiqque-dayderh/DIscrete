@@ -28,11 +28,15 @@ def verify_evidence(claim_text: str, quote: str, obs) -> tuple[str, bool]:
     the returned quote is always real text."""
     fields = [f for f in (obs["screen_text"], obs["caption"], obs["window_title"]) if f]
     q = tk.norm_key(quote)
-    if len(q) >= 4 and any(q in tk.norm_key(f) for f in fields):
-        return quote.strip(), True
     terms = set(tk.content_tokens(claim_text))
     if not terms:
         return "", False
+    if len(q) >= 4 and any(q in tk.norm_key(f) for f in fields):
+        # Authenticity alone says nothing about support. A genuine but unrelated
+        # quote must pass the same relevance gate as a replacement excerpt.
+        overlap = len(terms & set(tk.content_tokens(quote))) / len(terms)
+        if overlap >= T.EVIDENCE_MIN_OVERLAP:
+            return quote.strip(), True
     # Best window per field, so a substitute quote never spans two fields.
     snippet, overlap = max((tk.best_window(f, terms, width=24) for f in fields), key=lambda x: x[1], default=("", 0.0))
     return snippet, bool(snippet) and overlap >= T.EVIDENCE_MIN_OVERLAP

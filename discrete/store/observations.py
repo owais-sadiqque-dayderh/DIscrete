@@ -29,6 +29,15 @@ def _ph(ids: Sequence) -> str:
 
 
 class ObservationsMixin(StoreBase):
+    async def pending_enrichment(self, *, limit: int = 16) -> list[sqlite3.Row]:
+        return await self.q("SELECT * FROM observations WHERE origin='user' AND enrich_state='pending' "
+                            "ORDER BY id LIMIT ?", (limit,))
+
+    async def unsegmented_observations(self, *, limit: int = 1) -> list[sqlite3.Row]:
+        """User rows not yet in an episode, oldest first: the runtime's segmentation queue."""
+        return await self.q("SELECT * FROM observations WHERE origin='user' AND episode_id IS NULL "
+                            "ORDER BY id LIMIT ?", (limit,))
+
     async def add_observation(self, draft: ObservationDraft) -> tuple[int | None, bool]:
         """Insert, or collapse into an existing row. Returns (id, is_new)."""
 

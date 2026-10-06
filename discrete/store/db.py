@@ -326,12 +326,19 @@ def m005_perf_log(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX ix_perf_samples_at ON perf_samples(at)")
 
 
+def m006_unsegmented_index(conn: sqlite3.Connection) -> None:
+    # The runtime segments from the store (oldest unsegmented user row first). Without
+    # this, each lookup would scan every discarded and self-capture row too.
+    conn.execute("CREATE INDEX ix_obs_unsegmented ON observations(id) WHERE origin='user' AND episode_id IS NULL")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_base,
     m002_draft_attempts_and_digest_counts,
     m003_structured_page_fields,
     m004_minhash_raw_bytes,
     m005_perf_log,
+    m006_unsegmented_index,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

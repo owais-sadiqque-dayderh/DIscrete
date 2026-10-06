@@ -9,6 +9,7 @@ import numpy as np
 from .. import textkit as tk
 from ..config import T, consolidate_endpoint
 from ..llm import EXPECTED_ERRORS, complete, complete_json
+from ..models import ClaimDraft
 from ..perf import PERF
 from ..store import Store
 from ..timeutil import now, to_local
@@ -16,6 +17,7 @@ from .embed_worker import drain_outbox
 from .entities import promote_recurring
 from .prompts import CONSOLIDATE_PROMPT, DIGEST_PROMPT, ENTITY_PAGE_PROMPT
 from .validation import atomic
+from .verification import verify_claims
 
 log = logging.getLogger("discrete.process.consolidate")
 
@@ -78,12 +80,35 @@ async def _cluster_refine(store: Store) -> int:
         except EXPECTED_ERRORS as exc:
             log.warning("consolidation cluster failed: %s", exc)
             continue
-        outputs = [o for o in (data or {}).get("claims") or [] if isinstance(o, dict)]
+        if not isinstance(data, dict):
+            continue
+        outputs = [o for o in data.get("claims") or [] if isinstance(o, dict)]
         # A call failing validation changes nothing (planS2 §7.1).
         covered = {int(i) for o in outputs for i in (o.get("input_ids") or []) if str(i).lstrip("-").isdigit()}
         if not outputs or len(outputs) > len(cluster) + 2 or not ids <= covered:
             continue
         if not all(atomic(str(o.get("text") or "")) for o in outputs):
+            continue
+        drafts = []
+        by_claim = {r["id"]: r for r in cluster}
+        for output in outputs:
+            inputs = output.get("input_ids") or []
+            if not inputs or any(not str(i).isdigit() or int(i) not in ids for i in inputs):
+                break
+            evidence = []
+            for cid in dict.fromkeys(int(i) for i in inputs):
+                evidence.extend({"observation_id": r["observation_id"], "quote": r["quote"]}
+                                for r in await store.evidence_for_claim(cid) if r["relation"] == "supports")
+            drafts.append(ClaimDraft(kind=by_claim[int(inputs[0])]["kind"], text=output["text"], evidence=evidence))
+        if len(drafts) != len(outputs):
+            continue
+        observations = await store.get_observations(list({e["observation_id"] for d in drafts for e in d.evidence}),
+                                                   user_only=True)
+        try:
+            if not all(await verify_claims(drafts, {r["id"]: r for r in observations})):
+                continue  # never supersede good inputs with an unsupported refinement
+        except EXPECTED_ERRORS as exc:
+            log.warning("consolidation verification failed: %s", exc)
             continue
         if await store.consolidate_cluster(cluster, outputs):
             refined += 1
@@ -104,7 +129,9 @@ async def _entity_pages(store: Store) -> int:
             data = await complete_json(ep, [{"role": "user", "content": prompt}], max_tokens=400)
         except EXPECTED_ERRORS:
             continue
-        summary = tk.truncate(str((data or {}).get("summary") or ""), 800)
+        if not isinstance(data, dict):
+            continue
+        summary = tk.truncate(str(data.get("summary") or ""), 800)
         if not summary:
             continue
         kind = str((data or {}).get("kind") or "").lower()

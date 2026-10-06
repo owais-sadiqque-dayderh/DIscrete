@@ -126,37 +126,20 @@ class ClaimsMixin(StoreBase):
             out.setdefault(r[0], r[1])
         return out
 
-    async def reinforce_claim(self, claim_id: int, draft: ClaimDraft) -> float:
+    def _reinforce_claim(self, conn, claim_id: int, draft: ClaimDraft) -> float:
         """REINFORCE: add verified evidence, extend occurred_to; text untouched (planS2 §6.2)."""
+        for ev in draft.evidence:
+            self._link(conn, claim_id, int(ev["observation_id"]), "supports", str(ev.get("quote") or ""))
+        conn.execute("UPDATE claims SET occurred_to=MAX(occurred_to, ?), updated_at=? WHERE id=?",
+                     (draft.occurred_to, now(), claim_id))
+        self._cap_evidence(conn, claim_id)
+        return self._recompute_confidence(conn, claim_id)
 
-        def _r():
-            with self._tx() as conn:
-                for ev in draft.evidence:
-                    self._link(conn, claim_id, int(ev["observation_id"]), "supports", str(ev.get("quote") or ""))
-                conn.execute(
-                    "UPDATE claims SET occurred_to=MAX(occurred_to, ?), updated_at=? WHERE id=?",
-                    (draft.occurred_to, now(), claim_id),
-                )
-                self._cap_evidence(conn, claim_id)
-                return self._recompute_confidence(conn, claim_id)
-
-        return await self._call(_r)
-
-    async def invalidate_claim(self, claim_id: int, *, by_id: int, at: float) -> None:
-        def _inv():
-            with self._tx() as conn:
-                conn.execute(
-                    "UPDATE claims SET status='invalidated', valid_to=?, updated_at=? WHERE id=? AND status='live'",
-                    (at, now(), claim_id),
-                )
-                conn.execute("UPDATE claims SET invalidates_id=? WHERE id=?", (claim_id, by_id))
-                self._drop_vector(conn, "claim", claim_id)
-
-        await self._call(_inv)
-
-    async def flag_claims(self, ids: Sequence[int], flag: str) -> None:
-        if ids:
-            await self.execute(f"UPDATE claims SET flag=? WHERE id IN ({_ph(ids)})", [flag, *ids])
+    def _invalidate_claim(self, conn, claim_id: int, *, by_id: int, at: float) -> None:
+        conn.execute("UPDATE claims SET status='invalidated', valid_to=?, updated_at=? WHERE id=? AND status='live'",
+                     (at, now(), claim_id))
+        conn.execute("UPDATE claims SET invalidates_id=? WHERE id=?", (claim_id, by_id))
+        self._drop_vector(conn, "claim", claim_id)
 
     async def live_claims(self, *, kind: str | None = None, limit: int | None = None) -> list[sqlite3.Row]:
         sql, args = "SELECT * FROM claims WHERE status='live'", []
@@ -195,6 +178,11 @@ class ClaimsMixin(StoreBase):
         def _run():
             new_ids: list[int] = []
             with self._tx() as conn:
+                current = conn.execute(f"SELECT id, status, text FROM claims WHERE id IN ({_ph(list(cluster_ids))})",
+                                       list(cluster_ids)).fetchall()
+                if len(current) != len(cluster_ids) or any(r["status"] != "live" or
+                        r["text"] != by_id[r["id"]]["text"] for r in current):
+                    return []  # another draft/refinement already replaced the inputs
                 replaced: dict[int, int] = {}
                 for out in outputs[: len(cluster) + 2]:
                     inputs = [int(x) for x in (out.get("input_ids") or []) if int(x) in cluster_ids]
