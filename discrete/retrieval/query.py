@@ -41,8 +41,9 @@ _ABOUT_USER = re.compile(
     r"|\b(?:what|which) (?:kinds?|sorts?|types?) of\b.*\b(?:i|me)\b"
     r"|\b(?:am i|do i|i'm)\b.*\b(?:interested|into|building|working on|usually|tend to|often|prefer|rely on)\b"
     r"|\bwho am i\b|\bdescribe me\b", re.I)
-_TIME_SPENT = re.compile(r"\b(?:how (?:much time|long)|most time|time (?:on|spent|in)|spend(?:ing)? (?:my )?time|"
-                         r"spent (?:the )?most)\b", re.I)
+# "what time on Monday did I…" asks when, not how long: no bare "time on".
+_TIME_SPENT = re.compile(r"\b(?:how much time|how long (?:did|do|have) i (?:spend|spent|been)|most (?:of my )?time|"
+                         r"time spent|spend(?:ing)? (?:my |the most )?time|spent (?:the )?most)\b", re.I)
 _EDIT_VERBS = ("fix", "rewrite", "complete", "summarize", "translate", "format", "rephrase", "shorten")
 # The request's own scaffolding. Searching for "list" or "opened" matches any row that
 # says so (a todo list), not the pages being asked about (insights.md §7.36).

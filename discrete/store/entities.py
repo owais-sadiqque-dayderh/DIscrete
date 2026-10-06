@@ -173,33 +173,34 @@ class EntitiesMixin(StoreBase):
 
     async def rebuild_edges(self) -> int:
         """`entity_edges` from scratch: two entities are linked once per episode in which
-        live memories mention both (planS2 §10.5). Deterministic and cheap; returns edges."""
+        live memories mention both (planS2 §10.5). Computed on the reader connection; the
+        writer lock is held only to swap the table, so capture never waits on it."""
+        rows = await self.q(
+            "SELECT DISTINCT c.episode_id, m.entity_id, c.occurred_to FROM mentions m "
+            "JOIN claims c ON m.ref_kind='claim' AND c.id=m.ref_id "
+            "JOIN entities e ON e.id=m.entity_id AND e.merged_into IS NULL "
+            "WHERE c.status='live' AND c.episode_id IS NOT NULL")
+        by_ep: dict[int, dict[int, float]] = {}
+        for ep, eid, at in rows:
+            seen = by_ep.setdefault(ep, {})
+            seen[eid] = max(seen.get(eid, 0.0), at)
+        edges: dict[tuple[int, int], list[float]] = {}
+        for seen in by_ep.values():
+            ids = sorted(seen)
+            for i, a in enumerate(ids):
+                for b in ids[i + 1:]:
+                    w = edges.setdefault((a, b), [0.0, 0.0])
+                    w[0] += 1
+                    w[1] = max(w[1], seen[a], seen[b])
 
-        def _run() -> int:
+        def _swap() -> int:
             with self._tx() as conn:
-                rows = conn.execute(
-                    "SELECT DISTINCT c.episode_id, m.entity_id, c.occurred_to FROM mentions m "
-                    "JOIN claims c ON m.ref_kind='claim' AND c.id=m.ref_id "
-                    "JOIN entities e ON e.id=m.entity_id AND e.merged_into IS NULL "
-                    "WHERE c.status='live' AND c.episode_id IS NOT NULL").fetchall()
-                by_ep: dict[int, dict[int, float]] = {}
-                for ep, eid, at in rows:
-                    seen = by_ep.setdefault(ep, {})
-                    seen[eid] = max(seen.get(eid, 0.0), at)
-                edges: dict[tuple[int, int], list[float]] = {}
-                for seen in by_ep.values():
-                    ids = sorted(seen)
-                    for i, a in enumerate(ids):
-                        for b in ids[i + 1:]:
-                            w = edges.setdefault((a, b), [0.0, 0.0])
-                            w[0] += 1
-                            w[1] = max(w[1], seen[a], seen[b])
                 conn.execute("DELETE FROM entity_edges")
                 conn.executemany("INSERT INTO entity_edges(a, b, weight, last_seen) VALUES (?,?,?,?)",
                                  [(a, b, w, last) for (a, b), (w, last) in edges.items()])
                 return len(edges)
 
-        return await self._call(_run)
+        return await self._call(_swap)
 
     async def neighbors(self, entity_id: int, *, limit: int = 8, min_weight: float = 1.0) -> list[sqlite3.Row]:
         return await self.q(

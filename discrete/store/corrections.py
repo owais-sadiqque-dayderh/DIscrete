@@ -52,24 +52,37 @@ class CorrectionsMixin(ClaimsMixin):
 
         def _run() -> tuple[int, int]:
             with self._tx() as conn:
-                row = conn.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
-                if row is None:
+                asked = conn.execute("SELECT lineage_id FROM claims WHERE id=?", (claim_id,)).fetchone()
+                if asked is None:
                     raise KeyError(f"no claim {claim_id}")
+                # Correct the lineage's current version, whichever version was named.
+                row = conn.execute("SELECT * FROM claims WHERE lineage_id=? AND status='live' "
+                                   "ORDER BY version DESC LIMIT 1", (asked["lineage_id"],)).fetchone()
+                if row is None:
+                    raise KeyError(f"claim {claim_id} has no live version to correct")
+                target = row["id"]
                 version = conn.execute("SELECT MAX(version) FROM claims WHERE lineage_id=?",
                                        (row["lineage_id"],)).fetchone()[0] or 1
                 ev = conn.execute("SELECT observation_id, quote FROM evidence WHERE claim_id=? AND relation='supports'",
-                                  (claim_id,)).fetchall()
+                                  (target,)).fetchall()
                 draft = ClaimDraft(kind=row["kind"], text=text.strip(), context=row["context"],
                                    reasoning="corrected by the user", modality="stated",
                                    episode_id=row["episode_id"], occurred_from=row["occurred_from"],
-                                   occurred_to=row["occurred_to"],
+                                   occurred_to=row["occurred_to"], action=row["action"],
                                    evidence=[{"observation_id": r[0], "quote": r[1]} for r in ev])
                 nid = self._insert_claim(conn, draft, lineage_id=row["lineage_id"], version=version + 1,
-                                         derived_from=[claim_id])
-                self._carry_mentions(conn, [claim_id], nid)
-                change = self._set_state(conn, claim_id, status="superseded", valid_to=now(), superseded_by=nid)
+                                         derived_from=[target])
+                self._carry_mentions(conn, [target], nid)
+                change = self._set_state(conn, target, status="superseded", valid_to=now(), superseded_by=nid)
                 eid = self._log_event(conn, "correct", "user", claim_id=nid, created=[nid], changes=[change],
                                       reason=reason or "the user corrected the wording")
+                # What led to the action still led to it: copy its trail to the new version
+                # (tagged with this event, so reverting the correction retires the copies).
+                conn.execute(
+                    "INSERT OR IGNORE INTO links(src_kind, src_id, dst_kind, dst_id, relation, confidence, reason, "
+                    "evidence, status, event_id, created_at) SELECT src_kind, src_id, dst_kind, ?, relation, "
+                    "confidence, reason, evidence, 'live', ?, ? FROM links WHERE dst_kind='claim' AND dst_id=? "
+                    "AND status='live' AND relation IN ('led_to', 'step')", (nid, eid, now(), target))
                 return nid, eid
 
         return await self._call(_run)

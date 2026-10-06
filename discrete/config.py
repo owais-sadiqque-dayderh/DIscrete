@@ -383,6 +383,10 @@ class T:
     DREAM_MIN_EPISODES = _typed("DREAM_MIN_EPISODES", 3)
     DREAM_MIN_DAYS = _typed("DREAM_MIN_DAYS", 2)
     DREAM_FREQUENCY_DAYS = _typed("DREAM_FREQUENCY_DAYS", 5)
+    # Episodes of one sitting are not "several sessions": a pattern also needs support
+    # from this many separate occasions (memories at least DREAM_OCCASION_GAP_MIN apart).
+    DREAM_MIN_OCCASIONS = _typed("DREAM_MIN_OCCASIONS", 2)
+    DREAM_OCCASION_GAP_MIN = _typed("DREAM_OCCASION_GAP_MIN", 60.0)
     DREAM_DUPLICATE_SIM = _typed("DREAM_DUPLICATE_SIM", 0.85)
     # Contradiction sweep: pairs this similar (but below CONSOLIDATE_SIM) are checked.
     CONFLICT_SIM = _typed("CONFLICT_SIM", 0.55)
@@ -395,6 +399,10 @@ class T:
     # Attention (store/attention.py): a sighting lasts until the next one, at most this long.
     DWELL_GAP_CAP_S = _typed("DWELL_GAP_CAP_S", 180.0)
     DWELL_LAST_S = _typed("DWELL_LAST_S", 30.0)
+    ATTENTION_MAX_DAYS = _typed("ATTENTION_MAX_DAYS", 90.0)
+    # The Markdown export as a git repo (every export a commit). Off by default: git keeps
+    # every version forever, so a forgotten memory would survive in its history.
+    MEMORY_EXPORT_GIT = _typed("MEMORY_EXPORT_GIT", False)
     # Belief strength shown to Bubble: "established" once seen on this many days and episodes.
     ESTABLISHED_DAYS = _typed("ESTABLISHED_DAYS", 3)
     ESTABLISHED_EPISODES = _typed("ESTABLISHED_EPISODES", 3)

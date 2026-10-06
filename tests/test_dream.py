@@ -72,8 +72,8 @@ async def test_code_checks_reject_bad_patterns(store, fake, proposal, why):
 
 
 async def test_habits_need_several_days_projects_do_not(store, fake):
-    ids = [await _memory(store, "The user worked on the AMO agent repository", day=0, episode=20 + i, hours_ago=i)
-           for i in range(3)]
+    ids = [await _memory(store, "The user worked on the AMO agent repository", day=0, episode=20 + i,
+                         hours_ago=2 * i) for i in range(3)]
     fake.dream = {"patterns": [_pattern(ids, "The user works on AMO in the evenings", "habit"),
                                _pattern(ids, "The user is building the AMO agent", "project")], "audit": []}
     report = await run_dream(store)
@@ -182,3 +182,22 @@ async def test_dreaming_waits_for_time_and_activity(store, fake, monkeypatch):
     assert not await dr.due(store)  # too soon
     monkeypatch.setattr(T, "DREAM_INTERVAL_MIN", 0.0)
     assert not await dr.due(store)  # 0 = only by hand
+
+
+async def test_episodes_of_one_sitting_are_one_occasion(store, fake):
+    """Review #11: episodes close every 40 captures, so one 25-minute read is several episodes."""
+    ids = [await _memory(store, "The user read about agent memory repositories", day=0, episode=70 + i,
+                         hours_ago=0.1 * i) for i in range(4)]
+    fake.dream = {"patterns": [_pattern(ids, "The user is researching agent memory", "project")], "audit": []}
+    assert (await run_dream(store))["patterns"]["rejected"] == {"single_occasion": 1}
+
+
+async def test_a_crashing_step_neither_stops_the_others_nor_reruns_every_minute(store, fake, monkeypatch):
+    """Review #1/#2: a list reply or a crash used to abort the dream before last_dream."""
+    ids = await _football(store)
+    fake.dream = ["not", "an", "object"]
+    fake.profile = {"sections": []}
+    report = await run_dream(store)
+    assert "error" in report["patterns"] and "stale" in report and "error" not in report["stale"]
+    assert float(await store.get_meta("last_dream", "0")) > 0
+    assert ids

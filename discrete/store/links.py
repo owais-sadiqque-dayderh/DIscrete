@@ -52,6 +52,7 @@ class LinksMixin(ClaimsMixin):
             return []
         return await self.q(
             f"SELECT * FROM links WHERE status='live' AND dst_kind=? AND dst_id IN ({_ph(ids)}) "
+            f"AND src_kind='observation' AND relation IN ('led_to', 'step') "
             f"ORDER BY relation='led_to' DESC, confidence DESC", (dst_kind, *ids))
 
     async def checked_pairs(self) -> set[tuple[int, int]]:

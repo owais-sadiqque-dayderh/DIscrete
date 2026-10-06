@@ -13,7 +13,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..config import T
-from ..timeutil import day_key
 from .base import StoreBase
 
 
@@ -37,26 +36,27 @@ def _dur(seconds: float) -> str:
 
 class AttentionMixin(StoreBase):
     async def attention(self, start: float, end: float, *, by: str = "site", limit: int = 20) -> list[Attention]:
-        """Time per `by` (site | app | page) between start and end, most first."""
+        """Time per `by` (site | app | page) between start and end, most first. Aggregated
+        in SQL (a window function for the gap to the next sighting), so a long interval
+        costs one indexed scan, not a Python loop; intervals are capped at ATTENTION_MAX_DAYS."""
+        start = max(start, end - T.ATTENTION_MAX_DAYS * 86400)
+        key = {"app": "COALESCE(NULLIF(o.app, ''), '(unknown)')",
+               "page": "COALESCE(NULLIF(o.page_title, ''), o.window_title) || ' (' || "
+                       "COALESCE(NULLIF(o.site, ''), o.app) || ')'"}.get(
+            by, "COALESCE(NULLIF(o.site, ''), NULLIF(o.app, ''), '(unknown)')")
         rows = await self.q(
-            "SELECT s.obs_id, s.started_at, s.keys + s.clicks + s.scrolls + s.clipboard AS acts, o.app, o.site, "
-            "o.page_title, o.window_title FROM sightings s JOIN observations o ON o.id=s.obs_id "
-            "WHERE o.origin='user' AND s.started_at >= ? AND s.started_at < ? ORDER BY s.started_at, s.id",
-            (start, end))
-        acc: dict[str, list] = {}
-        for i, r in enumerate(rows):
-            nxt = rows[i + 1]["started_at"] if i + 1 < len(rows) else r["started_at"] + T.DWELL_LAST_S
-            dwell = max(0.0, min(nxt - r["started_at"], T.DWELL_GAP_CAP_S))
-            if by == "app":
-                key = r["app"] or "(unknown)"
-            elif by == "page":
-                key = f"{r['page_title'] or r['window_title']} ({r['site'] or r['app']})"
-            else:
-                key = r["site"] or r["app"] or "(unknown)"
-            a = acc.setdefault(key, [0.0, 0.0, set(), set()])
-            a[0] += dwell
-            a[1] += dwell if r["acts"] else 0.0
-            a[2].add(r["obs_id"])
-            a[3].add(day_key(r["started_at"]))
-        out = [Attention(k, v[0], v[1], len(v[2]), len(v[3])) for k, v in acc.items()]
-        return sorted(out, key=lambda a: -a.seconds)[:limit]
+            f"""WITH s AS (
+                  SELECT s.obs_id, s.started_at, (s.keys + s.clicks + s.scrolls + s.clipboard) > 0 AS active,
+                         MIN(COALESCE(LEAD(s.started_at) OVER (ORDER BY s.started_at, s.id) - s.started_at, ?), ?)
+                           AS dwell
+                  FROM sightings s JOIN observations o ON o.id=s.obs_id
+                  WHERE o.origin='user' AND s.started_at >= ? AND s.started_at < ?)
+                SELECT {key} AS k, SUM(MAX(s.dwell, 0)) AS seconds,
+                       SUM(CASE WHEN s.active THEN MAX(s.dwell, 0) ELSE 0 END) AS active_seconds,
+                       COUNT(DISTINCT s.obs_id) AS visits,
+                       COUNT(DISTINCT date(s.started_at, 'unixepoch', 'localtime')) AS days
+                FROM s JOIN observations o ON o.id=s.obs_id
+                GROUP BY k ORDER BY seconds DESC LIMIT ?""",
+            (T.DWELL_LAST_S, T.DWELL_GAP_CAP_S, start, end, limit))
+        return [Attention(r["k"], r["seconds"] or 0.0, r["active_seconds"] or 0.0, r["visits"], r["days"])
+                for r in rows]

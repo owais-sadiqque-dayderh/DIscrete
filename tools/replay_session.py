@@ -10,7 +10,9 @@ from pathlib import Path
 from PIL import Image
 
 from discrete.capture.enrich import Enricher, EnrichJob
+from discrete.capture.redact import SecretMemory, redact_capture
 from discrete.capture.suppress import classify_origin
+from discrete.config import T
 from discrete.llm import flush_usage
 from discrete.models import ObservationDraft
 from discrete.perf import PERF
@@ -36,9 +38,16 @@ async def replay(args):
         # 1. Store every capture in order, as live capture would (origin, dedup).
         lines = await asyncio.to_thread(Path(args.manifest).read_text)
         stored: list[tuple[int, dict, ObservationDraft]] = []
+        secrets = SecretMemory()
         for line in lines.splitlines():
             item = json.loads(line)
             draft = ObservationDraft(**item["draft"])
+            # The same redaction live capture applies, so a manifest of old captures
+            # can never send a key to a model.
+            red = redact_capture(draft.window_title, draft.url, draft.screen_text, draft.text_source, memory=secrets)
+            draft.window_title, draft.url, draft.screen_text = red.title, red.url, red.text
+            if red.drop_frame:
+                item.pop("image", None)
             if draft.origin == "user":
                 # Live capture classifies origin before storing; a replay must too.
                 draft.origin = classify_origin(draft.app, draft.window_title, draft.screen_text)
@@ -48,13 +57,17 @@ async def replay(args):
 
         # 2. Captions, DISCRETE_ENRICH_CONCURRENCY at a time (live capture also captions
         # asynchronously; each caption only reads captures before it).
+        slots = asyncio.Semaphore(max(1, T.ENRICH_CONCURRENCY))
+
         async def caption(oid: int, item: dict, draft: ObservationDraft) -> None:
             if not item.get("image"):
                 return
-            with Image.open(item["image"]) as im:
-                job = EnrichJob([im.convert("RGB")], draft.app, draft.window_title, draft.url, draft.screen_text,
-                                {k: getattr(draft, k) for k in ("keys", "clicks", "scrolls", "clipboard")})
-            await enricher._run(oid, job)
+            async with slots:  # decode a frame only when a caption slot is free (bounded memory)
+                with Image.open(item["image"]) as im:
+                    job = EnrichJob([im.convert("RGB")], draft.app, draft.window_title, draft.url,
+                                    draft.screen_text,
+                                    {k: getattr(draft, k) for k in ("keys", "clicks", "scrolls", "clipboard")})
+                await enricher._run(oid, job)
 
         await asyncio.gather(*(caption(*x) for x in stored))
 

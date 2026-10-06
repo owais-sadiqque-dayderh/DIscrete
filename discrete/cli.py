@@ -385,7 +385,18 @@ async def cmd_forget(args) -> int:
             return 1
         _print(_event_line(await store.get_event(eid)))
         _print(f"undo with: discrete revert {eid}")
+        await _refresh_export(store)
     return 0
+
+
+async def _refresh_export(store) -> None:
+    """A forgotten memory leaves the Markdown mirror at once, not at the next dream."""
+    from .config import memory_export_dir
+    from .export import export_markdown
+
+    out = memory_export_dir()
+    if out is not None and (out / ".discrete-export").exists():
+        await export_markdown(store, out, git=T.MEMORY_EXPORT_GIT)
 
 
 async def cmd_correct(args) -> int:
@@ -456,7 +467,7 @@ async def cmd_export(args) -> int:
 
     out = _export_dir(args.dir)
     async with _session() as store:
-        report = await export_markdown(store, out, git=not args.no_git)
+        report = await export_markdown(store, out, git=args.git or T.MEMORY_EXPORT_GIT)
     _print(json.dumps(report, indent=2, default=str))
     _print(f"open {out}/MEMORY.md (or the folder as an Obsidian vault)")
     return 0
@@ -584,7 +595,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     px = sub.add_parser("export", help="write memory as Markdown (git history, opens as an Obsidian vault)")
     px.add_argument("--dir", default="", help="default: DISCRETE_MEMORY_EXPORT_DIR or <data dir>/memory")
-    px.add_argument("--no-git", action="store_true")
+    px.add_argument("--git", action="store_true",
+                    help="commit the export to git (keeps every version, forgotten ones too)")
     px.set_defaults(func=cmd_export)
 
     pat = sub.add_parser("attention", help="where your time went: per site, app or page")

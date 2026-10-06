@@ -38,3 +38,4 @@ def test_time_questions_are_planned_as_time_spent():
     assert fallback_plan("what do I spend most time on?").time_spent
     assert fallback_plan("how much time did I spend on twitter today").time_spent
     assert not fallback_plan("what did I read on twitter today").time_spent
+    assert not fallback_plan("what time on Monday did I open the report?").time_spent  # review #14

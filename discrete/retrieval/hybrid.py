@@ -215,8 +215,8 @@ async def expand_why(store: Store, result: RetrievalResult) -> None:
     judge: those naming the same thing (with the matching line of screen text, since
     the caption often misses it: a browser's menu bar inside a video), the page it was
     reached from, and the moment or two just before."""
-    anchors = [h for h in result.hits if h.ref_kind == "claim" and h.claim_kind == "event"][: T.WHY_TARGETS]
-    anchors.sort(key=lambda h: not h.action)
+    anchors = sorted((h for h in result.hits if h.ref_kind == "claim" and h.claim_kind == "event"),
+                     key=lambda h: not h.action)[: T.WHY_TARGETS]  # stable: actions first, then rank
     if not anchors:
         anchors = [h for h in result.hits if h.ref_kind == "observation" and not h.via][:1]
     if not anchors:

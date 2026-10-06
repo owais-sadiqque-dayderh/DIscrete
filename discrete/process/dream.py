@@ -153,7 +153,7 @@ async def run_dream(store: Store) -> dict:
         from ..export import export_markdown
 
         try:
-            report["export"] = await export_markdown(store, out)
+            report["export"] = await export_markdown(store, out, git=T.MEMORY_EXPORT_GIT)
         except OSError as exc:
             log.warning("memory export failed: %s", exc)
     return report
@@ -210,9 +210,18 @@ def check_pattern(item: dict, by_id: dict, episodes: dict[int, set[int]], *,
         return None, "too_few_episodes"
     if category in _DAY_CATEGORIES and len(days) < T.DREAM_MIN_DAYS:
         return None, "too_few_days"
+    if occasions([by_id[i]["occurred_from"] for i in support]) < T.DREAM_MIN_OCCASIONS:
+        return None, "single_occasion"
     if _FREQUENCY.search(text) and len(days) < T.DREAM_FREQUENCY_DAYS:
         return None, "frequency_overclaim"
     return {"text": text, "category": category, "support": support, "episodes": len(eps), "days": len(days)}, ""
+
+
+def occasions(times: list[float]) -> int:
+    """Separate sittings among these moments: a gap of DREAM_OCCASION_GAP_MIN starts a new one."""
+    gap = T.DREAM_OCCASION_GAP_MIN * 60
+    ts = sorted(times)
+    return (1 + sum(1 for a, b in zip(ts, ts[1:], strict=False) if b - a >= gap)) if ts else 0
 
 
 async def _verify(items: list[dict], by_id: dict) -> list[bool]:

@@ -223,3 +223,33 @@ class SecretMemory:
             return word
 
         return Redaction(_WORD.sub(_word, text), count, (), count)
+
+
+@dataclass(frozen=True)
+class CaptureRedaction:
+    title: str
+    url: str
+    text: str
+    #: Keep no frame: a credential was on screen (text redaction cannot clean pixels).
+    drop_frame: bool
+    #: Anything at all was masked.
+    masked: bool
+
+
+def redact_capture(title: str, url: str, text: str, text_source: str = "",
+                   memory: SecretMemory | None = None) -> CaptureRedaction:
+    """The one redaction policy for a capture, shared by live capture and the replay tool.
+
+    Title, URL and text are always the redacted versions. The frame is dropped for a
+    confident credential match anywhere, and also for a catch-all match in OCR'd text:
+    OCR reads pixels, so a garbled key it caught is still readable in the frame."""
+    t, u, x = redact(title), redact_url(url), redact(text)
+    secrets = (*t.secrets, *u.secrets, *x.secrets)
+    scrubbed = Redaction(x.text, 0)
+    if memory is not None:
+        memory.remember(secrets)
+        scrubbed = memory.scrub(x.text)
+    confident = t.confident + u.confident + x.confident + scrubbed.confident
+    ocr_catch_all = "ocr" in (text_source or "") and x.count > x.confident
+    masked = bool(t.count + u.count + x.count + scrubbed.count)
+    return CaptureRedaction(t.text, u.text, scrubbed.text, bool(confident) or ocr_catch_all, masked)

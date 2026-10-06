@@ -170,3 +170,28 @@ async def test_redo_of_a_forget_restores_its_suppression_and_the_forget_can_be_r
     await store.revert_event(forget)
     assert (await store.get_claim(cid))["status"] == "live"
     assert not await store.suppressed("preference", "The user prefers aisle seats")
+
+
+async def test_correcting_an_old_version_corrects_the_live_one_and_keeps_the_action(store):
+    """Review #5."""
+    oid = await _obs(store, "Thank you for downloading Helium", n=3)
+    cid = await store.create_claim(ClaimDraft(kind="event", text="The user downloaded Helium", modality="engaged",
+                                              action="downloaded",
+                                              evidence=[{"observation_id": oid, "quote": "downloading Helium"}]))
+    v2, _ = await store.correct_claim(cid, "The user downloaded the Helium browser")
+    v3, _ = await store.correct_claim(cid, "The user downloaded Helium 0.18 for macOS")  # names the old id
+    live = [c for c in await store.lineage(cid) if c["status"] == "live"]
+    assert [c["id"] for c in live] == [v3] and live[0]["action"] == "downloaded"
+    assert v2 != v3
+
+
+async def test_a_forgotten_memory_leaves_the_profile_at_once(store):
+    """Review #4."""
+    a = await _claim(store, "The user follows football on FotMob", n=1)
+    b = await _claim(store, "The user uses Arc", n=2)
+    await store.save_profile({"written_at": 1.0, "sections": [
+        {"heading": "Interests", "points": [{"text": "They follow football.", "claims": [a]}]},
+        {"heading": "Tools", "points": [{"text": "They use Arc.", "claims": [b]}]}]}, run_id="r")
+    await store.forget_claim(a)
+    profile = await store.get_profile()
+    assert [s["heading"] for s in profile["sections"]] == ["Tools"]

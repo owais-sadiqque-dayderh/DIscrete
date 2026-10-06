@@ -210,6 +210,15 @@ class BeliefsMixin(LinksMixin):
 
         return await self._call(_run)
 
-    async def get_profile(self) -> dict:
+    async def get_profile(self, *, live_only: bool = True) -> dict:
+        """The stored profile. By default a point whose memories were forgotten, corrected
+        or retired since it was written is left out, so "forget" reaches the profile at once."""
         raw = await self.get_meta("profile", "")
-        return json.loads(raw) if raw else {}
+        profile = json.loads(raw) if raw else {}
+        if not live_only or not profile.get("sections"):
+            return profile
+        cited = sorted({c for sec in profile["sections"] for p in sec["points"] for c in p["claims"]})
+        live = {r["id"] for r in await self.get_claims(cited, live_only=True)}
+        sections = [{**sec, "points": [p for p in sec["points"] if set(p["claims"]) <= live]}
+                    for sec in profile["sections"]]
+        return {**profile, "sections": [sec for sec in sections if sec["points"]]}
