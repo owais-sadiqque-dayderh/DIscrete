@@ -19,7 +19,7 @@ Phases 18–19).
 | Separate data dir `~/.cache/exp_discrete` seeded with a snapshot of the live db | ✅ |
 | Own venv, tests | ✅ 112 passing |
 | Feature plan (dreaming, firmer beliefs + cleanup, graph, version history) | ✅ Agreed with the user 2026-10-06 ~21:30; building on branch `feat/memory-evolution` |
-| Branch `feat/memory-evolution` (baseline `main` = `41e2f9f`) | 🚧 Phases 1–4 built and unit-tested; benchmarks pending |
+| Branch `feat/memory-evolution` (baseline `main` = `41e2f9f`) | 🚧 Phases 1–4 + export built, 169 tests; **benchmarks running — see HANDOFF** |
 | Disk space | ⚠️ Fell to ~270 MB free during setup; ~6.9 GB free a few minutes later (macOS reclaimed purgeable space). Still 97% full |
 | OpenRouter credit | ⚠️ ~$3.35 left (shared with live DIscrete) |
 
@@ -205,6 +205,100 @@ This audit shows where each proposed feature starts from. Code paths are relativ
   - input-source and schema audit (Claude Opus) → `docs/audit_inputs.md`;
   - Markdown/Obsidian + git export (Codex GPT-6-Sol) → `discrete/export.py`;
   - live-session golden questions incl. "why" (Claude Opus) → `bench/private/live1006/cases.yaml`.
+
+---
+
+## ▶ HANDOFF — read this first if you are picking up (written 2026-10-07 ~00:30 IST)
+
+The previous agent (Claude Opus 5.5, user's main subscription) hit its time limit. The user wants another Claude to
+carry on, delegating sub-tasks to Codex/other Claude agents where useful (`delegate_task` via the T3 orchestrator;
+`orchestrator_capabilities` lists providers: `codex` gpt-6-sol / gpt-6.1-sol, `claudeAgent` opus-5-5, etc.).
+
+**User's standing instructions** (all still apply):
+- Build on DIscrete in this folder only, on branch `feat/memory-evolution`. `main` = baseline `41e2f9f`. Never
+  touch `COMP_001/Discrete/` (the user's live copy, run by `COMP_001/jarvis`).
+- Research what others do, implement what's good, innovate where not. Experiment, test, **evaluate against the
+  baseline**, log everything in this file, move on. Elite production quality (the reliability bar of a large
+  company).
+- Goals: deep "why" answers (the Helium example); learn the user's preferences, habits, projects and interests from
+  screen activity; the audit of AX / OCR / VLM / schema; the 4 features (dreaming, belief strengthening + cleanup,
+  graph, version history).
+- At the end: brief the user on what changed and what didn't, with numbers, and give **setup notes to test the
+  branch**. The user decides on merging. Don't merge, push or open PRs. Commit on the branch only, with explicit
+  paths (`git add <files>`, never `-A`: delegated agents write files concurrently).
+- Resources: don't compromise on development, but pause and tell the user when a resource runs out (OpenRouter
+  credit was $3.04 at 23:30 on 2026-10-06; check `curl -s https://openrouter.ai/api/v1/credits -H "Authorization:
+  Bearer $CORE_LM_API_KEY"`; disk was 95% full).
+- Use DIscrete's exact models for every comparison (`.env`): muse-spark-1.3 (caption/insight/core, minimal
+  reasoning), gemini-3.8-flash verifier, gpt-4o-mini utility, text-embedding-3-small, cohere rerank-4-fast. Judge:
+  deepseek-v4-pro.
+
+**State of the code** (`git log --oneline main..feat/memory-evolution`, 13 commits, 169 tests pass, ruff clean):
+see Phases 2–4 above. Plus:
+- the Markdown export (`discrete/export.py`, by a Codex agent; wired as `discrete export`, and auto-run after each
+  dream);
+- the why fallback for any matched moment (commit `54b2afe`).
+
+**Jobs that were running at handoff** (all write under `bench/private/`; check whether they finished):
+1. **g46 baseline score:** `bench/private/g46/eval-base.log` → `bench/private/results/g46-base.json`. It scores the
+   main code on `g46/base.db`.
+2. **g46 branch rebuild:** `bench/private/g46/replay-branch.log` → `g46/branch.db`. It replays with the branch
+   pipeline (action capture, precise event times, trails), then `process --recover --consolidate`.
+3. **Live-session baseline rebuild:** `bench/private/live1006/replay-base.log` → `live1006/base.db`, with main code.
+4. **Delegated input/schema audit** (Claude Opus, still running): `task_status` with taskId
+   `node:delegated-task:command%3Amcp%3A5a593636-4fc7-4dd7-be2d-b82cb7825024%3Adelegate-task%3Aexp-discrete-input-audit-r1`.
+   Output goes to `docs/audit_inputs.md` and `bench/audit/` (uncommitted; review, then commit with explicit paths).
+
+**Evaluation protocol (to do next).** All commands run from `exp_discrete/`:
+```bash
+# A. Baseline vs branch on the 46-question session (Sep 30/Oct 1)
+.venv/bin/python bench/run_g46.py --db bench/private/g46/base.db --name g46-base --code ../exp_discrete_main  # if not done
+cp bench/private/g46/branch.db /tmp/g46-branch-dream.db                                        # never dream on the original
+.venv/bin/python -m discrete.cli --db /tmp/g46-branch-dream.db dream --force                   # patterns, conflicts, profile
+.venv/bin/python bench/run_g46.py --db /tmp/g46-branch-dream.db --name g46-branch
+.venv/bin/python bench/run_g46.py --compare g46-base g46-branch
+#    ablation: is a change from drafting or from retrieval/dream?
+cp bench/private/g46/base.db /tmp/g46-base-plus.db && .venv/bin/python -m discrete.cli --db /tmp/g46-base-plus.db dream --force
+.venv/bin/python bench/run_g46.py --db /tmp/g46-base-plus.db --name g46-base+dream
+
+# B. Live session of 2026-10-06 (30 questions incl. 6 "why"): bench/private/live1006/cases.yaml
+.venv/bin/python tools/replay_session.py --manifest bench/private/live1006/manifest.jsonl --db bench/private/live1006/branch.db
+.venv/bin/python -m discrete.cli --db bench/private/live1006/branch.db process --recover --consolidate
+.venv/bin/python bench/run_g46.py --cases bench/private/live1006/cases.yaml --db bench/private/live1006/base.db --name live-base --code ../exp_discrete_main
+.venv/bin/python bench/run_g46.py --cases bench/private/live1006/cases.yaml --db bench/private/live1006/branch.db --name live-branch
+.venv/bin/python bench/run_g46.py --compare live-base live-branch
+```
+- Noise: about 2 of 46 questions from the judge alone (closed log). Report per category, especially `why`,
+  `profile` and `unanswerable` (the new features must not make it overclaim).
+- Inspect `discrete --db X changes`, `profile --ids`, and the `trail` events (`changes --op trail`) for quality.
+  Bad patterns or links are prompt/gate bugs: fix, re-run, log.
+- Note: `g46/base.db` was opened once by branch code (an export smoke test), so it is at schema 7. The baseline code
+  ignores the extra tables/column; scores are unaffected.
+
+**Known gaps / next steps after the evaluation:**
+1. The live golden set shows causes that aren't "actions" ("why did I open ChatGPT", "why did I look at Omar's
+   profile": a DM). Stored trails cover only completed actions. Query-time `expand_why` covers the rest heuristically
+   (same-thing terms, `navigated_from`, the last 2 moments). If why scores stay low, consider trails for every
+   engaged navigation event (cost: one muse call each) or an on-demand trail call at query time (latency).
+2. Act on `docs/audit_inputs.md`. Change capture/preprocessing only where measured; then rebuild both sessions and
+   re-score.
+3. Live-test the branch on the user's machine (setup notes below), then dream for real after a few days of data.
+4. README section for the new features; update `.env` comments if settings change.
+5. Final brief to the user: changed vs not, scores before/after with noise, cost/latency deltas, setup notes.
+
+**Setup notes for the user to test the branch** (draft; finalize after evaluation):
+```bash
+cd ~/Documents/PARSEC/COMP_001/exp_hindsight/exp_discrete      # branch feat/memory-evolution; .venv already built
+ln -sf "$PWD/jarvis" ~/.local/bin/jarvis-exp                     # separate from your normal `jarvis`
+jarvis stop                                                      # stop the live DIscrete (same Option+Tab)
+jarvis-exp start                                                 # data in ~/.cache/exp_discrete (its own db)
+# use the Mac normally; then:
+jarvis-exp ask "why did I download helium?"
+jarvis-exp dream && jarvis-exp profile && jarvis-exp patterns
+jarvis-exp changes 2h ; jarvis-exp history <id> ; jarvis-exp forget <id> ; jarvis-exp revert <event>
+jarvis-exp graph ; jarvis-exp export                             # Markdown in ~/.cache/exp_discrete/memory (Obsidian vault)
+jarvis-exp stop && jarvis start                                  # back to the normal one
+```
 
 ---
 
