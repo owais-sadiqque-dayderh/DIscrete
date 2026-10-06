@@ -273,9 +273,17 @@ This audit shows where each proposed feature starts from. Code paths are relativ
   - audit #5: **evidence provenance**, migration 9 (`evidence.field`); the drafter prefers screen-text quotes;
   - tests for the episode cap and chunked drafting.
   - Suite: 204 tests (including delegated agents' uncommitted tests), ruff clean.
-- **Rebuilds running** (started at `28af5f4`, before the chrome/caption/attention/provenance changes, so they are
-  intermediate checks): `g46/branch.db`, `g46/branch-geminiverify.db`, `live1006/branch.db`, `live1006/base.db`
-  (main). The final branch rebuild comes after the action detectors are wired in.
+- **Replay made parallel** (`tools/replay_session.py`): captions run `DISCRETE_ENRICH_CONCURRENCY` at a time, then
+  segmentation and drafting run in capture order. The result is identical; 20 captures took 69 s instead of about
+  5 min.
+  - The outdated branch rebuilds were stopped. Only `live1006/base.db` (main code via a copy of the fast tool at
+    `/tmp/replay_session_fast.py`) is running; its log ends in `DONE`.
+  - **Final rebuilds to run once the action detectors are wired in:** `g46/branch.db`,
+    `g46/branch-geminiverify.db` (`VERIFY_LM_MODEL_NAME=google/gemini-3.8-flash`), `live1006/branch.db`. Use
+    `DISCRETE_ENRICH_CONCURRENCY=6 .venv/bin/python tools/replay_session.py --manifest … --db …`, then
+    `discrete --db … process --recover --consolidate`, then the HANDOFF eval protocol.
+- **Delegated, still running:** capture text (audit #4/#7) and action detectors (audit #10); both Codex,
+  uncommitted until reviewed.
 - **Next (me):**
   - audit #6 (filter chrome before the drafter and the caption);
   - #11 (caption prompt: separate the page from embedded media, name brands in media);
