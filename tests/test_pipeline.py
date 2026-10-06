@@ -434,3 +434,39 @@ def test_replay_maps_domain_apps_to_browser_without_app_names():
     assert mod.app_and_site("Adobe Illustrator 2026", "https://example.com/x") == ("Adobe Illustrator 2026",
                                                                                   "example.com")
     assert mod.app_and_site("", "https://example.com/x") == ("Browser", "example.com")
+
+
+async def test_episodes_close_at_the_drafters_reach(store, monkeypatch):
+    """A 92-observation episode lost its first 52 before drafting (Helium, live 2026-10-06)."""
+    from discrete.config import T
+
+    monkeypatch.setattr(T, "EPISODE_MAX_OBS", 5)
+    tr = EpisodeTracker(store)
+    closed = []
+    for i in range(12):
+        oid, _ = await store.add_observation(obs(text=f"distinct page number {i} " * 3, t=T0 + 10 * i))
+        closed += await tr.on_observation(oid, await store.get_observation(oid), session_id="s1")
+    assert len(closed) == 2  # 5 + 5, the last 2 still open
+
+
+async def test_a_long_episode_is_drafted_in_chunks_and_nothing_is_dropped(store, fake, monkeypatch):
+    from discrete.config import T
+
+    monkeypatch.setattr(T, "EPISODE_MAX_OBS", 1000)
+    monkeypatch.setattr(T, "DRAFT_MAX_OBS", 10)
+    eid, ids = await _one_episode(store, [f"Helium download step {i} unique words {i * 7}" for i in range(25)])
+    prompts = []
+    real = fake.chat
+
+    async def spy(ep, messages, **kw):
+        prompts.append(messages[-1]["content"] if isinstance(messages[-1]["content"], str) else "")
+        return await real(ep, messages, **kw)
+
+    monkeypatch.setattr(fake, "chat", spy)
+    fake.draft = {"title": "t", "summary": "s", "claims": [
+        {"kind": "event", "text": "The user viewed Helium download step 0", "action": "",
+         "evidence": [{"observation_id": ids[0], "quote": "Helium download step 0"}]}]}
+    await ProcessPipeline(store).draft_episode(eid)
+    drafts = [p for p in prompts if "one episode of a person's computer activity" in p]
+    assert len(drafts) == 3  # 10 + 10 + 5
+    assert f"observation_id={ids[0]}]" in drafts[0] and f"observation_id={ids[-1]}]" in drafts[-1]
