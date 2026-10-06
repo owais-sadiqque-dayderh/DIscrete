@@ -289,6 +289,10 @@ class T:
     # Never watched at all: nothing stored, Bubble off there (capture/privacy.py).
     DENIED_APPS = _typed("DENIED_APPS", [])
     DENIED_SITES = _typed("DENIED_SITES", [])
+    # Credentials (API keys, tokens, passwords, JWTs, private keys) are removed from
+    # screen text, titles, URLs, captions and Bubble's field before storage or any model
+    # call; a capture with a secret keeps no frame (capture/redact.py).
+    REDACT_SECRETS = _typed("REDACT_SECRETS", True)
     SELF_WINDOW_PATTERNS = [s.lower() for s in _typed("SELF_WINDOW_PATTERNS", ["bin/discrete", "discrete run"])]
     CANVAS_APPS = [s.lower() for s in _typed(
         "CANVAS_APPS",

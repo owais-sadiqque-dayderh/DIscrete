@@ -15,6 +15,7 @@ from ..aio import spawn
 from ..capture import accessibility as ax
 from ..capture.frames import FrameGrabber
 from ..capture.privacy import denied
+from ..capture.redact import redact
 from ..capture.suppress import hold, note_agent_output, release
 from ..config import T, bubble_vision_endpoint
 from ..llm import EXPECTED_ERRORS, NotConfigured, complete_json, embed, image_part
@@ -157,6 +158,8 @@ class BubbleService:
                 return
             with PERF.timer("bubble.field_read"):
                 text, desc = await self._read_field(snap)
+            if T.REDACT_SECRETS:
+                text = redact(text).text  # the field goes to the planner and the writer
             if not field_query(text):
                 self.overlay.message("No text in this field", tone="warn")
                 return

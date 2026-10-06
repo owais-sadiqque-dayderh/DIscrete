@@ -26,6 +26,7 @@ from ..models import ObservationDraft
 from ..perf import PERF, since_ms
 from ..store import Store
 from .frames import downscale
+from .redact import redact
 from .prompts import CAPTURE_PROMPT
 
 log = logging.getLogger("discrete.capture.enrich")
@@ -157,6 +158,9 @@ class Enricher:
             await self.store.enrichment_failed(oid)
             return
         caption = str(data.get("caption") or "").strip()
+        if T.REDACT_SECRETS:
+            # The model saw the frame: a key it read off the screen must not be stored.
+            caption = redact(caption).text
         if not data.get("useful", True) or (len(job.screen_text) < 40 and len(caption) < 5):
             self.stats["dropped_useless"] += 1
             await self.store.discard_observation(oid)

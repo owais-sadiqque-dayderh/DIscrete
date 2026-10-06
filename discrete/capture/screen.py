@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import dataclasses
 import logging
 import time
 from typing import Any
@@ -30,6 +31,7 @@ from .browser import browser_url
 from .enrich import Capture, EnrichJob
 from .frames import FrameGrabber, is_blank
 from .privacy import denied
+from .redact import SecretMemory, redact, redact_url
 from .session import SessionTracker
 from .suppress import classify_origin, is_suppressed
 
@@ -76,7 +78,9 @@ class ScreenObserver:
         self._warned_blank = False
         self.away = False
         self.stats = {k: 0 for k in ("captured", "light", "frame_dup", "dropped_failed", "degraded",
-                                     "suppressed", "aborted_drift", "self", "denied")}
+                                     "suppressed", "aborted_drift", "self", "denied", "redacted")}
+        # Fragments of recently redacted secrets, so an OCR copy split differently goes too.
+        self._secrets = SecretMemory()
 
     # ------------------------------------------------------------ lifecycle
 
@@ -245,6 +249,9 @@ class ScreenObserver:
             # Before any text is read or any frame saved: a denied window leaves nothing.
             self.stats["denied"] += 1
             return
+        title, url, found = self._redact_meta(ctx.window_title, url)
+        if found:
+            ctx = dataclasses.replace(ctx, window_title=title)
         counts: dict[str, Any] = pending["counts"]
         started, ended = pending["started"], time.time()
         phash = str(imagehash.phash(after)) if after is not None else ""
@@ -263,6 +270,11 @@ class ScreenObserver:
         t_text = time.perf_counter()
         screen_text, text_source = await asyncio.to_thread(self._screen_text, ctx, after, stale)
         PERF.sample("capture.text", since_ms(t_text), n=len(screen_text))
+        screen_text, n = self._redact_text(screen_text)
+        if found or n:
+            # Text redaction cannot clean a frame: keep none, caption from the text alone.
+            self.stats["redacted"] += 1
+            before = after = None
         origin = classify_origin(ctx.app, ctx.window_title, screen_text)
         base: dict[str, Any] = dict(
             origin=origin, event_kind=pending["kind"], session_id=self.session.session_id,
@@ -287,7 +299,7 @@ class ScreenObserver:
             await self.queue.put(Capture(ObservationDraft(source="heartbeat", caption=light_caption, **base)))
             return
 
-        after_path = await asyncio.to_thread(self._save, after, "after")
+        after_path = await asyncio.to_thread(self._save, after, "after") if after is not None else ""
         self._last_full_capture = time.time()
         self._last_full_text = screen_text
         if not self.ep.configured:
@@ -302,6 +314,22 @@ class ScreenObserver:
         PERF.sample("capture.local", since_ms(t0))  # hash, text, frame save: all work before the queue
         await self.queue.put(Capture(ObservationDraft(
             source="screen", caption=light_caption, frame_path=after_path, enrich_state="pending", **base), job))
+
+    def _redact_meta(self, title: str, url: str) -> tuple[str, str, int]:
+        """Window title and URL without credentials, and how many were removed."""
+        if not T.REDACT_SECRETS:
+            return title, url, 0
+        t, u = redact(title), redact_url(url)
+        self._secrets.remember((*t.secrets, *u.secrets))
+        return t.text, u.text, t.count + u.count
+
+    def _redact_text(self, text: str) -> tuple[str, int]:
+        if not T.REDACT_SECRETS:
+            return text, 0
+        r = redact(text)
+        self._secrets.remember(r.secrets)
+        s = self._secrets.scrub(r.text)
+        return s.text, r.count + s.count
 
     def _remember(self, sig: tuple, phash: str) -> None:
         self._last_kept[sig] = phash
