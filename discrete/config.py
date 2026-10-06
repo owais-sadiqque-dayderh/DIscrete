@@ -302,6 +302,9 @@ class T:
     VLM_MAX_WIDTH = _typed("VLM_MAX_WIDTH", 1024)
     VLM_IMAGE_DETAIL = _typed("VLM_IMAGE_DETAIL", "low")
     SELF_APPS = [s.lower() for s in _typed("SELF_APPS", [])]
+    # Chromium web pages: read visible text through AX text markers (one call, line
+    # structured) instead of walking per-word nodes. Experimental until verified live.
+    AX_TEXT_MARKERS = _typed("AX_TEXT_MARKERS", False)
     # Never watched at all: nothing stored, Bubble off there (capture/privacy.py).
     DENIED_APPS = _typed("DENIED_APPS", [])
     DENIED_SITES = _typed("DENIED_SITES", [])

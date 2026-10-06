@@ -18,13 +18,16 @@ import sys
 import time
 from dataclasses import dataclass
 
+from ..config import T
+
 log = logging.getLogger("discrete.capture.ax")
 
 try:
     import Quartz
-    from AppKit import NSRunningApplication
+    from AppKit import NSMakeRect, NSRunningApplication, NSValue
     from ApplicationServices import (
         AXIsProcessTrusted,
+        AXTextMarkerRangeCreate,
         AXUIElementCopyAttributeValue,
         AXUIElementCopyParameterizedAttributeValue,
         AXUIElementCreateApplication,
@@ -43,7 +46,7 @@ except ImportError:  # non-macOS
     _HAS_QUARTZ = False
 
 _AX_OK = 0  # kAXErrorSuccess
-_CHROME_ROLES = frozenset({"AXMenuBar", "AXMenu", "AXToolbar", "AXScrollBar", "AXTabGroup", "AXButton"})
+_CHROME_ROLES = frozenset({"AXMenuBar", "AXMenu", "AXToolbar", "AXScrollBar", "AXTabGroup"})
 _NAV_ROLES = frozenset({"AXLandmarkNavigation"})
 _TEXT_ROLES = frozenset({"AXStaticText", "AXTextArea", "AXTextView", "AXTextField"})
 _MIN_WINDOW_SIDE = 80
@@ -195,15 +198,20 @@ _WEB_REFIND_S = 2.0
 _web_cache: dict[int, tuple[str, object, float]] = {}
 
 
-def _find_role(el, role: str, *, max_nodes: int = 1500, budget_s: float = 0.08):
+def _find_role(el, role: str, *, max_nodes: int = 1500, budget_s: float = 0.08,
+               seen_out: list[int] | None = None):
     deadline = time.monotonic() + budget_s
     stack, seen = [el], 0
     while stack and seen < max_nodes and time.monotonic() < deadline:
         cur = stack.pop()
         seen += 1
         if _ax_get(cur, "AXRole") == role:
+            if seen_out is not None:
+                seen_out[0] = seen
             return cur
         stack.extend(reversed(_ax_get(cur, "AXChildren") or []))
+    if seen_out is not None:
+        seen_out[0] = seen
     return None
 
 
@@ -281,31 +289,38 @@ def _walk_text(el, parts: list[str], *, depth: int, max_nodes: int, deadline: fl
     if not range_used:
         value = _ax_get(el, "AXValue")
     title = _ax_get(el, "AXTitle") if not range_used and (not isinstance(value, str) or not value.strip()) else None
-    if visible:
+
+    # A successful visible-range read replaces the text view's entire subtree.
+    children = [] if range_used else (_ax_get(el, "AXChildren") or [])
+    before = (len(parts), len(deferred) if deferred is not None else 0)
+    if visible and role in _TEXT_ROLES:
         selected = value if isinstance(value, str) and value.strip() else title
         if isinstance(selected, str) and selected.strip():
             target.append(selected.strip())
             if target_meta is not None:
                 target_meta.append((role, parent, p, s))
-
-    # A successful visible-range read replaces the text view's entire subtree.
-    children = [] if range_used else (_ax_get(el, "AXChildren") or [])
-    before = (len(parts), len(deferred) if deferred is not None else 0)
     for child in children:
         _walk_text(child, parts, depth=depth + 1, max_nodes=max_nodes, deadline=deadline, seen=seen,
                    viewport=viewport, deferred=deferred, in_banner=in_banner or role == "AXLandmarkBanner",
                    clipped_parent=not visible, parent=el, meta=meta, deferred_meta=deferred_meta)
 
-    # A container's aria description often repeats its visible descendants.
-    if (visible and not range_used and not (isinstance(value, str) and value.strip())
-            and not (isinstance(title, str) and title.strip())
-            and before == (len(parts), len(deferred) if deferred is not None else 0)
-            and not _has_text_child(children, deadline)):
-        description = _ax_get(el, "AXDescription")
-        if isinstance(description, str) and description.strip():
-            target.append(description.strip())
-            if target_meta is not None:
-                target_meta.append((role, parent, p, s))
+    # Chromium puts a tweet's full aria label on a container and its visible
+    # words in descendants. Emit container text only when no child supplied text.
+    if visible and role not in _TEXT_ROLES and not range_used:
+        has_child_text = before != (len(parts), len(deferred) if deferred is not None else 0)
+        if not has_child_text and not _has_text_child(children, deadline):
+            selected = value if isinstance(value, str) and value.strip() else title
+            from_description = not isinstance(selected, str) or not selected.strip()
+            if from_description:
+                selected = _ax_get(el, "AXDescription")
+            # Icon buttons and linked images expose spoken labels for controls
+            # whose words are not actually painted in the captured window.
+            icon = ((from_description and role in {"AXButton", "AXLink"} and (s is None or s[0] < 48))
+                    or (role == "AXImage" and _ax_get(parent, "AXRole") in {"AXButton", "AXLink"}))
+            if not icon and isinstance(selected, str) and selected.strip():
+                target.append(selected.strip())
+                if target_meta is not None:
+                    target_meta.append((role, parent, p, s))
 
 
 def _merge_static_runs(parts: list[str], meta: list[tuple]) -> list[str]:
@@ -330,6 +345,40 @@ def _merge_static_runs(parts: list[str], meta: list[tuple]) -> list[str]:
     return out
 
 
+def _web_visible_text(web_area, viewport: tuple[float, float, float, float], deadline: float) -> str:
+    """Read Chromium's line-structured text between markers inside the window."""
+    if time.monotonic() >= deadline:
+        return ""
+    try:
+        bounds = NSValue.valueWithRect_(NSMakeRect(*viewport))
+        start = _ax_get_param(web_area, "AXStartTextMarkerForBounds", bounds)
+        end = _ax_get_param(web_area, "AXEndTextMarkerForBounds", bounds)
+        if start is None or end is None or time.monotonic() >= deadline:
+            return ""
+        marker_range = AXTextMarkerRangeCreate(None, start, end)
+    except Exception:
+        return ""
+    if time.monotonic() >= deadline:
+        return ""
+    raw_frame = _ax_get_param(web_area, "AXBoundsForTextMarkerRange", marker_range)
+    frame = _rect_xywh(_ax_value(raw_frame, kAXValueCGRectType))
+    if frame is None:
+        return ""
+    x, y, w, h = frame
+    vx, vy, vw, vh = viewport
+    if w <= 0 or h <= 0 or x + w <= vx or x >= vx + vw or y < vy - 8 or y + h > vy + vh + 8:
+        return ""
+    if time.monotonic() >= deadline:
+        return ""
+    value = _ax_get_param(web_area, "AXStringForTextMarkerRange", marker_range)
+    if not isinstance(value, str):
+        return ""
+    # Some sites flatten an entire article into one line; the node walk retains
+    # visual line boundaries there. Empty text is also a fallback signal.
+    text = value.strip()
+    return text if text.count("\n") >= 2 or len(text) < 200 else ""
+
+
 def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: int,
                      viewport: tuple[float, float, float, float] | None = None) -> str:
     """AX text walk of the focused window of `pid`. Empty when AX is not trusted."""
@@ -346,12 +395,23 @@ def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: in
             s = _size_wh(_ax_value(_ax_get(win, "AXSize"), kAXValueCGSizeType))
             if p is not None and s is not None and any(abs(a - b) > 2 for a, b in zip((*p, *s), viewport, strict=True)):
                 return ""  # another window of the same app gained focus; trust captured pixels
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        searched = [0]
+        if T.AX_TEXT_MARKERS and viewport and max_nodes >= 4:
+            # Experimental (DISCRETE_AX_TEXT_MARKERS): not yet verified live on enough pages.
+            # Reuse the remaining node budget if marker reads fail.
+            web_area = _find_role(win, "AXWebArea", max_nodes=max_nodes // 2,
+                                  budget_s=min(0.05, max(0.0, deadline - time.monotonic())), seen_out=searched)
+            if web_area is not None:
+                visible_text = _web_visible_text(web_area, viewport, deadline)
+                if visible_text:
+                    return visible_text[:max_chars]
         parts: list[str] = []
         deferred: list[str] = []
         meta: list[tuple] = []
         deferred_meta: list[tuple] = []
-        deadline = time.monotonic() + timeout_ms / 1000.0
-        _walk_text(win, parts, depth=0, max_nodes=max_nodes, deadline=deadline, seen=[0],
+        _walk_text(win, parts, depth=0, max_nodes=max(0, max_nodes - searched[0]),
+                   deadline=deadline, seen=[0],
                    viewport=viewport, deferred=deferred, meta=meta, deferred_meta=deferred_meta)
         # Adjacent duplicates are common (title + value of one element).
         out: list[str] = []

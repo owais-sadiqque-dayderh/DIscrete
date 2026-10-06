@@ -108,6 +108,75 @@ def test_static_runs_on_same_line_merge_across_parents(monkeypatch):
     assert _read(monkeypatch, nodes) == "One line"
 
 
+def test_web_area_uses_bounded_markers_before_word_nodes(monkeypatch):
+    monkeypatch.setattr(ax.T, "AX_TEXT_MARKERS", True)  # experimental path, off by default
+    nodes = _root("web")
+    nodes["web"] = {"AXRole": "AXWebArea", "AXChildren": ["article"]}
+    nodes["article"] = {"AXRole": "AXGroup", "AXValue": "So imagine an agent has memory",
+                        "AXChildren": ["heading", "link", "last"]}
+    nodes["heading"] = {"AXRole": "AXHeading", "AXChildren": ["so"]}
+    nodes["link"] = {"AXRole": "AXLink", "AXChildren": ["imagine"]}
+    for name, word, x in (("so", "So", 10), ("imagine", "imagine", 35), ("last", "an agent", 105)):
+        nodes[name] = {"AXRole": "AXStaticText", "AXValue": word,
+                       "AXPosition": (x, 20), "AXSize": (65, 18)}
+    calls = []
+    monkeypatch.setattr(ax, "_web_visible_text",
+                        lambda web, viewport, deadline: calls.append(web) or "So imagine\nan agent\nNext line")
+    assert _read(monkeypatch, nodes) == "So imagine\nan agent\nNext line"
+    assert calls == ["web"]
+    monkeypatch.setattr(ax, "_web_visible_text", lambda *args: "")
+    assert _read(monkeypatch, nodes) == "So imagine an agent"
+
+
+def test_bounded_marker_read_requires_structured_text(monkeypatch):
+    class Value:
+        @staticmethod
+        def valueWithRect_(rect):
+            return rect
+
+    monkeypatch.setattr(ax, "NSValue", Value)
+    monkeypatch.setattr(ax, "NSMakeRect", lambda *args: args)
+    monkeypatch.setattr(ax, "AXTextMarkerRangeCreate", lambda allocator, start, end: (start, end))
+    monkeypatch.setattr(ax, "_ax_value", lambda value, kind: value)
+    calls = []
+
+    def param(element, attr, value):
+        calls.append((attr, value))
+        return {"AXStartTextMarkerForBounds": "start", "AXEndTextMarkerForBounds": "end",
+                "AXBoundsForTextMarkerRange": ((0, 0), (200, 100)),
+                "AXStringForTextMarkerRange": "First line\nSecond line\nThird line"}[attr]
+
+    monkeypatch.setattr(ax, "_ax_get_param", param)
+    assert ax._web_visible_text("web", (0, 0, 200, 200), float("inf")) == "First line\nSecond line\nThird line"
+    assert calls == [("AXStartTextMarkerForBounds", (0, 0, 200, 200)),
+                     ("AXEndTextMarkerForBounds", (0, 0, 200, 200)),
+                     ("AXBoundsForTextMarkerRange", ("start", "end")),
+                     ("AXStringForTextMarkerRange", ("start", "end"))]
+    monkeypatch.setattr(ax, "_ax_get_param", lambda element, attr, value:
+                        ((0, 0), (200, 100)) if attr == "AXBoundsForTextMarkerRange" else "word " * 100)
+    assert ax._web_visible_text("web", (0, 0, 200, 200), float("inf")) == ""
+    monkeypatch.setattr(ax, "_ax_get_param", lambda element, attr, value:
+                        ((0, 0), (200, 300)) if attr == "AXBoundsForTextMarkerRange" else "One\nTwo\nThree")
+    assert ax._web_visible_text("web", (0, 0, 200, 200), float("inf")) == ""
+
+
+def test_chromium_article_aria_and_decorative_icons(monkeypatch):
+    nodes = _root("article", "text_button", "short_button", "icon_button", "chart")
+    nodes["article"] = {"AXRole": "AXGroup", "AXValue": "Whole tweet repeats its descendants",
+                        "AXDescription": "Whole tweet repeats its descendants", "AXChildren": ["tweet"]}
+    nodes["tweet"] = {"AXRole": "AXStaticText", "AXValue": "Whole tweet repeats its descendants",
+                      "AXPosition": (10, 10), "AXSize": (180, 20)}
+    nodes["text_button"] = {"AXRole": "AXButton", "AXTitle": "Continue",
+                            "AXPosition": (10, 40), "AXSize": (100, 30)}
+    nodes["short_button"] = {"AXRole": "AXButton", "AXTitle": "OK",
+                             "AXPosition": (120, 40), "AXSize": (35, 30)}
+    nodes["icon_button"] = {"AXRole": "AXButton", "AXDescription": "Like",
+                            "AXPosition": (10, 80), "AXSize": (32, 32), "AXChildren": ["icon"]}
+    nodes["icon"] = {"AXRole": "AXImage", "AXDescription": "Heart"}
+    nodes["chart"] = {"AXRole": "AXImage", "AXDescription": "Revenue chart"}
+    assert _read(monkeypatch, nodes) == "Whole tweet repeats its descendants\nContinue\nOK\nRevenue chart"
+
+
 def test_storage_frame_keeps_native_pixels_only_in_memory():
     native = Image.new("RGB", (2400, 1200), "white")
     frame = _storage_frame(native, 1600)
