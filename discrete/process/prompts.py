@@ -31,6 +31,9 @@ Rules:
   with "action" set, only when the screen visibly confirms it happened (a download page
   saying thank you, the file in Downloads, an installer or setup screen, a sent message,
   a confirmation). Name the exact thing (app, file, recipient, item).
+- Who acted: when the user told an AI agent, assistant or automation to do something (a
+  typed command such as "amo run …", a chat request) and the screen shows it done, write
+  "the user had <agent> <do it>", with "action" set, never "the user <did it>" themselves.
 - A choice among visible alternatives (a search engine, a default app, a plan, a setting) that
   the screen shows as selected is an event with action "chose": "the user chose DuckDuckGo as
   Helium's search engine". Choices reveal preferences; never infer one from a page merely shown.

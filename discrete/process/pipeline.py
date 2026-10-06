@@ -60,6 +60,11 @@ def action_verb(item: dict) -> str:
     return verb if verb in ACTION_VERBS else ""
 
 
+def _thing_tokens(text: str) -> set[str]:
+    """What an action is about: its words minus "the user", the verb and filler."""
+    return {t for t in tk.content_tokens(text, min_len=3) if t not in ACTION_VERBS and t not in ("user", "users")}
+
+
 def max_events(span_min: float) -> int:
     """Event room for an episode of this length (long episodes do several things)."""
     extra = int(max(0.0, span_min - 5) // max(T.DRAFT_EVENT_MINUTES, 0.5))
@@ -159,7 +164,7 @@ class ProcessPipeline:
             else:
                 kept.append(cd)
         drafts = kept
-        writes = [ClaimWrite(cd) for cd in drafts if cd.kind == "event"]
+        writes = [await self._action_write(cd) for cd in drafts if cd.kind == "event"]
         durables = [_Durable(cd=cd, text=claim_text(cd.text, cd.context)) for cd in drafts if cd.kind != "event"]
         writes += await self._merge(durables)
         for w in writes:
@@ -199,6 +204,22 @@ class ProcessPipeline:
                                                   limit=T.CHROME_WINDOW)
             out[(app, site)] = tk.chrome_lines(texts, share=T.CHROME_SHARE, min_texts=T.CHROME_MIN_CAPTURES)
         return out
+
+    async def _action_write(self, cd: ClaimDraft) -> ClaimWrite:
+        """An action already remembered (the same verb on the same thing, close in time:
+        a download page and then the file in Finder, or two episodes cut from one task)
+        reinforces the earlier claim instead of adding a duplicate. Other events are new."""
+        if not cd.action:
+            return ClaimWrite(cd)
+        mine = _thing_tokens(cd.text)
+        for row in await self.store.q(
+                "SELECT id, text FROM claims WHERE status='live' AND kind='event' AND action=? "
+                "AND occurred_from BETWEEN ? AND ?",
+                (cd.action, cd.occurred_from - T.ACTION_DEDUP_WINDOW_S, cd.occurred_to + T.ACTION_DEDUP_WINDOW_S)):
+            theirs = _thing_tokens(row["text"])
+            if mine and theirs and len(mine & theirs) / len(mine | theirs) >= T.ACTION_DEDUP_JACCARD:
+                return ClaimWrite(cd, operation="reinforced", target_id=row["id"])
+        return ClaimWrite(cd)
 
     async def _call_draft(self, rows, chrome: dict[tuple[str, str], set[str]] | None = None) -> dict:
         seen_lines: set[str] = set()

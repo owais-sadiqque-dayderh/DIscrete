@@ -353,6 +353,9 @@ class T:
     DRAFT_EVENT_MINUTES = _typed("DRAFT_EVENT_MINUTES", 3.0)
     DRAFT_MAX_EVENTS_CAP = _typed("DRAFT_MAX_EVENTS_CAP", 10)
     DRAFT_MAX_ACTIONS = _typed("DRAFT_MAX_ACTIONS", 6)
+    # The same action on the same thing within this window reinforces the earlier memory.
+    ACTION_DEDUP_WINDOW_S = _typed("ACTION_DEDUP_WINDOW_S", 3 * 3600.0)
+    ACTION_DEDUP_JACCARD = _typed("ACTION_DEDUP_JACCARD", 0.5)
     DRAFT_MAX_DURABLE = _typed("DRAFT_MAX_DURABLE", 5)
     DRAFT_MAX_OBS = _typed("DRAFT_MAX_OBS", 40)
     EVIDENCE_MIN_OVERLAP = _typed("EVIDENCE_MIN_OVERLAP", 0.2)
