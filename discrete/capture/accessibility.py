@@ -44,6 +44,8 @@ except ImportError:  # non-macOS
 
 _AX_OK = 0  # kAXErrorSuccess
 _CHROME_ROLES = frozenset({"AXMenuBar", "AXMenu", "AXToolbar", "AXScrollBar", "AXTabGroup", "AXButton"})
+_NAV_ROLES = frozenset({"AXLandmarkNavigation"})
+_TEXT_ROLES = frozenset({"AXStaticText", "AXTextArea", "AXTextView", "AXTextField"})
 _MIN_WINDOW_SIDE = 80
 
 
@@ -113,6 +115,30 @@ def _ax_get(el, attr: str):
         return val if err == _AX_OK else None
     except Exception:
         return None
+
+
+def _ax_get_param(el, attr: str, parameter):
+    try:
+        AXUIElementSetMessagingTimeout(el, _AX_TIMEOUT_S)
+        err, val = AXUIElementCopyParameterizedAttributeValue(el, attr, parameter, None)
+        return val if err == _AX_OK else None
+    except Exception:
+        return None
+
+
+def _has_text_child(children, deadline: float) -> bool:
+    """Check aria containers for text descendants, including clipped ones."""
+    stack = list(children)
+    checked = 0
+    while stack and checked < 25 and time.monotonic() < deadline:
+        child = stack.pop()
+        checked += 1
+        if _ax_get(child, "AXRole") in _TEXT_ROLES:
+            return True
+        if any(isinstance(_ax_get(child, attr), str) for attr in ("AXValue", "AXTitle")):
+            return True
+        stack.extend(_ax_get(child, "AXChildren") or [])
+    return bool(stack)  # uncertainty is safer than exposing an aria summary
 
 
 def _ax_url(raw) -> str:
@@ -221,29 +247,87 @@ def _enable_full_tree(app_el, pid: int) -> None:
 
 
 def _walk_text(el, parts: list[str], *, depth: int, max_nodes: int, deadline: float, seen: list[int],
-               viewport: tuple[float, float, float, float] | None = None) -> None:
+               viewport: tuple[float, float, float, float] | None = None,
+               deferred: list[str] | None = None, in_banner: bool = False,
+               clipped_parent: bool = False, parent=None,
+               meta: list[tuple] | None = None, deferred_meta: list[tuple] | None = None) -> None:
     if depth > 40 or seen[0] >= max_nodes or time.monotonic() > deadline:
         return
     seen[0] += 1
     role = str(_ax_get(el, "AXRole") or "")
-    if role in _CHROME_ROLES:
+    if role in _CHROME_ROLES or role in _NAV_ROLES or (in_banner and role == "AXList"):
         return
-    visible = True
+    visible = not clipped_parent
+    located = False
+    p = s = None
     if viewport:
         p = _point_xy(_ax_value(_ax_get(el, "AXPosition"), kAXValueCGPointType))
         s = _size_wh(_ax_value(_ax_get(el, "AXSize"), kAXValueCGSizeType))
         if p is not None and s is not None:
+            located = True
             x, y, w, h = viewport
             # Chromium clamps offscreen text to a one-pixel strip at the
             # viewport edge. It intersects the window but is not readable.
             visible = s[0] > 1 and s[1] > 1 and p[0] + s[0] > x and p[0] < x + w and p[1] + s[1] > y and p[1] < y + h
-    for attr in ("AXValue", "AXTitle", "AXDescription"):
-        val = _ax_get(el, attr)
-        if visible and isinstance(val, str) and val.strip():
-            parts.append(val.strip())
-            break
-    for child in _ax_get(el, "AXChildren") or []:
-        _walk_text(child, parts, depth=depth + 1, max_nodes=max_nodes, deadline=deadline, seen=seen, viewport=viewport)
+    target = parts if located or deferred is None else deferred
+    target_meta = meta if target is parts else deferred_meta
+    value = None
+    range_used = False
+    if role in {"AXTextArea", "AXTextView"}:
+        char_range = _ax_get(el, "AXVisibleCharacterRange")
+        if char_range is not None:
+            value = _ax_get_param(el, "AXStringForRange", char_range)
+            range_used = isinstance(value, str)
+    if not range_used:
+        value = _ax_get(el, "AXValue")
+    title = _ax_get(el, "AXTitle") if not range_used and (not isinstance(value, str) or not value.strip()) else None
+    if visible:
+        selected = value if isinstance(value, str) and value.strip() else title
+        if isinstance(selected, str) and selected.strip():
+            target.append(selected.strip())
+            if target_meta is not None:
+                target_meta.append((role, parent, p, s))
+
+    # A successful visible-range read replaces the text view's entire subtree.
+    children = [] if range_used else (_ax_get(el, "AXChildren") or [])
+    before = (len(parts), len(deferred) if deferred is not None else 0)
+    for child in children:
+        _walk_text(child, parts, depth=depth + 1, max_nodes=max_nodes, deadline=deadline, seen=seen,
+                   viewport=viewport, deferred=deferred, in_banner=in_banner or role == "AXLandmarkBanner",
+                   clipped_parent=not visible, parent=el, meta=meta, deferred_meta=deferred_meta)
+
+    # A container's aria description often repeats its visible descendants.
+    if (visible and not range_used and not (isinstance(value, str) and value.strip())
+            and not (isinstance(title, str) and title.strip())
+            and before == (len(parts), len(deferred) if deferred is not None else 0)
+            and not _has_text_child(children, deadline)):
+        description = _ax_get(el, "AXDescription")
+        if isinstance(description, str) and description.strip():
+            target.append(description.strip())
+            if target_meta is not None:
+                target_meta.append((role, parent, p, s))
+
+
+def _merge_static_runs(parts: list[str], meta: list[tuple]) -> list[str]:
+    """Join adjacent static text nodes that form one visual line."""
+    out: list[str] = []
+    prior = None
+    for value, current in zip(parts, meta, strict=True):
+        role, parent, point, size = current
+        if prior is not None and role == prior[0] == "AXStaticText" and "\n" not in value and "\n" not in out[-1]:
+            old_point, old_size = prior[2], prior[3]
+            same_line = point is not None and old_point is not None and abs(point[1] - old_point[1]) <= 4
+            if same_line:
+                adjacent = point[0] >= old_point[0] and (old_size is None or point[0] <= old_point[0] + old_size[0] + 30)
+            else:
+                adjacent = point is None or old_point is None
+            if (same_line and adjacent) or (parent is prior[1] and adjacent):
+                out[-1] = f"{out[-1]} {value}"
+                prior = current
+                continue
+        out.append(value)
+        prior = current
+    return out
 
 
 def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: int,
@@ -263,11 +347,15 @@ def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: in
             if p is not None and s is not None and any(abs(a - b) > 2 for a, b in zip((*p, *s), viewport, strict=True)):
                 return ""  # another window of the same app gained focus; trust captured pixels
         parts: list[str] = []
+        deferred: list[str] = []
+        meta: list[tuple] = []
+        deferred_meta: list[tuple] = []
         deadline = time.monotonic() + timeout_ms / 1000.0
-        _walk_text(win, parts, depth=0, max_nodes=max_nodes, deadline=deadline, seen=[0], viewport=viewport)
+        _walk_text(win, parts, depth=0, max_nodes=max_nodes, deadline=deadline, seen=[0],
+                   viewport=viewport, deferred=deferred, meta=meta, deferred_meta=deferred_meta)
         # Adjacent duplicates are common (title + value of one element).
         out: list[str] = []
-        for p in parts:
+        for p in (*_merge_static_runs(parts, meta), *_merge_static_runs(deferred, deferred_meta)):
             if not out or out[-1] != p:
                 out.append(p)
         return "\n".join(out)[:max_chars]

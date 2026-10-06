@@ -184,6 +184,11 @@ class ScreenObserver:
                 ctx = await asyncio.to_thread(ax.window_context)
                 img = await asyncio.to_thread(self.grabber.grab, ctx.bounds, max_width=T.FRAME_MAX_WIDTH, window_id=ctx.window_id)
                 if img is not None:
+                    # Only the newest frame keeps its native-resolution copy for OCR (a 5K
+                    # window is ~44 MB): an older one, used by a rotated capture, is OCR'd at
+                    # storage resolution.
+                    if self._latest is not None:
+                        self._latest[0].info.pop("_ocr_native", None)
                     self._latest = (img, ctx)
                     self._recent.append((img, ctx))
                     if not self._warned_blank and is_blank(img):
@@ -348,10 +353,11 @@ class ScreenObserver:
             max_chars=T.SCREEN_TEXT_MAX_CHARS, viewport=ctx.bounds)
         # A long AX tree can still be only chrome while the document is a scanned page
         # or a canvas, so its length cannot establish coverage: OCR every frame
-        # (~0.2-0.3 s, off the event loop). Only OCR lines that AX lacks are kept, and
+        # (off the event loop). Only OCR lines that AX lacks are kept, and
         # they go first so a long chrome tree cannot truncate them away; on an ordinary
         # page that is a few lines, and the exact AX text follows.
-        ocr_lines = _novel_lines(ocr.ocr_image(after), text)
+        native = after.info.get("_ocr_native", after) if after is not None else None
+        ocr_lines = _novel_lines(ocr.ocr_image(native), text)
         if not ocr_lines:
             return tk.truncate(text, T.SCREEN_TEXT_MAX_CHARS), "ax" if text else ""
         merged = "\n".join(ocr_lines + ([text] if text else []))

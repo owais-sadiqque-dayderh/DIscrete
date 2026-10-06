@@ -80,7 +80,7 @@ class FrameGrabber:
             log.debug("grab failed: %s", exc)
             return None
         img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-        return downscale(img, max_width)
+        return _storage_frame(img, max_width)
 
     def _grab_window(self, window_id: int, max_width: int) -> Image.Image | None:
         """Window-isolated ScreenCaptureKit capture, including occluded window content.
@@ -113,7 +113,9 @@ class FrameGrabber:
             filt = sc.SCContentFilter.alloc().initWithDesktopIndependentWindow_(win)
             cfg = sc.SCStreamConfiguration.alloc().init()
             frame = win.frame()
-            width = max(1, min(max_width, int(frame.size.width * 2)))
+            # ScreenCaptureKit takes pixel dimensions here. Keep the backing-scale
+            # image for OCR; the returned frame is still capped for storage/VLM.
+            width = max(1, int(frame.size.width * 2))
             cfg.setWidth_(width)
             cfg.setHeight_(max(1, int(width * frame.size.height / max(1, frame.size.width))))
             cfg.setShowsCursor_(False)
@@ -134,7 +136,7 @@ class FrameGrabber:
             if not shot_ready.wait(2) or not result:
                 return None
             with Image.open(io.BytesIO(result[0])) as im:
-                return im.convert("RGB")
+                return _storage_frame(im.convert("RGB"), max_width)
         except Exception as exc:
             log.debug("window capture failed: %s", exc)
             return None
@@ -145,6 +147,17 @@ def downscale(img: Image.Image, max_width: int) -> Image.Image:
         return img
     h = max(1, int(img.height * max_width / img.width))
     return img.resize((max_width, h), Image.Resampling.BILINEAR)
+
+
+def _storage_frame(native: Image.Image, max_width: int) -> Image.Image:
+    # OCR gains little past ~2x the storage width, and memory is bounded.
+    native = downscale(native, max_width * 2)
+    frame = downscale(native, max_width)
+    if frame is not native:
+        # In-memory only: Image.save() writes the downsized pixels, while
+        # _screen_text can still OCR the lossless capture before it is released.
+        frame.info["_ocr_native"] = native
+    return frame
 
 
 def is_blank(img: Image.Image | None) -> bool:
