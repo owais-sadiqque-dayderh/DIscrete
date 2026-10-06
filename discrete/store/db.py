@@ -332,6 +332,54 @@ def m006_unsegmented_index(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX ix_obs_unsegmented ON observations(id) WHERE origin='user' AND episode_id IS NULL")
 
 
+def m007_memory_evolution(conn: sqlite3.Connection) -> None:
+    """The change log (store/history.py), typed links between memories (causal trails
+    and the graph, store/links.py) and suppressions for forgotten claims."""
+    conn.execute("""CREATE TABLE memory_events(
+      id INTEGER PRIMARY KEY,
+      at REAL NOT NULL,
+      op TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      claim_id INTEGER,
+      created TEXT NOT NULL DEFAULT '[]',
+      changes TEXT NOT NULL DEFAULT '[]',
+      reason TEXT NOT NULL DEFAULT '',
+      run_id TEXT NOT NULL DEFAULT '',
+      data TEXT NOT NULL DEFAULT '{}',
+      undone_by INTEGER)""")
+    conn.execute("CREATE INDEX ix_events_at ON memory_events(at)")
+    conn.execute("""CREATE TABLE memory_event_refs(
+      event_id INTEGER NOT NULL REFERENCES memory_events(id) ON DELETE CASCADE,
+      claim_id INTEGER NOT NULL,
+      PRIMARY KEY (event_id, claim_id))""")
+    conn.execute("CREATE INDEX ix_event_refs_claim ON memory_event_refs(claim_id)")
+    conn.execute("""CREATE TABLE links(
+      id INTEGER PRIMARY KEY,
+      src_kind TEXT NOT NULL,
+      src_id INTEGER NOT NULL,
+      dst_kind TEXT NOT NULL,
+      dst_id INTEGER NOT NULL,
+      relation TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0,
+      reason TEXT NOT NULL DEFAULT '',
+      evidence TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'live',
+      created_at REAL NOT NULL,
+      UNIQUE (src_kind, src_id, dst_kind, dst_id, relation))""")
+    conn.execute("CREATE INDEX ix_links_dst ON links(dst_kind, dst_id, relation)")
+    conn.execute("CREATE INDEX ix_links_src ON links(src_kind, src_id, relation)")
+    conn.execute("""CREATE TABLE suppressions(
+      id INTEGER PRIMARY KEY,
+      kind TEXT NOT NULL,
+      text TEXT NOT NULL,
+      norm_key TEXT NOT NULL,
+      vector BLOB,
+      claim_id INTEGER,
+      event_id INTEGER,
+      created_at REAL NOT NULL)""")
+    conn.execute("CREATE INDEX ix_suppressions_key ON suppressions(norm_key)")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_base,
     m002_draft_attempts_and_digest_counts,
@@ -339,6 +387,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m004_minhash_raw_bytes,
     m005_perf_log,
     m006_unsegmented_index,
+    m007_memory_evolution,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

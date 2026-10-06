@@ -13,7 +13,8 @@ from ..confidence import compute_confidence, modality_of
 from ..config import T
 from ..models import ClaimDraft
 from ..timeutil import day_key, now
-from .base import StoreBase, rowid
+from .base import rowid
+from .history import HistoryMixin
 
 # (vector, text_hash) of the claim's embedding text, when the caller already has it.
 Vector = tuple[Sequence[float], str]
@@ -23,7 +24,7 @@ def _ph(ids: Sequence) -> str:
     return ",".join("?" * len(ids))
 
 
-class ClaimsMixin(StoreBase):
+class ClaimsMixin(HistoryMixin):
     def _recompute_confidence(self, conn, claim_id: int) -> float:
         """planS2 §8: per distinct supporting episode, its best evidence modality."""
         row = conn.execute("SELECT modality FROM claims WHERE id=?", (claim_id,)).fetchone()
@@ -97,11 +98,14 @@ class ClaimsMixin(StoreBase):
         return cid
 
     async def create_claim(self, draft: ClaimDraft, *, refines_id: int | None = None,
-                           invalidates_id: int | None = None, vector: Vector | None = None) -> int:
+                           invalidates_id: int | None = None, vector: Vector | None = None,
+                           actor: str = "user", reason: str = "") -> int:
         def _create():
             with self._tx() as conn:
-                return self._insert_claim(conn, draft, lineage_id=str(uuid4()), version=1,
-                                          refines_id=refines_id, invalidates_id=invalidates_id, vector=vector)
+                cid = self._insert_claim(conn, draft, lineage_id=str(uuid4()), version=1,
+                                         refines_id=refines_id, invalidates_id=invalidates_id, vector=vector)
+                self._log_event(conn, "add", actor, claim_id=cid, created=[cid], reason=reason or draft.reasoning)
+                return cid
 
         return await self._call(_create)
 
@@ -126,20 +130,26 @@ class ClaimsMixin(StoreBase):
             out.setdefault(r[0], r[1])
         return out
 
-    def _reinforce_claim(self, conn, claim_id: int, draft: ClaimDraft) -> float:
-        """REINFORCE: add verified evidence, extend occurred_to; text untouched (planS2 §6.2)."""
+    def _reinforce_claim(self, conn, claim_id: int, draft: ClaimDraft) -> dict:
+        """REINFORCE: add verified evidence, extend occurred_to; text untouched (planS2 §6.2).
+        Returns the change for the event log: the observations newly linked."""
+        had = {r[0] for r in conn.execute("SELECT observation_id FROM evidence WHERE claim_id=?", (claim_id,))}
         for ev in draft.evidence:
             self._link(conn, claim_id, int(ev["observation_id"]), "supports", str(ev.get("quote") or ""))
         conn.execute("UPDATE claims SET occurred_to=MAX(occurred_to, ?), updated_at=? WHERE id=?",
                      (draft.occurred_to, now(), claim_id))
         self._cap_evidence(conn, claim_id)
-        return self._recompute_confidence(conn, claim_id)
+        self._recompute_confidence(conn, claim_id)
+        now_has = {r[0] for r in conn.execute("SELECT observation_id FROM evidence WHERE claim_id=?", (claim_id,))}
+        return {"id": claim_id, "evidence_added": sorted(now_has - had)}
 
-    def _invalidate_claim(self, conn, claim_id: int, *, by_id: int, at: float) -> None:
-        conn.execute("UPDATE claims SET status='invalidated', valid_to=?, updated_at=? WHERE id=? AND status='live'",
-                     (at, now(), claim_id))
+    def _recompute_after_revert(self, conn, claim_id: int) -> None:
+        self._recompute_confidence(conn, claim_id)
+
+    def _invalidate_claim(self, conn, claim_id: int, *, by_id: int, at: float) -> dict | None:
+        change = self._set_state(conn, claim_id, only_if_live=True, status="invalidated", valid_to=at)
         conn.execute("UPDATE claims SET invalidates_id=? WHERE id=?", (claim_id, by_id))
-        self._drop_vector(conn, "claim", claim_id)
+        return change
 
     async def live_claims(self, *, kind: str | None = None, limit: int | None = None) -> list[sqlite3.Row]:
         sql, args = "SELECT * FROM claims WHERE status='live'", []
@@ -169,7 +179,8 @@ class ClaimsMixin(StoreBase):
             "SELECT * FROM evidence WHERE claim_id=? ORDER BY relation='supports' DESC, created_at", (claim_id,)
         )
 
-    async def consolidate_cluster(self, cluster: list[sqlite3.Row], outputs: list[dict]) -> list[int]:
+    async def consolidate_cluster(self, cluster: list[sqlite3.Row], outputs: list[dict], *,
+                                  run_id: str = "") -> list[int]:
         """planS2 §7.1: N inputs → a bounded set. Each output inherits evidence only
         from the inputs it derives from; inputs no output uses stay live."""
         cluster_ids = {r["id"] for r in cluster}
@@ -211,12 +222,12 @@ class ClaimsMixin(StoreBase):
                     for i in inputs:
                         replaced.setdefault(i, nid)
                 ts = now()
-                for old, nid in replaced.items():
-                    conn.execute(
-                        "UPDATE claims SET status='superseded', valid_to=?, superseded_by=?, updated_at=? WHERE id=?",
-                        (ts, nid, ts, old),
-                    )
-                    self._drop_vector(conn, "claim", old)
+                changes = [self._set_state(conn, old, status="superseded", valid_to=ts, superseded_by=nid)
+                           for old, nid in replaced.items()]
+                if new_ids:
+                    self._log_event(conn, "merge", "consolidate", claim_id=new_ids[0], created=new_ids,
+                                    changes=changes, run_id=run_id,
+                                    reason=f"merged {len(replaced)} overlapping claims into {len(new_ids)}")
             return new_ids
 
         return await self._call(_run)
@@ -244,11 +255,9 @@ class ClaimsMixin(StoreBase):
                 ).fetchall()
                 ts = now()
                 for (cid,) in rows:
-                    conn.execute(
-                        "UPDATE claims SET status='superseded', valid_to=?, flag='unsupported', updated_at=? WHERE id=?",
-                        (ts, ts, cid),
-                    )
-                    self._drop_vector(conn, "claim", cid)
+                    change = self._set_state(conn, cid, status="superseded", valid_to=ts, flag="unsupported")
+                    self._log_event(conn, "expire", "cleanup", claim_id=cid, changes=[change],
+                                    reason=f"no supporting evidence after {ttl_days:g} days")
                 return len(rows)
 
         return await self._call(_run)

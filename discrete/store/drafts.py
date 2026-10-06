@@ -34,21 +34,30 @@ class DraftsMixin(ClaimsMixin):
                 ops = []
                 for w in writes:
                     cd = w.draft
+                    why = f"episode {episode_id}"
                     if w.operation == "reinforced":
                         assert w.target_id is not None
                         cid = w.target_id
-                        self._reinforce_claim(conn, cid, cd)
+                        change = self._reinforce_claim(conn, cid, cd)
+                        self._log_event(conn, "reinforce", "draft", claim_id=cid, changes=[change],
+                                        reason=f"seen again in {why}")
                     else:
                         vector = (w.vector, w.text_hash) if w.vector is not None else None
                         cid = self._insert_claim(conn, cd, lineage_id=str(uuid4()), version=1,
                                                  refines_id=w.refines_id,
                                                  invalidates_id=w.target_id if w.operation == "invalidated" else None,
                                                  vector=vector)
+                        changes = []
+                        op = "refine" if w.refines_id is not None else "add"
                         if w.operation == "invalidated":
                             assert w.target_id is not None
-                            self._invalidate_claim(conn, w.target_id, by_id=cid, at=cd.occurred_from)
+                            changes.append(self._invalidate_claim(conn, w.target_id, by_id=cid, at=cd.occurred_from))
+                            op, why = "invalidate", f"contradicted by newer evidence in {why}"
                         if w.contested_id is not None:
-                            conn.execute("UPDATE claims SET flag='contested' WHERE id IN (?,?)", (cid, w.contested_id))
+                            changes.append(self._set_state(conn, w.contested_id, flag="contested"))
+                            conn.execute("UPDATE claims SET flag='contested' WHERE id=?", (cid,))
+                            op, why = "contest", f"passive evidence in {why} disagrees with an engaged claim"
+                        self._log_event(conn, op, "draft", claim_id=cid, created=[cid], changes=changes, reason=why)
                     for eid in w.mentions:
                         conn.execute("INSERT OR IGNORE INTO mentions(entity_id, ref_kind, ref_id, created_at) "
                                      "VALUES (?, 'claim', ?, ?)", (eid, cid, now()))

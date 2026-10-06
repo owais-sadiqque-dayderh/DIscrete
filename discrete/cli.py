@@ -303,6 +303,95 @@ async def cmd_answer(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------ memory history
+
+
+def _since(text: str) -> float:
+    """'90m', '6h', '2d' → a timestamp; '' or 'all' → 0."""
+    text = (text or "").strip().lower()
+    if not text or text == "all":
+        return 0.0
+    unit = {"m": 60, "h": 3600, "d": 86400}.get(text[-1])
+    if unit is None or not text[:-1].replace(".", "", 1).isdigit():
+        raise SystemExit(f"--since: use 90m, 6h or 2d, not {text!r}")
+    return time.time() - float(text[:-1]) * unit
+
+
+def _event_line(e) -> str:
+    created = json.loads(e["created"])
+    changes = json.loads(e["changes"])
+    touched = ", ".join(
+        [f"+#{c}" for c in created]
+        + [f"#{c['id']} {c['before'].get('status', '')}→{c['after'].get('status', '')}".rstrip("→")
+           if c.get("before") else f"#{c['id']} +{len(c.get('evidence_added', []))} evidence" for c in changes])
+    undone = f"  (reverted by #{e['undone_by']})" if e["undone_by"] else ""
+    when = time.strftime("%b %d %H:%M", time.localtime(e["at"]))
+    return f"#{e['id']:<5} {when}  {e['actor']:<11} {e['op']:<10} {touched}  — {e['reason']}{undone}"
+
+
+async def cmd_history(args) -> int:
+    async with _session() as store:
+        versions = await store.lineage(args.claim_id)
+        if not versions:
+            _err(f"no claim {args.claim_id}")
+            return 1
+        _print("Versions:")
+        for c in versions:
+            mark = "→" if c["id"] == args.claim_id else " "
+            _print(f" {mark} #{c['id']} v{c['version']} [{c['kind']} · {c['modality']} · {c['status']}"
+                   f"{' · ' + c['flag'] if c['flag'] else ''}] {c['text']}")
+        _print("\nChanges:")
+        for e in await store.events_for_claim(args.claim_id):
+            _print("  " + _event_line(e))
+    return 0
+
+
+async def cmd_changes(args) -> int:
+    async with _session() as store:
+        rows = await store.recent_events(since=_since(args.since), actor=args.actor, op=args.op, limit=args.n)
+        for e in reversed(rows):
+            _print(_event_line(e))
+        if not rows:
+            _print("(no changes)")
+    return 0
+
+
+async def cmd_revert(args) -> int:
+    from .store import RevertConflict
+
+    async with _session() as store:
+        try:
+            rid = await store.revert_event(args.event_id, force=args.force)
+        except (KeyError, RevertConflict) as exc:
+            _err(str(exc).strip("'\""))
+            return 1
+        _print(_event_line(await store.get_event(rid)))
+    return 0
+
+
+async def cmd_forget(args) -> int:
+    async with _session() as store:
+        try:
+            eid = await store.forget_claim(args.claim_id, reason=args.reason)
+        except KeyError as exc:
+            _err(str(exc).strip("'\""))
+            return 1
+        _print(_event_line(await store.get_event(eid)))
+        _print(f"undo with: discrete revert {eid}")
+    return 0
+
+
+async def cmd_correct(args) -> int:
+    async with _session() as store:
+        try:
+            nid, eid = await store.correct_claim(args.claim_id, args.text, reason=args.reason)
+        except KeyError as exc:
+            _err(str(exc).strip("'\""))
+            return 1
+        _print(_event_line(await store.get_event(eid)))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="discrete")
     p.add_argument("--db", help="store path (default: $DISCRETE_DATA_DIR/discrete.db)")
@@ -372,6 +461,33 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("gap_id", type=int)
     pa.add_argument("text")
     pa.set_defaults(func=cmd_answer)
+
+    ph = sub.add_parser("history", help="every version of a memory and every change to it, with reasons")
+    ph.add_argument("claim_id", type=int)
+    ph.set_defaults(func=cmd_history)
+
+    pc = sub.add_parser("changes", help="the memory change log: what changed, who changed it, why")
+    pc.add_argument("--since", default="all", help="90m / 6h / 2d (default: all)")
+    pc.add_argument("--actor", default="", help="draft | consolidate | dream | cleanup | user")
+    pc.add_argument("--op", default="", help="add | reinforce | invalidate | merge | dream_add | forget | …")
+    pc.add_argument("-n", type=int, default=50)
+    pc.set_defaults(func=cmd_changes)
+
+    pr = sub.add_parser("revert", help="undo one change from the change log (a revert can itself be reverted)")
+    pr.add_argument("event_id", type=int)
+    pr.add_argument("--force", action="store_true", help="even if later changes touched the same memories")
+    pr.set_defaults(func=cmd_revert)
+
+    pf = sub.add_parser("forget", help="forget a memory and never re-learn it")
+    pf.add_argument("claim_id", type=int)
+    pf.add_argument("--reason", default="")
+    pf.set_defaults(func=cmd_forget)
+
+    pco = sub.add_parser("correct", help="replace a memory's wording with yours (kept as a stated fact)")
+    pco.add_argument("claim_id", type=int)
+    pco.add_argument("text")
+    pco.add_argument("--reason", default="")
+    pco.set_defaults(func=cmd_correct)
     return p
 
 

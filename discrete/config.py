@@ -344,6 +344,9 @@ class T:
     FACT_HALF_LIFE_DAYS = _typed("FACT_HALF_LIFE_DAYS", 180.0)
     PREF_HALF_LIFE_DAYS = _typed("PREF_HALF_LIFE_DAYS", 90.0)
     EVIDENCE_MAX_SUPPORTS = _typed("EVIDENCE_MAX_SUPPORTS", 12)
+    # A forgotten claim is not re-learned: new drafts this close to it are dropped.
+    SUPPRESS_SIM = _typed("SUPPRESS_SIM", 0.90)
+    SUPPRESS_JACCARD = _typed("SUPPRESS_JACCARD", 0.8)
     ENTITY_MIN_EPISODES = _typed("ENTITY_MIN_EPISODES", 2)
     FUZZY_AUTO = _typed("FUZZY_AUTO", 96.0)
     FUZZY_ADJUDICATE = _typed("FUZZY_ADJUDICATE", 88.0)

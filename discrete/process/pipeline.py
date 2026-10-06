@@ -120,6 +120,13 @@ class ProcessPipeline:
             counts[bucket] += 1
             drafts.append(cd)
         drafts = await self._verify(drafts, by_id, outcome)
+        kept = []
+        for cd in drafts:
+            if await self.store.suppressed(cd.kind, cd.text):
+                outcome.reject("forgotten")  # the user told us to forget this one
+            else:
+                kept.append(cd)
+        drafts = kept
         writes = [ClaimWrite(cd) for cd in drafts if cd.kind == "event"]
         durables = [_Durable(cd=cd, text=claim_text(cd.text, cd.context)) for cd in drafts if cd.kind != "event"]
         writes += await self._merge(durables)
@@ -244,9 +251,14 @@ class ProcessPipeline:
             vecs = await embed([d.text for d in durables])
         except (NotConfigured, *EXPECTED_ERRORS):
             vecs = [None] * len(durables)
+        kept = []
         for d, v in zip(durables, vecs, strict=True):
             d.vec = v
+            if v is not None and await self.store.suppressed(d.cd.kind, d.cd.text, v):
+                continue  # close to a forgotten claim: not re-learned
             d.candidates = await self._candidates(d)
+            kept.append(d)
+        durables = kept
         await self._relate(durables)
         return [self._operation(d) for d in durables]
 
