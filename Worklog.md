@@ -264,6 +264,18 @@ This audit shows where each proposed feature starts from. Code paths are relativ
 - **Delegated now** (Codex GPT-6-Sol, separate files, uncommitted until reviewed):
   - audit #4 (clean AX at the source, visible-only text) + #7 (OCR at native resolution) → `capture/*.py`;
   - audit #10 (deterministic action and choice detectors) → `process/actions.py`.
+- **Also done in Phase 5:**
+  - audit #6: chrome-free text for the drafter and caption model; `DRAFT_TEXT_CHARS_PER_OBS` 1200 → 2000;
+  - audit #11: the caption prompt separates a page from embedded media and names brands and apps inside media;
+  - audit #9: **sightings**, migration 8. Every sighting is recorded, duplicates included. Attention = dwell until
+    the next sighting (capped at 180 s); active = input. `discrete attention`, time questions get a totals record,
+    and dreaming and the profile read it as context;
+  - audit #5: **evidence provenance**, migration 9 (`evidence.field`); the drafter prefers screen-text quotes;
+  - tests for the episode cap and chunked drafting.
+  - Suite: 204 tests (including delegated agents' uncommitted tests), ruff clean.
+- **Rebuilds running** (started at `28af5f4`, before the chrome/caption/attention/provenance changes, so they are
+  intermediate checks): `g46/branch.db`, `g46/branch-geminiverify.db`, `live1006/branch.db`, `live1006/base.db`
+  (main). The final branch rebuild comes after the action detectors are wired in.
 - **Next (me):**
   - audit #6 (filter chrome before the drafter and the caption);
   - #11 (caption prompt: separate the page from embedded media, name brands in media);
