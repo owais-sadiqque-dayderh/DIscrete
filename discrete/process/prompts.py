@@ -18,7 +18,7 @@ Return strict JSON:
       "text": "<string, one proposition about the user, at most 240 chars>",
       "context": "<string: when or where it applies, may be empty>",
       "entities": ["<proper noun the claim is about>"],
-      "action": "<for a completed action event, its verb (downloaded, installed, purchased, booked, sent, posted, created, saved, exported, signed up, submitted, subscribed, deleted, shared); otherwise empty>",
+      "action": "<for a completed action event, its verb (downloaded, installed, purchased, booked, sent, posted, created, saved, exported, signed up, submitted, subscribed, deleted, shared, chose); otherwise empty>",
       "evidence": [{{"observation_id": <int>, "quote": "<verbatim substring of that observation>"}}]
     }}
   ]
@@ -31,6 +31,11 @@ Rules:
   with "action" set, only when the screen visibly confirms it happened (a download page
   saying thank you, the file in Downloads, an installer or setup screen, a sent message,
   a confirmation). Name the exact thing (app, file, recipient, item).
+- A choice among visible alternatives (a search engine, a default app, a plan, a setting) that
+  the screen shows as selected is an event with action "chose": "the user chose DuckDuckGo as
+  Helium's search engine". Choices reveal preferences; never infer one from a page merely shown.
+- A "Detected on screen" list may follow the observations: leads from simple rules. Use one
+  only if the cited observation really shows it, with your own quote; ignore the rest.
 - Besides actions: at most {max_events} other event claims and at most {max_durable}
   fact/preference claims.
 - event = something the user did or viewed at this time ("the user compared three

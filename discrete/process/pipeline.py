@@ -12,6 +12,7 @@ from ..models import ClaimDraft, ClaimWrite
 from ..perf import PERF
 from ..store import DraftConflict, Store
 from ..timeutil import to_local
+from .actions import detect, hints
 from .embed_worker import claim_text
 from .entities import promotable, resolve_existing, structural_candidates
 from .prompts import DRAFT_EPISODE_PROMPT, RELATE_BLOCK, RELATE_PROMPT
@@ -50,7 +51,7 @@ class _Durable:
 ACTION_VERBS = frozenset(
     "downloaded installed uninstalled purchased bought ordered booked paid sent posted replied published created "
     "saved exported uploaded signed_up registered submitted subscribed unsubscribed deleted shared "
-    "scheduled accepted declined merged committed pushed deployed".split())
+    "scheduled accepted declined merged committed pushed deployed chose".split())
 
 
 def action_verb(item: dict) -> str:
@@ -223,6 +224,10 @@ class ProcessPipeline:
         prompt = DRAFT_EPISODE_PROMPT.format(
             observations="\n\n".join(blocks), max_events=max_events(span_min), max_durable=T.DRAFT_MAX_DURABLE
         )
+        # Deterministic detectors (process/actions.py) point the drafter at completed
+        # actions and choices it might skim past; it still has to quote and cite them.
+        if found := hints(detect(list(rows))):
+            prompt += f"\n{found}\n"
         data = await complete_json(self.ep, [{"role": "user", "content": prompt}], max_tokens=2500)
         if not isinstance(data, dict):
             raise LLMError("draft: not an object")
