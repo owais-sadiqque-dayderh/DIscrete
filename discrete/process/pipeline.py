@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 
 from .. import textkit as tk
@@ -92,6 +93,42 @@ def _relate_line(text: str, context: str, seen_from: float, seen_to: float) -> s
     if f"{to_local(seen_to):%Y-%m-%d %H:%M}" != seen:
         seen += f" to {to_local(seen_to):%Y-%m-%d %H:%M}"
     return f"{text} | context: {json.dumps(context or '', ensure_ascii=False)} | seen: {seen}"
+
+
+def _thing_tokens(text: str) -> set[str]:
+    """What an action is about: its words minus "the user", the verb and filler."""
+    return {t for t in tk.content_tokens(text, min_len=3) if t not in ACTION_VERBS and t not in ("user", "users")}
+
+
+_ARG = re.compile(r"[\w@$€£%.:/+-]+")
+
+
+def _arguments(text: str) -> set[str]:
+    """The parts that pin an action to one occurrence: names, numbers, handles, files, URLs."""
+    out = set()
+    for i, raw in enumerate(_ARG.findall(text)):
+        tok = raw.strip(".,:;").lower()
+        if not tok or tok in ("the", "user", "a", "an", "i"):
+            continue
+        if any(c.isdigit() for c in tok) or any(c in tok for c in "@$€£%/:") or "." in tok or (i and raw[0].isupper()):
+            out.add(tok)
+    return out
+
+
+def same_action(a: str, b: str) -> bool:
+    """Two wordings of one action: enough shared words, and no argument that disagrees.
+
+    One side naming something the other doesn't mention is a refinement ("Helium" vs
+    "Helium.dmg"); both sides naming different things ("to Alice" vs "to Bob", "$40" vs
+    "$45") are two actions, however similar the rest reads.
+    """
+    mine, theirs = _thing_tokens(a), _thing_tokens(b)
+    if not mine or not theirs or len(mine & theirs) / len(mine | theirs) < T.ACTION_DEDUP_JACCARD:
+        return False
+    la, lb = a.lower(), b.lower()
+    only_a = {t for t in _arguments(a) if t not in lb}
+    only_b = {t for t in _arguments(b) if t not in la}
+    return not (only_a and only_b)
 
 
 def max_events(span_min: float) -> int:
@@ -281,22 +318,21 @@ class ProcessPipeline:
         return out
 
     async def _action_write(self, cd: ClaimDraft) -> ClaimWrite:
-        """Reinforce only an identical proposition citing the same occurrence.
+        """An action already remembered (the same verb on the same thing, close in time:
+        a download page and then the file in Finder, or two episodes cut from one task)
+        reinforces the earlier claim instead of adding a duplicate. Different arguments
+        (another recipient, amount or file) are a different event; see same_action().
 
-        Until actions have structured argument/confirmation IDs, similarity cannot
-        establish identity: a different recipient or a repeated send is a new event.
-        """
-        if not cd.action or not cd.evidence:
+        Without structured occurrence IDs, an identical repeat inside the window (the same
+        report sent to the same person twice) still reads as one action: re-observing an
+        action is far more common than repeating it verbatim within hours."""
+        if not cd.action:
             return ClaimWrite(cd)
-        own = {e["observation_id"] for e in cd.evidence}
         for row in await self.store.q(
                 "SELECT id, text FROM claims WHERE status='live' AND kind='event' AND action=? "
                 "AND occurred_from BETWEEN ? AND ?",
                 (cd.action, cd.occurred_from - T.ACTION_DEDUP_WINDOW_S, cd.occurred_to + T.ACTION_DEDUP_WINDOW_S)):
-            if tk.norm_key(cd.text) != tk.norm_key(row["text"]):
-                continue
-            evidence = await self.store.evidence_for_claim(row["id"])
-            if own & {e["observation_id"] for e in evidence}:
+            if same_action(cd.text, row["text"]):
                 return ClaimWrite(cd, operation="reinforced", target_id=row["id"])
         return ClaimWrite(cd)
 

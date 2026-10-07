@@ -633,7 +633,7 @@ async def test_evidence_records_where_the_quote_was_found(store, fake):
     assert fields == {o1: "screen_text", o2: "caption"}
 
 
-async def test_similar_actions_without_occurrence_identity_stay_separate(store, fake):
+async def test_the_same_action_twice_reinforces_instead_of_duplicating(store, fake):
     eid, (o1, o2) = await _one_episode(store, ["Thank you for downloading Helium", "helium_0.18.dmg in Downloads"])
     fake.draft = {"title": "t", "summary": "s", "claims": [
         {"kind": "event", "text": "The user downloaded the Helium browser", "action": "downloaded",
@@ -644,5 +644,5 @@ async def test_similar_actions_without_occurrence_identity_stay_separate(store, 
         {"kind": "event", "text": "The user downloaded Helium browser installer", "action": "downloaded",
          "evidence": [{"observation_id": o3, "quote": "Helium browser download finished"}]}]}
     out = await ProcessPipeline(store).draft_episode(eid2)
-    assert out.reinforced == 0 and out.added == 1
-    assert len([c for c in await store.live_claims() if c["action"] == "downloaded"]) == 2
+    assert out.reinforced == 1 and out.added == 0
+    assert len([c for c in await store.live_claims() if c["action"] == "downloaded"]) == 1
