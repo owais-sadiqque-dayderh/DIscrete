@@ -136,7 +136,6 @@ class EpisodeTracker:
             if vectors:
                 c = np.mean(vectors, axis=0)
                 self.state.centroid = c / max(float(np.linalg.norm(c)), 1e-9)
-            self.state.pair = pair_of(row)
         await self.store.mark_episode_ready(old)
         closed = [old]
         if self.state.n >= T.EPISODE_MAX_OBS or self.state.last_obs_at - self.state.started_at >= T.EPISODE_MAX_S:

@@ -14,6 +14,21 @@ from ..timeutil import day_bounds, day_key, from_local, now
 from .base import StoreBase, rowid
 from .tasks import cosine
 
+# A split predecessor can wait briefly for its live successor to become ready.
+# A module constant keeps the hold independent of model/retry configuration.
+EPISODE_DRAFT_GRACE_S = 30.0
+_WAITING_SUCCESSOR = """
+    e.draft_attempts=0 AND COALESCE((SELECT CAST(value AS REAL) FROM meta
+      WHERE key='episode_ready_since:' || e.id), e.updated_at) > ?
+    AND NOT EXISTS (SELECT 1 FROM meta WHERE key='episode_boundary_locked:' || e.id)
+    AND EXISTS (
+      SELECT 1 FROM episodes successor WHERE successor.id=(
+        SELECT id FROM episodes WHERE status!='merged' AND (started_at,id)>(e.started_at,e.id)
+        ORDER BY started_at,id LIMIT 1)
+      AND successor.status='open' AND successor.session_id=e.session_id
+      AND successor.started_at-e.ended_at <= ?)
+"""
+
 
 @dataclass
 class _ObservationCentroid:
@@ -44,13 +59,20 @@ class EpisodesMixin(StoreBase):
 
     async def mark_episode_ready(self, episode_id: int) -> None:
         """Close an episode for drafting; its interval is its observations' span."""
-        await self.execute(
-            """UPDATE episodes SET status='ready', updated_at=?,
+        def _ready():
+            with self._tx() as conn:
+                ts = now()
+                cur = conn.execute(
+                    """UPDATE episodes SET status='ready', updated_at=?,
                  started_at=COALESCE((SELECT MIN(started_at) FROM observations WHERE episode_id=episodes.id), started_at),
                  ended_at=COALESCE((SELECT MAX(ended_at) FROM observations WHERE episode_id=episodes.id), ended_at)
                WHERE id=? AND status='open'""",
-            (now(), episode_id),
-        )
+                    (ts, episode_id),
+                )
+                if cur.rowcount:
+                    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
+                                 (f"episode_ready_since:{episode_id}", str(ts)))
+        await self._call(_ready)
 
     async def recover_open_episodes(self, *, older_than_s: float = 0.0) -> list[int]:
         """Open episodes whose tracker died with its process become ready."""
@@ -69,6 +91,9 @@ class EpisodesMixin(StoreBase):
         def _claim():
             with self._tx() as conn:
                 self._merge_ready_episode(conn, episode_id)
+                if conn.execute(f"SELECT 1 FROM episodes e WHERE e.id=? AND ({_WAITING_SUCCESSOR})",
+                                (episode_id, now() - EPISODE_DRAFT_GRACE_S, T.EPISODE_MERGE_GAP_S)).fetchone():
+                    return False
                 cur = conn.execute(
                     "UPDATE episodes SET status='drafting', draft_attempts=draft_attempts+1, updated_at=? "
                     "WHERE id=? AND status='ready'",
@@ -137,6 +162,13 @@ class EpisodesMixin(StoreBase):
                     continue
                 if cosine(own.vector, candidate.vector) < T.EPISODE_MERGE_SIM:
                     continue
+                # Merging updates updated_at, but must not restart the grace timer.
+                ready_since = conn.execute(
+                    "SELECT MIN(CAST(value AS REAL)) FROM meta WHERE key IN (?,?)",
+                    (f"episode_ready_since:{episode_id}", f"episode_ready_since:{other['id']}")).fetchone()[0]
+                conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
+                             (f"episode_ready_since:{episode_id}",
+                              str(ready_since if ready_since is not None else min(ep['updated_at'], other['updated_at']))))
                 conn.execute("UPDATE observations SET episode_id=? WHERE episode_id=?", (episode_id, other['id']))
                 conn.execute("UPDATE episodes SET started_at=?, ended_at=?, updated_at=? WHERE id=?",
                              (start, end, now(), episode_id))
@@ -207,7 +239,9 @@ class EpisodesMixin(StoreBase):
         await self._call(_close)
 
     async def episodes_ready_for_draft(self, *, limit: int = 5) -> list[sqlite3.Row]:
-        return await self.q("SELECT * FROM episodes WHERE status='ready' ORDER BY started_at, id LIMIT ?", (limit,))
+        return await self.q(f"SELECT e.* FROM episodes e WHERE e.status='ready' AND NOT ({_WAITING_SUCCESSOR}) "
+                            "ORDER BY e.started_at, e.id LIMIT ?",
+                            (now() - EPISODE_DRAFT_GRACE_S, T.EPISODE_MERGE_GAP_S, limit))
 
     async def reset_stuck_drafting(self) -> None:
         await self.execute("UPDATE episodes SET status='ready' WHERE status='drafting'")

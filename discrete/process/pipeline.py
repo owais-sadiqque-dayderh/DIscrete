@@ -27,6 +27,14 @@ log = logging.getLogger("discrete.process.pipeline")
 _KINDS = ("event", "fact", "preference")
 _RELATIONS = ("same", "refines", "contradicts", "unrelated")
 
+# Prompts cover the model input; these fields cover subsequent validation,
+# verification, modality/times, and capture-derived entity candidates. Capture
+# bookkeeping (dup_count, updated_at, etc.) must not discard successful calls.
+_DRAFT_ROW_FIELDS = (
+    "id", "started_at", "ended_at", "app", "site", "window_title", "screen_text",
+    "caption", "keys", "clicks", "clipboard", "entities", "text_source",
+)
+
 
 @dataclass
 class DraftOutcome:
@@ -134,13 +142,7 @@ class ProcessPipeline:
             await self.store.bump_metric("draft_window_dropped", len(dropped))
             raise DraftConflict("draft window omitted observations")
         chrome = await self._chrome(rows)
-        # Hash the entire observation snapshot, not just each chunk: an edit,
-        # append or reassignment invalidates all earlier results. Include the
-        # actual prompts so changes to filtering, chunking or draft caps do too.
-        input_hash = hashlib.sha256(json.dumps({
-            "observations": [dict(r) for r in rows],
-            "prompts": [self._draft_prompt(chunk, chrome) for chunk in chunks],
-        }, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        input_hash = self._draft_input_hash(rows, [self._draft_prompt(chunk, chrome) for chunk in chunks])
         cached = await self.store.draft_chunks(episode_id, input_hash)
         parts = []
         for index, chunk in enumerate(chunks):
@@ -260,6 +262,14 @@ class ProcessPipeline:
         if not isinstance(data, dict):
             raise LLMError("draft: not an object")
         return data
+
+    @staticmethod
+    def _draft_input_hash(rows, prompts: list[str]) -> str:
+        """Invalidate all chunks when meaningful input anywhere in the episode changes."""
+        return hashlib.sha256(json.dumps({
+            "observations": [{key: r[key] for key in _DRAFT_ROW_FIELDS} for r in rows],
+            "prompts": prompts,
+        }, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
     def _draft_prompt(self, rows, chrome: dict[tuple[str, str], set[str]] | None = None,
                       *, record_losses: bool = False) -> str:
@@ -424,7 +434,7 @@ class ProcessPipeline:
             w.operation, w.target_id = "reinforced", by_rel["same"][0]["id"]
         elif by_rel["contradicts"]:
             old = by_rel["contradicts"][0]
-            if cd.modality == "passive" and old["modality"] in ("engaged", "stated"):
+            if old["modality"] == "stated" or (cd.modality == "passive" and old["modality"] == "engaged"):
                 w.contested_id = old["id"]
             else:
                 w.operation, w.target_id = "invalidated", old["id"]

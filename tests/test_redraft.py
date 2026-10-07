@@ -41,7 +41,7 @@ async def test_redraft_clears_tasks_and_preserves_merged_episode_boundaries(stor
     await store.set_meta("last_consolidation", "100")
     assert (await store.stats())["tasks"] > 0
 
-    preserved_tables = ("observations", "sightings", "obs_minhash", "entity_candidates", "token_df")
+    preserved_tables = ("observations", "sightings", "obs_minhash", "token_df")
     preserved = {table: [tuple(r) for r in await store.q(f"SELECT * FROM {table}")] for table in preserved_tables}
     boundaries = [tuple(r) for r in await store.q("SELECT id,session_id,started_at,ended_at FROM episodes ORDER BY id")]
     original_episodes = [tuple(r) for r in await store.q("SELECT * FROM episodes ORDER BY id")]

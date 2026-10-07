@@ -200,7 +200,8 @@ async def expand_tasks(store: Store, result: RetrievalResult) -> None:
     if not anchors:
         return
     have = {(h.ref_kind, h.ref_id) for h in result.hits}
-    for ep in await store.task_siblings(anchors, limit=T.TASK_RETRIEVAL_SIBLINGS, interval=result.plan.interval):
+    for ep in await store.task_siblings(anchors, limit=T.TASK_RETRIEVAL_SIBLINGS, interval=result.plan.interval,
+                                       exclude_ids=[h.ref_id for h in result.hits if h.ref_kind == 'episode']):
         if ('episode', ep['id']) in have or not ep['summary']:
             continue
         h = Hit('episode', ep['id'], ep['title'] or 'episode', ep['summary'],

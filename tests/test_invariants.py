@@ -93,7 +93,9 @@ def test_quote_matches_normalized_text_in_any_single_field(gate_db, field):
     execute(conn, f"UPDATE observations SET {field}='Downloaded\n  CHATGPT.dmg'")
     assert checks(path)["grounded_evidence"].passed
     execute(conn, "INSERT INTO evidence VALUES (1,99,'invented')")
-    assert checks(path)["grounded_evidence"].passed
+    result = checks(path)["grounded_evidence"]
+    assert not result.passed
+    assert result.details["violations"] == [{"claim_id": 1, "observation_id": 99}]
 
 
 def test_quote_cannot_span_separate_fields(gate_db):

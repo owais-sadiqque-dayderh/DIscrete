@@ -219,20 +219,24 @@ def check_store(path: str | Path, *, expect: str | Path | None = None, slo: bool
                                               "observations": {"id", *TEXT_FIELDS}})
         self_cites = []
         ungrounded = []
+        bad_quotes = []
         for claim in claims:
             if "id" not in claim:
                 continue
-            authentic = False
+            authentic = bool(evidence[claim["id"]])
             for ev in evidence[claim["id"]]:
                 obs = by_id.get(ev["observation_id"])
                 if obs is None:
+                    authentic = False
+                    bad_quotes.append({"claim_id": claim["id"], "observation_id": ev["observation_id"]})
                     continue
                 if self_unavailable is None and obs["origin"] != "user":
                     self_cites.append({"claim_id": claim["id"], "observation_id": obs["id"], "origin": obs["origin"]})
                 if quote_unavailable is None:
                     quote = tk.norm_key(ev["quote"] or "")
-                    if quote and any(quote in tk.norm_key(obs.get(f) or "") for f in TEXT_FIELDS):
-                        authentic = True
+                    if not quote or not any(quote in tk.norm_key(obs.get(f) or "") for f in TEXT_FIELDS):
+                        authentic = False
+                        bad_quotes.append({"claim_id": claim["id"], "observation_id": obs["id"]})
             if not authentic:
                 ungrounded.append(claim["id"])
         meta = dict(conn.execute("SELECT key, value FROM meta")) if {"key", "value"} <= schema["meta"] else {}
@@ -241,7 +245,8 @@ def check_store(path: str | Path, *, expect: str | Path | None = None, slo: bool
                                                 "observations": {"id", "episode_id", "origin"},
                                                 "meta": {"key", "value"}})
         checks = [self_unavailable or CheckResult("no_self_evidence", not self_cites, {"violations": self_cites}),
-                  quote_unavailable or CheckResult("grounded_evidence", not ungrounded, {"claim_ids": ungrounded}),
+                  quote_unavailable or CheckResult("grounded_evidence", not ungrounded,
+                                                   {"claim_ids": ungrounded, "violations": bad_quotes}),
                   coverage_unavailable or _coverage(conn, meta)]
         # Capture caps changed between the golden sessions; an explicit YAML value
         # removes ambiguity. In its absence check both known historical boundaries.
