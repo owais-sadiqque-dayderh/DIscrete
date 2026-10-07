@@ -34,6 +34,16 @@ _LIVE = {
 }
 
 
+def embedding_text(kind: str, row) -> str:
+    """The text a row of this kind is embedded from. It lives here so that a late
+    completion can be checked against the row's current text when it is saved."""
+    if kind == "observation":
+        parts = (row["window_title"], row["page_title"], row["site"], row["caption"], row["screen_text"])
+        return tk.truncate("\n".join(p for p in parts if p), T.EMBED_TEXT_CHARS)
+    first, second = {"claim": ("text", "context"), "episode": ("title", "summary"), "entity": ("name", "summary")}[kind]
+    return tk.truncate(f"{row[first]}\n{row[second]}".strip(), T.EMBED_TEXT_CHARS)
+
+
 def fts_match(text: str) -> str:
     return tk.fts_query(tk.content_tokens(text) or tk.tokens(text))
 
@@ -112,17 +122,34 @@ class IndexMixin(StoreBase):
     async def outbox_discard(self, kind: str, rid: int) -> None:
         await self.execute("DELETE FROM index_outbox WHERE ref_kind=? AND ref_id=?", (kind, rid))
 
-    async def save_embeddings(self, items: Sequence[tuple[str, int, Sequence[float], str]]) -> None:
+    async def save_embeddings(self, items: Sequence[tuple[str, int, Sequence[float], str]], *,
+                              current: bool = False) -> int:
+        """Store vectors; returns how many were stored. With `current` (a remote call that
+        may return late) a vector is kept only while its row is live and still has the
+        embedded text: a stale completion neither replaces the vector of newer text nor
+        consumes its outbox entry, and a forgotten row stays unindexed."""
         def _save():
+            saved = []
             with self._tx() as conn:
                 for kind, rid, vec, th in items:
+                    if current and (have := self._current_text_hash(conn, kind, rid)) != th:
+                        if have is not None:
+                            self._enqueue(conn, kind, rid)  # the newer text still needs its vector
+                        continue
                     self._write_vector(conn, kind, rid, vec, th)
-                for kind, rid, _, _ in items:
+                    saved.append((kind, rid))
+                for kind, rid in saved:
                     if kind == "episode":
                         self._assign_episode_task(conn, rid)
+            return len(saved)
 
-        if items:
-            await self._call(_save)
+        return await self._call(_save) if items else 0
+
+    @staticmethod
+    def _current_text_hash(conn, kind: str, rid: int) -> str | None:
+        table, live = _LIVE[kind]
+        row = conn.execute(f"SELECT * FROM {table} WHERE id=? AND {live}", (rid,)).fetchone()
+        return tk.content_hash(embedding_text(kind, row)) if row else None
 
     async def get_vector(self, kind: str, rid: int, text_hash: str) -> np.ndarray | None:
         """The stored vector for exactly this text, if it is already embedded."""

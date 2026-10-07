@@ -56,7 +56,7 @@ class DraftsMixin(ClaimsMixin):
                         if w.contested_id is not None:
                             changes.append(self._set_state(conn, w.contested_id, flag="contested"))
                             conn.execute("UPDATE claims SET flag='contested' WHERE id=?", (cid,))
-                            op, why = "contest", f"passive evidence in {why} disagrees with an engaged claim"
+                            op, why = "contest", f"evidence in {why} disputes a claim it cannot supersede"
                         self._log_event(conn, op, "draft", claim_id=cid, created=[cid], changes=changes, reason=why)
                     for eid in w.mentions:
                         conn.execute("INSERT OR IGNORE INTO mentions(entity_id, ref_kind, ref_id, created_at) "

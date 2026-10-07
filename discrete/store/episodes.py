@@ -171,6 +171,12 @@ class EpisodesMixin(StoreBase):
             if not merged:
                 return
 
+    async def defer_draft(self, episode_id: int) -> None:
+        """Back to ready without spending an attempt: nothing was tried."""
+        await self.execute(
+            "UPDATE episodes SET status='ready', draft_attempts=MAX(0, draft_attempts-1), updated_at=? "
+            "WHERE id=? AND status='drafting'", (now(), episode_id))
+
     async def draft_failed(self, episode_id: int) -> None:
         await self.execute(
             "UPDATE episodes SET status=CASE WHEN draft_attempts>=? THEN 'failed' ELSE 'ready' END, updated_at=? "

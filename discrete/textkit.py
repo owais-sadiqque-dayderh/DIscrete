@@ -276,19 +276,27 @@ def site_from_url(url: str) -> str:
     return ""
 
 
+_CHROME_MAX_WORDS = 3
+
+
 def chrome_lines(texts: list[str], *, share: float, min_texts: int) -> set[str]:
-    """Normalized lines recurring in more than `share` of `texts` (captures of one app and
-    site): navigation, toolbars, trending lists. Fewer than `min_texts` captures say
-    nothing reliable, so then nothing is chrome. Recurrence also catches content that
-    stays on screen (a chat transcript); callers drop chrome only where a repeat adds
-    nothing (the drafter and the caption prompt), never from what is stored."""
+    """Normalized label-like lines recurring in more than `share` of `texts` (captures of
+    one app and site): navigation and toolbar labels. Fewer than `min_texts` captures say
+    nothing reliable, so then nothing is chrome. Recurrence alone is not chrome: content
+    that stays on screen (a chat transcript, a sentence, a total) is longer or
+    carries digits, so it stays. Callers drop chrome only where a repeat adds nothing
+    (the drafter and the caption prompt), never from what is stored."""
     if len(texts) < min_texts:
         return set()
     counts: dict[str, int] = {}
     for text in texts:
         for key in {norm_key(line) for line in (text or "").splitlines() if line.strip()}:
             counts[key] = counts.get(key, 0) + 1
-    return {k for k, n in counts.items() if n / len(texts) > share}
+    return {k for k, n in counts.items() if n / len(texts) > share and _label_like(k)}
+
+
+def _label_like(key: str) -> bool:
+    return len(key.split()) <= _CHROME_MAX_WORDS and not any(c.isdigit() for c in key)
 
 
 def without_lines(text: str, drop: set[str]) -> str:

@@ -182,7 +182,7 @@ def test_chrome_threshold_is_per_app_and_site(gate_db):
     path, conn = gate_db
     for oid in range(2, 7):
         execute(conn, "INSERT INTO observations(id,screen_text,site) VALUES (?,?,?)",
-                (oid, "Repeated chrome navigation labels\n" + str(oid), "chrome.example"))
+                (oid, "Repeated chrome labels\n" + str(oid), "chrome.example"))
     result = checks(path)["chrome_share"]
     assert not result.passed and result.details["share"] > .3
     execute(conn, "UPDATE observations SET site=CAST(id AS TEXT)")

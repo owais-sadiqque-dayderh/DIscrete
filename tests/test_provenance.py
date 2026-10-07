@@ -416,7 +416,6 @@ async def test_debug_cli_backfill_does_not_call_models(store, tmp_db, fake, monk
 async def test_cancelled_graph_pass_does_not_reopen_committed_episode(store, fake, monkeypatch):
     import asyncio
 
-    from discrete.config import Endpoint
     from discrete.process import provenance
     from discrete.process.pipeline import ProcessPipeline
 
@@ -425,7 +424,6 @@ async def test_cancelled_graph_pass_does_not_reopen_committed_episode(store, fak
     await store.execute("UPDATE observations SET episode_id=? WHERE id=?", (ep, oid))
     await store.mark_episode_ready(ep)
     pipe = ProcessPipeline(store)
-    pipe.ep = Endpoint("insight", "", "", "")
 
     async def cancel(*args):
         raise asyncio.CancelledError

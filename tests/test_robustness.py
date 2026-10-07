@@ -275,8 +275,9 @@ async def test_incomplete_merge_decisions_do_not_silently_add_conflicting_prefer
     import discrete.process.pipeline as pipeline
     from discrete.models import ClaimDraft
     from discrete.process.pipeline import _Durable
+    candidate = {"id": 7, "text": "The user prefers concise notes.", "context": "", "occurred_from": 0, "occurred_to": 0}
     durable = _Durable(ClaimDraft(kind="preference", text="The user prefers detailed notes."),
-                       text="The user prefers detailed notes.", candidates=[{"id": 7, "text": "The user prefers concise notes."}])
+                       text="The user prefers detailed notes.", candidates=[candidate])
 
     async def incomplete(*args, **kwargs):
         return {"relations": []}

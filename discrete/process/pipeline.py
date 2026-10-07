@@ -16,7 +16,7 @@ from ..perf import PERF
 from ..store import DraftConflict, Store
 from ..timeutil import to_local
 from .actions import detect, hints
-from .embed_worker import claim_text
+from .embed_worker import claim_text, policy_blocked, source_denied
 from .entities import promotable, resolve_existing, structural_candidates
 from .prompts import DRAFT_EPISODE_PROMPT, RELATE_BLOCK, RELATE_PROMPT
 from .validation import atomic, injection_drop, subject_ok, verify_evidence
@@ -34,6 +34,10 @@ _DRAFT_ROW_FIELDS = (
     "id", "started_at", "ended_at", "app", "site", "window_title", "screen_text",
     "caption", "keys", "clicks", "clipboard", "entities", "text_source",
 )
+
+
+class DraftDeferred(Exception):
+    """The episode cannot be drafted yet (no model configured); it stays ready."""
 
 
 @dataclass
@@ -71,9 +75,23 @@ def action_verb(item: dict) -> str:
     return verb if verb in ACTION_VERBS else ""
 
 
-def _thing_tokens(text: str) -> set[str]:
-    """What an action is about: its words minus "the user", the verb and filler."""
-    return {t for t in tk.content_tokens(text, min_len=3) if t not in ACTION_VERBS and t not in ("user", "users")}
+def _narrative(text: str, actions: set[str], sources: list[str]) -> str:
+    """The drafted title or summary, without the sentences verification never saw: a
+    completed action (purchased, sent, ...) no verified event claim backs, or an
+    instruction copied off the screen. What remains describes what was on screen; it
+    is indexed and grouped into tasks, so it must not assert what the claims do not."""
+    kept = [s for s in tk.sentences(text)
+            if not ({t for t in tk.tokens(s) if t in ACTION_VERBS} - actions) and not injection_drop(s, sources)]
+    return " ".join(kept)
+
+
+def _relate_line(text: str, context: str, seen_from: float, seen_to: float) -> str:
+    """A claim for the relation prompt, with the context and time that decide whether
+    two claims really conflict."""
+    seen = f"{to_local(seen_from):%Y-%m-%d %H:%M}"
+    if f"{to_local(seen_to):%Y-%m-%d %H:%M}" != seen:
+        seen += f" to {to_local(seen_to):%Y-%m-%d %H:%M}"
+    return f"{text} | context: {json.dumps(context or '', ensure_ascii=False)} | seen: {seen}"
 
 
 def max_events(span_min: float) -> int:
@@ -98,10 +116,13 @@ class ProcessPipeline:
     async def draft_episode(self, episode_id: int) -> DraftOutcome | None:
         if not await self.store.begin_draft(episode_id):
             return None  # someone else is drafting it, or it is not ready
+        res = None
         try:
             with PERF.timer("draft.episode", ref_id=episode_id) as t:
                 res = await self._draft(episode_id)
                 t.n = res.added + res.reinforced
+        except DraftDeferred:
+            await self.store.defer_draft(episode_id)
         except (*EXPECTED_ERRORS, DraftConflict) as exc:
             log.warning("episode %s draft failed: %s", episode_id, exc)
             await self.store.draft_failed(episode_id)
@@ -115,6 +136,7 @@ class ProcessPipeline:
             raise
         # Outside the draft lifecycle: even cancellation here must not reopen a
         # committed episode. The maintenance pass resumes unfinished graph work.
+        # A deferred episode still gets its graph: provenance needs no model.
         from .provenance import build_provenance
 
         try:
@@ -132,13 +154,19 @@ class ProcessPipeline:
     async def _draft(self, episode_id: int) -> DraftOutcome:
         outcome = DraftOutcome(episode_id=episode_id)
         rows = await self.store.observations_for_episode(episode_id)
+        if blocked := [r["id"] for r in rows if source_denied(r)]:
+            # Excluded from every model call; the rest of the episode is drafted.
+            await self.store.set_meta(f"draft_policy_blocked:{episode_id}", json.dumps(blocked))
+            await self.store.bump_metric("draft_policy_blocked", len(blocked))
+            rows = [r for r in rows if r["id"] not in blocked]
         apps = sorted({r["app"] for r in rows if r["app"]})
         sites = sorted({r["site"] for r in rows if r["site"]})
         engaged = sum(1 for r in rows if r["keys"] or r["clicks"] or r["clipboard"]) / max(1, len(rows))
-        if not rows or not self.ep.configured:
-            if rows and not self.ep.configured:
-                await self.store.bump_metric("draft_skipped_unconfigured", len(rows))
-            title = " / ".join(apps)[:80] or "(no user activity)"
+        if rows and not self.ep.configured:
+            await self.store.bump_metric("draft_skipped_unconfigured", len(rows))
+            raise DraftDeferred("no insight model configured")
+        if not rows:
+            title = " / ".join(apps)[:80] or ("(excluded by privacy settings)" if blocked else "(no user activity)")
             await self.store.close_episode(episode_id, title=title, summary="", apps=apps, sites=sites,
                                            engaged_fraction=engaged)
             return outcome
@@ -228,9 +256,12 @@ class ProcessPipeline:
                 names_seen += structural_candidates(r["screen_text"])
             if r["keys"] or r["clicks"] or r["clipboard"]:
                 names_seen += [x for x in (r["app"], r["site"]) if x]
+        actions = {cd.action for cd in drafts if cd.action}
+        sources = [r["screen_text"] for r in rows]
+        title = _narrative(str(data.get("title") or ""), actions, sources) or " / ".join(apps)
         ops = await self.store.commit_episode_draft(
-            episode_id, title=tk.truncate(str(data.get("title") or ""), 80),
-            summary=tk.truncate(str(data.get("summary") or ""), 600), apps=apps, sites=sites,
+            episode_id, title=tk.truncate(title, 80),
+            summary=tk.truncate(_narrative(str(data.get("summary") or ""), actions, sources), 600), apps=apps, sites=sites,
             engaged_fraction=engaged, writes=writes,
             candidates=sorted({n.strip() for n in names_seen if n and promotable(n)}), rejected=outcome.rejected,
         )
@@ -250,18 +281,22 @@ class ProcessPipeline:
         return out
 
     async def _action_write(self, cd: ClaimDraft) -> ClaimWrite:
-        """An action already remembered (the same verb on the same thing, close in time:
-        a download page and then the file in Finder, or two episodes cut from one task)
-        reinforces the earlier claim instead of adding a duplicate. Other events are new."""
-        if not cd.action:
+        """Reinforce only an identical proposition citing the same occurrence.
+
+        Until actions have structured argument/confirmation IDs, similarity cannot
+        establish identity: a different recipient or a repeated send is a new event.
+        """
+        if not cd.action or not cd.evidence:
             return ClaimWrite(cd)
-        mine = _thing_tokens(cd.text)
+        own = {e["observation_id"] for e in cd.evidence}
         for row in await self.store.q(
                 "SELECT id, text FROM claims WHERE status='live' AND kind='event' AND action=? "
                 "AND occurred_from BETWEEN ? AND ?",
                 (cd.action, cd.occurred_from - T.ACTION_DEDUP_WINDOW_S, cd.occurred_to + T.ACTION_DEDUP_WINDOW_S)):
-            theirs = _thing_tokens(row["text"])
-            if mine and theirs and len(mine & theirs) / len(mine | theirs) >= T.ACTION_DEDUP_JACCARD:
+            if tk.norm_key(cd.text) != tk.norm_key(row["text"]):
+                continue
+            evidence = await self.store.evidence_for_claim(row["id"])
+            if own & {e["observation_id"] for e in evidence}:
                 return ClaimWrite(cd, operation="reinforced", target_id=row["id"])
         return ClaimWrite(cd)
 
@@ -282,20 +317,25 @@ class ProcessPipeline:
 
     def _draft_prompt(self, rows, chrome: dict[tuple[str, str], set[str]] | None = None,
                       *, record_losses: bool = False) -> str:
-        seen_lines: set[str] = set()
+        # Characters of each line already in the prompt. Only what survives truncation
+        # counts as delivered, so a later copy of the line supplies the cut-off rest.
+        delivered: dict[str, int] = {}
         blocks = []
         for r in rows:
-            kept = []
+            kept: dict[str, str] = {}
             text = tk.without_lines(r["screen_text"] or "", (chrome or {}).get((r["app"], r["site"]), set()))
             for line in text.splitlines():
                 k = tk.norm_key(line)
-                if k and k not in seen_lines:
-                    seen_lines.add(k)
-                    kept.append(line)
-            content = "\n".join(kept)
+                if k and k not in kept and delivered.get(k, 0) < len(line):
+                    kept[k] = line[delivered.get(k, 0):]
+            content = "\n".join(kept.values())
             if record_losses and len(content) > T.DRAFT_TEXT_CHARS_PER_OBS:
                 PERF.count("health.draft_text_truncated")
             excerpt = tk.truncate(content, T.DRAFT_TEXT_CHARS_PER_OBS)
+            room = len(excerpt) - (len(excerpt) < len(content))  # minus the ellipsis
+            for k, part in kept.items():
+                delivered[k] = delivered.get(k, 0) + min(len(part), max(0, room))
+                room -= len(part) + 1
             acted = "acted" if (r["keys"] or r["clicks"] or r["clipboard"]) else "viewed only"
             page = f" page={r['page_title']!r}" if r["page_title"] else ""
             blocks.append(
@@ -401,15 +441,20 @@ class ProcessPipeline:
         fused = sorted(tk.rrf(rankings, k=T.RRF_K).items(), key=lambda x: -x[1])
         rows = {r["id"]: r for r in await self.store.get_claims([i for i, _ in fused])}
         out = [rows[i] for i, _ in fused if i in rows and rows[i]["status"] == "live" and rows[i]["kind"] == d.cd.kind]
-        return out[: T.RELATE_CANDIDATES]
+        # The relation prompt quotes these: none from a source today's policy denies.
+        return [c for c in out[: T.RELATE_CANDIDATES] if not await policy_blocked(self.store, "claim", c["id"])]
 
     async def _relate(self, durables: list[_Durable]) -> None:
         asked = [(n, d) for n, d in enumerate(durables) if d.candidates]
         if not asked:
             return
         blocks = "\n\n".join(
-            RELATE_BLOCK.format(n=n, kind=d.cd.kind, text=d.cd.text,
-                                candidates="\n".join(f"[id={c['id']}] {c['text']}" for c in d.candidates))
+            RELATE_BLOCK.format(n=n, kind=d.cd.kind,
+                                text=_relate_line(d.cd.text, d.cd.context, d.cd.occurred_from, d.cd.occurred_to),
+                                candidates="\n".join(
+                                    f"[id={c['id']}] "
+                                    + _relate_line(c["text"], c["context"], c["occurred_from"], c["occurred_to"])
+                                    for c in d.candidates))
             for n, d in asked
         )
         data = await complete_json(self.ep, [{"role": "user", "content": RELATE_PROMPT.format(blocks=blocks)}],
@@ -443,7 +488,10 @@ class ProcessPipeline:
             w.operation, w.target_id = "reinforced", by_rel["same"][0]["id"]
         elif by_rel["contradicts"]:
             old = by_rel["contradicts"][0]
-            if old["modality"] == "stated" or (cd.modality == "passive" and old["modality"] == "engaged"):
+            # Arrival order is not time order: evidence seen before the old claim's
+            # latest support cannot end it (a retried or recovered episode), only dispute it.
+            older = cd.occurred_from < max(old["valid_from"], old["occurred_to"])
+            if older or old["modality"] == "stated" or (cd.modality == "passive" and old["modality"] == "engaged"):
                 w.contested_id = old["id"]
             else:
                 w.operation, w.target_id = "invalidated", old["id"]
