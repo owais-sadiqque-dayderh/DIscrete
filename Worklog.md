@@ -1189,3 +1189,71 @@ user's running app in `exp_discrete` is untouched. Brief: `../hardening_2026-10-
   redraft with hardening code + dream, x2. Note: eval .venv is a symlink to exp_discrete's venv → scripts need
   `PYTHONPATH=$PWD`. Credit at start $2.87 (~$2 expected).
 - Remaining: live Mac check (incognito detection, Bubble per-chunk focus) and results write-up — delegated to Codex.
+
+### 2026-10-08 — hardening benchmark + live checks (Codex)
+
+Detached benchmark @955b0ee: started 04:15:45 IST; `ALL DONE` at 04:56:35 IST. All eight scoring steps and both
+build steps returned rc=0; all result JSONs are valid. Read the existing results only; no extra paid runs or restart.
+`main` = old main; `final` = feat/memory-evolution; `hret` = hardening retrieval/answering on final's databases;
+`hard` = hardening redraft + dream. Means of two repeats, including means of each repeat's latency percentiles.
+
+| Set | Code | Overall % | Recall % | Enum % | Agg % | Profile % | Temp % | Why % | Unans % | Supported % | p50/p90 s | Writer/answer $ |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| live1006 | main | 53.5 | 62.5 | 50.0 | 0.0 | 33.3 | 50.0 | 50.0 | 70.0 | 81.1 | 14.1/21.1 | 0.0674 |
+| live1006 | final | 76.7 | 66.7 | 50.0 | 0.0 | 100.0 | 75.0 | 91.7 | 90.0 | 95.0 | 15.6/32.0 | 0.0634 |
+| live1006 | hret | 66.7 | 88.9 | 50.0 | 0.0 | 16.7 | 0.0 | 91.7 | 100.0 | 88.4 | 8.4/13.5 | 0.0735 |
+| live1006 | hard | 66.7 | 77.8 | 25.0 | 0.0 | 50.0 | 0.0 | 100.0 | 100.0 | 90.0 | 9.3/16.4 | 0.0716 |
+| g46 | main | 90.2 | 95.0 | 50.0 | 100.0 | 66.7 | 75.0 | — | 100.0 | 97.8 | 15.2/24.1 | 0.1076 |
+| g46 | final | 91.2 | 93.2 | 50.0 | 100.0 | 83.3 | 87.5 | — | 100.0 | 95.6 | 14.7/24.0 | 0.1071 |
+| g46 | hret | 85.6 | 88.3 | 50.0 | 100.0 | 66.7 | 66.7 | — | 100.0 | 94.5 | 7.5/12.5 | 0.1107 |
+| g46 | hard | 91.9 | 95.0 | 50.0 | 100.0 | 50.0 | 100.0 | — | 100.0 | 98.9 | 8.4/12.8 | 0.1229 |
+
+Rates use the runner's scored-case denominators. Excluded infrastructure cases per repeat: live main 1/1;
+g46 main 0/0, final 1/0, hret 1/1, hard 3/3; all other pairs 0/0. Category rates average each repeat's fraction,
+so missing cases change denominators (especially g46 hard temporal/profile/aggregate). `$` is mean saved
+`answer_cost_usd` per whole evaluation repeat: priced answer-path calls (including retrieval/verifier/embedding),
+not an isolated writer-only or formation/dream bill. Hret and hard values are lower bounds: unpriced calls a/b
+were live hret 3/2, live hard 2/2, g46 hret 4/7, g46 hard 18/15. Old summaries lack cost-coverage metadata.
+
+**Verdict (two-repeat evidence):**
+
+- Hardening is **not at least as good as feat/memory-evolution on answer quality**: live hret/hard score 66.65%/66.70% versus final 76.65% (about -10 pp).
+- G46 hret is lower (85.55% versus 91.20%); hard's 91.85% scored-only mean excludes three verifier-timeout refusals each repeat. Counting every case, hard is 85.87% (40/46, 39/46) versus final 90.22% (40/46, 43/46).
+- Answers are faster: hard mean p50/p90 is live 9.3/16.4 s and g46 8.4/12.8 s, versus final 15.6/32.0 s and 14.7/24.0 s; live supported rate falls 95.0% → 90.0%, and measured answer-path spend increases.
+- Fix temporal empty answers and verifier-timeout coverage before declaring parity; these two repeats measure returned-evidence support/string matches, not independent source truth or broader generalization.
+
+**Per-question regressions:** final passed in both repeats, and the indicated candidate failed in both (including separately identified infrastructure refusals).
+
+- live, hret + hard, “What was I doing around 22:20?” — zero returned records and refusal in both, whereas final returned relevant X/Helium episodes; no timeout signal, upstream exclusion/missing evidence cause not isolated.
+- live, hret + hard, “What was I looking at around 22:31?” — zero returned records and refusal, whereas final returned OpenRouter/Terminal evidence; no timeout signal, upstream exclusion/missing evidence cause not isolated.
+- live, hret + hard, “What did I open right after I stopped DIscrete with jarvis stop?” — reduced evidence/list (two records, one item), and timestamp 22:37:28 disagrees with returned 22:37:26; support and expected-string checks fail.
+- live, hret + hard, “What project am I working on?” — judge accepts the DIscrete answer, but the benchmark requires literal “memory”; strings_ok=false, a strict expectation rather than judge-reported unsupported content.
+- live, hret only, “What browser do I normally use?” — answers Arc from past-use evidence instead of final's Helium-default evidence; judge rejects habitual-use inference. Hard does not lose this in both repeats.
+- g46, hret only, “Which app did I install from a dmg file?” — narrower records establish opening ChatGPT.dmg/installer, not completed installation; judge rejects completion claim.
+- g46, hret only, “Who did I send PMO.pdf to on Discord?” — answer attributes sending to the user while returned evidence attributes it to AMO; strict actor-support judging rejects it.
+- g46, hret only, “What was I doing around midnight between September 30 and October 1?” — zero returned records/refusal in both, no timeout signal; final had relevant evidence.
+- g46, hret only, “What did I do after midnight on October 1?” — support verifier times out (~10 s end-to-end with an 8 s verifier budget), then refuses despite 18 hits; both are infra_error=true and excluded from scored means.
+- g46, hard only, “What kinds of things do I use AI agents for?” — support verifier timeout with nine hits, then refusal in both; infra_error=true and excluded from scored means.
+
+**R1-08 timeout audit:** literal `support_timeout` occurs zero times in answers and logs for all eight candidate
+runs; case-insensitive whole-JSON matches are tunable names in manifests. The actual warning
+“retrieval support verification timed out” occurs in saved case errors: live hret a/b 0/0, live hard 0/0,
+g46 hret 1/1, g46 hard 3/3 (eight final-attempt timeout cases total; retries may add more).
+Hard-a timeouts: Sep 30 afternoon, AI-agent uses, after Oct 1 midnight. Hard-b: Sep 30/Oct 1 midnight,
+messaging apps, AI-agent uses. These refusals materially affect coverage even though the runner labels them infrastructure.
+Build logs also warn of incomplete claim-verifier decisions for g46 episode 4 and live episode 8; builds still returned rc=0.
+
+**Job 1 / R1-06:** inspected `capture/browser.py` and `privacy.py`: `note_private(app, window_id)` reads front-window
+mode via AppleScript for Google Chrome, Microsoft Edge, Brave Browser, caches `mode == "incognito"`;
+`private_window(window_id)` feeds `denied(..., window_id=...)` → `"private"`. Title markers remain a fallback
+with the accepted normal-title false-positive trade-off. No Chrome/Chromium/Edge/Brave application was found
+in `/Applications` (including a depth-two application-directory search). Arc and Safari are installed, and their
+private mode is explicitly undetectable by this implementation. The supported-browser live normal/incognito
+check could not run; no windows opened or closed, no Automation permission request/change. R1-07 Bubble
+per-chunk focus/URL live check remains pending.
+
+**Live daemon / credit (04:58–04:59 IST):** `jarvis-exp status` reports running, 1,372 captures / 129 episodes /
+412 memories; OpenRouter credit **$1.93** (initial check at 04:24: $2.60). Read `tail -50` and scanned the full
+live log since 2026-10-08 04:19:00: **zero ERROR/Traceback lines**. The log shows orderly shutdown messages
+at 04:51:06 and a fresh runtime start at 04:51:36, with no error; this test agent issued no stop/start command.
+No live/private database changes, branch switches, pushes, merges, or PRs by this agent.
