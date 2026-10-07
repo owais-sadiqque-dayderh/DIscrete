@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Sequence
 from typing import Any
@@ -71,14 +72,18 @@ class ClaimsMixin(HistoryMixin):
 
     def _insert_claim(self, conn, draft: ClaimDraft, *, lineage_id: str, version: int,
                       refines_id: int | None = None, invalidates_id: int | None = None,
-                      derived_from: list[int] | None = None, vector: Vector | None = None) -> int:
+                      derived_from: list[int] | None = None, vector: Vector | None = None,
+                      allow_suppressed: bool = False) -> int:
+        text = tk.truncate(draft.text, T.CLAIM_MAX_CHARS)
+        if not allow_suppressed and self._suppressed(conn, draft.kind, text, vector[0] if vector else None):
+            raise ValueError("claim is suppressed")
         ts = now()
         cur = conn.execute(
             """INSERT INTO claims(lineage_id, version, kind, text, context, reasoning, modality,
                  occurred_from, occurred_to, valid_from, status, episode_id, refines_id, invalidates_id,
                  confidence, derived_from, action, created_at, updated_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,'live',?,?,?,0,?,?,?,?)""",
-            (lineage_id, version, draft.kind, tk.truncate(draft.text, T.CLAIM_MAX_CHARS), draft.context,
+            (lineage_id, version, draft.kind, text, draft.context,
              draft.reasoning, draft.modality, draft.occurred_from or ts, draft.occurred_to or ts,
              draft.occurred_from or ts, draft.episode_id, refines_id, invalidates_id,
              json.dumps(derived_from or []), draft.action, ts, ts),
@@ -131,6 +136,9 @@ class ClaimsMixin(HistoryMixin):
     def _reinforce_claim(self, conn, claim_id: int, draft: ClaimDraft) -> dict:
         """REINFORCE: add verified evidence, extend occurred_to; text untouched (planS2 §6.2).
         Returns the change for the event log: evidence added and evicted by the cap, in full."""
+        current = conn.execute("SELECT kind, text, status FROM claims WHERE id=?", (claim_id,)).fetchone()
+        if current is None or current["status"] != "live" or self._suppressed(conn, current["kind"], current["text"]):
+            raise ValueError("reinforcement target is withdrawn or suppressed")
         before = self._evidence_rows(conn, claim_id)
         old_to = conn.execute("SELECT occurred_to FROM claims WHERE id=?", (claim_id,)).fetchone()[0]
         for ev in draft.evidence:
@@ -151,6 +159,56 @@ class ClaimsMixin(HistoryMixin):
         change = self._set_state(conn, claim_id, only_if_live=True, status="invalidated", valid_to=at)
         conn.execute("UPDATE claims SET invalidates_id=? WHERE id=?", (claim_id, by_id))
         return change
+
+    def _pattern_support_valid(self, conn, category: str, text: str, support: Sequence[int]) -> bool:
+        if not support:
+            return False
+        rows = conn.execute(
+            f"SELECT o.episode_id, o.started_at FROM evidence e JOIN observations o ON o.id=e.observation_id "
+            f"WHERE e.relation='supports' AND e.claim_id IN ({_ph(support)})", list(support)).fetchall()
+        eps = {r[0] for r in rows if r[0] is not None}
+        times = sorted({r[1] for r in rows})
+        days = {day_key(t) for t in times}
+        occasions = (1 + sum(b - a >= T.DREAM_OCCASION_GAP_MIN * 60
+                             for a, b in zip(times, times[1:], strict=False))) if times else 0
+        frequency = re.search(r"\b(?:always|daily|every ?day|each day|every (?:morning|evening|night|week)|"
+                              r"regularly|routinely|usually|habitually|constantly|never)\b", text, re.I)
+        return (len(eps) >= T.DREAM_MIN_EPISODES and occasions >= T.DREAM_MIN_OCCASIONS
+                and (category not in {"habit", "preference"} or len(days) >= T.DREAM_MIN_DAYS)
+                and (not frequency or len(days) >= T.DREAM_FREQUENCY_DAYS))
+
+    def _withdraw_dependents(self, conn, withdrawn: set[int]) -> list[dict]:
+        """Remove copied support immediately, keeping only sufficiently backed inductions.
+        Record the evidence and dependency changes in the triggering event for undo."""
+        changes = []
+        while withdrawn:
+            next_withdrawn = set()
+            for p in conn.execute("SELECT * FROM claims WHERE status='live' AND kind='pattern'").fetchall():
+                support = json.loads(p["derived_from"] or "[]")
+                if not withdrawn.intersection(support):
+                    continue
+                live = [r[0] for r in conn.execute(
+                    f"SELECT id FROM claims WHERE id IN ({_ph(support)}) AND status='live' AND flag!='contested'",
+                    support)]
+                before = self._evidence_rows(conn, p["id"])
+                conn.execute("DELETE FROM evidence WHERE claim_id=?", (p["id"],))
+                if live:
+                    for ev in conn.execute(f"SELECT * FROM evidence WHERE relation='supports' "
+                                           f"AND claim_id IN ({_ph(live)})", live).fetchall():
+                        self._link(conn, p["id"], ev["observation_id"], "supports", ev["quote"], ev["field"])
+                conn.execute("UPDATE claims SET derived_from=?, updated_at=? WHERE id=?",
+                             (json.dumps(sorted(live)), now(), p["id"]))
+                self._recompute_confidence(conn, p["id"])
+                change = self._evidence_change(conn, p["id"], before,
+                    fields_before={"derived_from": p["derived_from"]}, fields_after={"derived_from": json.dumps(sorted(live))})
+                if not self._pattern_support_valid(conn, p["context"], p["text"], live):
+                    state = self._set_state(conn, p["id"], status="retired", valid_to=now())
+                    if state:
+                        change.update(before=state["before"], after=state["after"])
+                    next_withdrawn.add(p["id"])
+                changes.append(change)
+            withdrawn = next_withdrawn
+        return changes
 
     async def live_claims(self, *, kind: str | None = None, limit: int | None = None) -> list[sqlite3.Row]:
         sql, args = "SELECT * FROM claims WHERE status='live'", []

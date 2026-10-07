@@ -74,6 +74,10 @@ class HistoryMixin(StoreBase):
                    created: Sequence[int] = (), changes: Sequence[dict | None] = (), reason: str = "",
                    run_id: str = "", data: dict | None = None) -> int:
         changes = [c for c in changes if c]
+        withdrawn = {c["id"] for c in changes if c.get("after", {}).get("status") in DEAD
+                     or c.get("after", {}).get("flag") == "contested"}
+        if withdrawn:
+            changes += self._withdraw_dependents(conn, withdrawn)
         cur = conn.execute(
             "INSERT INTO memory_events(at, op, actor, claim_id, created, changes, reason, run_id, data) "
             "VALUES (?,?,?,?,?,?,?,?,?)",

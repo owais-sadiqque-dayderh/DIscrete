@@ -107,13 +107,16 @@ class BeliefsMixin(LinksMixin):
 
         def _run() -> int:
             with self._tx() as conn:
-                rows = conn.execute(f"SELECT * FROM claims WHERE id IN ({_ph(support)}) AND status='live'",
+                rows = conn.execute(f"SELECT * FROM claims WHERE id IN ({_ph(support)}) AND status='live' "
+                                    "AND flag!='contested' AND kind!='pattern'",
                                     list(support)).fetchall()
                 if len(rows) != len(set(support)):
                     raise ValueError("support changed while dreaming")
                 ev = conn.execute(
                     f"SELECT observation_id, quote FROM evidence WHERE relation='supports' "
                     f"AND claim_id IN ({_ph(support)}) ORDER BY created_at DESC", list(support)).fetchall()
+                if not self._pattern_support_valid(conn, category, text, support):
+                    raise ValueError("insufficient supporting occasions")
                 mods = {r["modality"] for r in rows}
                 draft = ClaimDraft(
                     kind="pattern", text=text, context=category, reasoning=f"dreamed from {len(rows)} memories",
@@ -138,7 +141,11 @@ class BeliefsMixin(LinksMixin):
         def _run() -> bool:
             with self._tx() as conn:
                 p = conn.execute("SELECT * FROM claims WHERE id=? AND status='live'", (pattern_id,)).fetchone()
-                if p is None:
+                if p is None or self._suppressed(conn, p["kind"], p["text"]):
+                    return False
+                eligible = conn.execute(f"SELECT id FROM claims WHERE id IN ({_ph(support)}) "
+                                        "AND status='live' AND flag!='contested' AND kind!='pattern'", list(support)).fetchall()
+                if len(eligible) != len(set(support)):
                     return False
                 old = set(json.loads(p["derived_from"] or "[]"))
                 new = sorted(set(support) - old)
@@ -213,9 +220,20 @@ class BeliefsMixin(LinksMixin):
     async def save_profile(self, profile: dict, *, run_id: str) -> int:
         def _run() -> int:
             with self._tx() as conn:
+                clean = json.loads(json.dumps(profile))
+                for sec in clean.get("sections", []):
+                    points = []
+                    for point in sec.get("points", []):
+                        ids = point.get("claims", [])
+                        live = conn.execute(f"SELECT id FROM claims WHERE id IN ({_ph(ids)}) AND status='live' "
+                                            "AND flag NOT IN ('stale','contested')", ids).fetchall() if ids else []
+                        if ids and len(live) == len(set(ids)) and not self._suppressed(conn, "pattern", point["text"]):
+                            points.append(point)
+                    sec["points"] = points
+                clean["sections"] = [s for s in clean.get("sections", []) if s["points"]]
                 prev = conn.execute("SELECT value FROM meta WHERE key='profile'").fetchone()
                 conn.execute("INSERT INTO meta(key, value) VALUES ('profile', ?) "
-                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(profile),))
+                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(clean),))
                 return self._log_event(conn, "profile", "dream", reason="profile rewritten", run_id=run_id,
                                        data={"previous": json.loads(prev[0]) if prev else None})
 
@@ -229,7 +247,7 @@ class BeliefsMixin(LinksMixin):
         if not live_only or not profile.get("sections"):
             return profile
         cited = sorted({c for sec in profile["sections"] for p in sec["points"] for c in p["claims"]})
-        live = {r["id"] for r in await self.get_claims(cited, live_only=True)}
+        live = {r["id"] for r in await self.get_claims(cited, live_only=True) if r["flag"] not in {"contested", "stale"}}
         sections = [{**sec, "points": [p for p in sec["points"] if set(p["claims"]) <= live]}
                     for sec in profile["sections"]]
         return {**profile, "sections": [sec for sec in sections if sec["points"]]}

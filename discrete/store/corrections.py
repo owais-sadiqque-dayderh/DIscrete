@@ -71,7 +71,7 @@ class CorrectionsMixin(ClaimsMixin):
                                    occurred_to=row["occurred_to"], action=row["action"],
                                    evidence=[{"observation_id": r[0], "quote": r[1]} for r in ev])
                 nid = self._insert_claim(conn, draft, lineage_id=row["lineage_id"], version=version + 1,
-                                         derived_from=[target])
+                                         derived_from=[target], allow_suppressed=True)
                 self._carry_mentions(conn, [target], nid)
                 change = self._set_state(conn, target, status="superseded", valid_to=now(), superseded_by=nid)
                 eid = self._log_event(conn, "correct", "user", claim_id=nid, created=[nid], changes=[change],
@@ -89,8 +89,13 @@ class CorrectionsMixin(ClaimsMixin):
 
     async def suppressed(self, kind: str, text: str, vector=None) -> bool:
         """Would this new claim re-learn something the user told us to forget?"""
+        return await self._call(lambda: self._suppressed(self.conn, kind, text, vector))
+
+    def _suppressed(self, conn, kind: str, text: str, vector=None) -> bool:
+        """Transaction-time gate shared by every claim writer."""
         key = tk.norm_key(text)
-        rows: list[sqlite3.Row] = await self.q("SELECT norm_key, text, vector FROM suppressions WHERE kind=?", (kind,))
+        rows: list[sqlite3.Row] = conn.execute(
+            "SELECT norm_key, text, vector FROM suppressions WHERE kind=?", (kind,)).fetchall()
         if not rows:
             return False
         toks = set(tk.content_tokens(text))

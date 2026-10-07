@@ -118,7 +118,7 @@ async def test_audit_retires_and_withdrawn_support_retires(store, fake):
     for cid in ids:
         await store.forget_claim(cid)
     fake.dream = {"patterns": [], "audit": []}
-    assert (await run_dream(store))["patterns"]["retired"] == 1
+    assert (await run_dream(store))["patterns"]["retired"] == 0  # withdrawal already revalidated it
     assert (await store.get_claim(p["id"]))["status"] == "retired"
 
 
@@ -227,3 +227,45 @@ async def test_one_reinforced_claim_can_supply_separate_occasions(store, fake):
     assert report["patterns"]["rejected"] == {"frequency_overclaim": 1}
     fake.dream = {"patterns": [_pattern([merged], category="habit")], "audit": []}
     assert (await run_dream(store))["patterns"]["added"] == 1
+
+
+async def test_forgotten_pattern_cannot_be_regenerated(store, fake):
+    ids = await _football(store)
+    fake.dream = {"patterns": [_pattern(ids)], "audit": []}
+    await run_dream(store)
+    [p] = await store.live_claims(kind="pattern")
+    await store.forget_claim(p["id"])
+    assert (await run_dream(store))["patterns"]["added"] == 0
+    assert await store.live_claims(kind="pattern") == []
+
+
+async def test_withdrawal_revalidates_pattern_immediately_and_undo_restores_it(store):
+    ids = await _football(store)
+    p = await store.add_pattern(_pattern(ids)["text"], "interest", ids, reason="test", run_id="r")
+    await store.save_profile({"written_at": now(), "sections": [{"heading": "Interests", "points": [
+        {"text": "They follow football.", "claims": [p]}]}]}, run_id="r")
+    forget = await store.forget_claim(ids[0])
+    assert (await store.get_claim(p))["status"] == "retired"
+    assert (await store.get_profile())["sections"] == []
+    await store.revert_event(forget)
+    assert (await store.get_claim(p))["status"] == "live"
+    assert len((await store.get_profile())["sections"]) == 1
+
+
+async def test_partial_withdrawal_keeps_sufficient_pattern_but_removes_copied_quote(store):
+    ids = await _football(store)
+    ids.append(await _memory(store, "The user checked football scores on FotMob", day=3, episode=99))
+    p = await store.add_pattern(_pattern(ids)["text"], "interest", ids, reason="test", run_id="r")
+    removed = {r[0] for r in await store.q("SELECT observation_id FROM evidence WHERE claim_id=?", (ids[0],))}
+    await store.forget_claim(ids[0])
+    assert (await store.get_claim(p))["status"] == "live"
+    assert not removed & {r[0] for r in await store.q("SELECT observation_id FROM evidence WHERE claim_id=?", (p,))}
+    assert json.loads((await store.get_claim(p))["derived_from"]) == sorted(ids[1:])
+
+
+async def test_confirm_refuses_withdrawn_support(store):
+    ids = await _football(store)
+    p = await store.add_pattern(_pattern(ids)["text"], "interest", ids, reason="test", run_id="r")
+    more = await _memory(store, "The user checked football scores on FotMob", day=3, episode=99)
+    await store.forget_claim(more)
+    assert not await store.confirm_pattern(p, [more], reason="test", run_id="r")
