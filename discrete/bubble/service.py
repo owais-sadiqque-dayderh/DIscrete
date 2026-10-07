@@ -112,6 +112,22 @@ class BubbleService:
             if cur and cur != pid:
                 return
 
+    def _focus_matches(self, snap: ax.FocusSnapshot) -> bool:
+        """Is the destination still the window, page and field the hotkey fired in?
+
+        Same-app focus changes (another field, tab or page) keep the PID, so each
+        chunk rechecks window, URL (without fragment), the focused AX element and the
+        deny policy, failing closed when any of them cannot be read."""
+        ctx = ax.window_context()
+        if (not ctx.pid or ctx.pid != snap.pid or ctx.window_id != snap.window_id
+                or ctx.url.split("#")[0] != snap.url.split("#")[0]
+                or denied(ctx.app, bundle_id=ctx.bundle_id, url=ctx.url)):
+            return False
+        create = getattr(ax, "AXUIElementCreateApplication", None)
+        if snap.element is None or create is None:
+            return False
+        return ax._ax_get(create(snap.pid), "AXFocusedUIElement") == snap.element
+
     async def _read_field(self, snap: ax.FocusSnapshot) -> tuple[str, str]:
         """(text up to the caret, field description): AX only; unapproved pixels never leave the device."""
         if snap.has_text:
@@ -125,7 +141,10 @@ class BubbleService:
         hold()
         watcher = asyncio.create_task(self._watch_focus(snap.pid))
         self.overlay.show(snap.caret)
-        typed = ""
+        # Everything inserted so far, even if the stream fails or is cancelled later:
+        # inserted text is agent output whatever happens next.
+        emitted: list[str] = []
+        moved = False
         try:
             if denied(snap.app, url=snap.url):
                 # DENIED_APPS / DENIED_SITES: the field is not read, nor is the screen.
@@ -164,9 +183,22 @@ class BubbleService:
                 self._spawn(self._record_gap(p))
             self.overlay.status(f"Writing from {n} source{'s' if n != 1 else ''}" if n else "Writing")
             snap.restore()
-            typed = await self.engine.write(p, emit=lambda s: type_text(s, pid=snap.pid),
-                                            should_continue=lambda: not watcher.done())
-            if typed:
+
+            def emit(chunk: str) -> bool:
+                nonlocal moved
+                if not self._focus_matches(snap):
+                    moved = True
+                    return False
+                if not type_text(chunk, pid=snap.pid):
+                    return False
+                emitted.append(chunk)
+                return True
+
+            typed = await self.engine.write(p, emit=emit, should_continue=lambda: not watcher.done())
+            if moved and not typed:
+                self.overlay.message("Focus moved — stopped", tone="muted")
+                self.stats["cancelled"] += 1
+            elif typed:
                 self.stats["completed"] += 1
                 PERF.sample("bubble.total", since_ms(t0), n=len(typed))  # hotkey → last word typed
                 self.overlay.done(f"Done · {time.perf_counter() - t0:.1f}s")
@@ -190,8 +222,8 @@ class BubbleService:
             self.overlay.message("Something went wrong", tone="warn")
         finally:
             watcher.cancel()
-            if typed:
-                note_agent_output(typed)
+            if emitted:
+                note_agent_output("".join(emitted))
             release()
 
     async def _record_gap(self, p) -> None:
