@@ -26,6 +26,10 @@ from .overlay_client import Overlay
 
 log = logging.getLogger("discrete.bubble")
 
+# One budget for the whole answer, hotkey to last word, whatever its parts' own
+# timeouts and retries add up to (a why question's verification alone may take 25 s).
+_FOREGROUND_TIMEOUT_S = 60.0
+
 
 class BubbleService:
     def __init__(self, store: Store, *, overlay: Overlay | None = None):
@@ -145,67 +149,69 @@ class BubbleService:
         # inserted text is agent output whatever happens next.
         emitted: list[str] = []
         moved = False
+        deadline: asyncio.Timeout | None = None
         try:
-            if denied(snap.app, url=snap.url):
-                # DENIED_APPS / DENIED_SITES: the field is not read, nor is the screen.
-                self.overlay.message("Bubble is off here", tone="warn")
-                return
-            with PERF.timer("bubble.field_read"):
-                text, desc = await self._read_field(snap)
-            if T.REDACT_SECRETS:
-                text = redact(text).text  # the field goes to the planner and the writer
-            if not field_query(text):
-                self.overlay.message("No text in this field", tone="warn")
-                return
+            async with asyncio.timeout(_FOREGROUND_TIMEOUT_S) as deadline:
+                if denied(snap.app, url=snap.url):
+                    # DENIED_APPS / DENIED_SITES: the field is not read, nor is the screen.
+                    self.overlay.message("Bubble is off here", tone="warn")
+                    return
+                with PERF.timer("bubble.field_read"):
+                    text, desc = await self._read_field(snap)
+                if T.REDACT_SECRETS:
+                    text = redact(text).text  # the field goes to the planner and the writer
+                if not field_query(text):
+                    self.overlay.message("No text in this field", tone="warn")
+                    return
 
-            def progress(stage: str, detail) -> None:
-                if stage == "searching":
-                    self.overlay.status("Searching your memory")
-                elif stage == "ranking" and detail:
-                    self.overlay.status(f"Ranking {detail} moments")
+                def progress(stage: str, detail) -> None:
+                    if stage == "searching":
+                        self.overlay.status("Searching your memory")
+                    elif stage == "ranking" and detail:
+                        self.overlay.status(f"Ranking {detail} moments")
 
-            self.overlay.status("Understanding")
-            p = await self.engine.prepare(text, app=snap.app, field_desc=desc, progress=progress)
-            if watcher.done():
-                self.overlay.message("Focus moved — stopped", tone="muted")
-                self.stats["cancelled"] += 1
-                return
-            n = len(p.result.hits)
-            log.info("bubble: mode=%s intent=%s hits=%d retrieve=%.2fs query=%r", p.mode, p.result.plan.intent,
-                     n, p.timings["retrieve_s"], "[encrypted store]" if getattr(
-                         self.store.conn, "_discrete_encrypted", False) else p.query[:80])
-            if p.mode == "empty":
-                self.stats["empty"] += 1
-                self.overlay.message("Nothing on file about that", tone="muted")
-                self._spawn(self._record_gap(p))
-                return
-            if p.mode == "thin":
-                self._spawn(self._record_gap(p))
-            self.overlay.status(f"Writing from {n} source{'s' if n != 1 else ''}" if n else "Writing")
-            snap.restore()
+                self.overlay.status("Understanding")
+                p = await self.engine.prepare(text, app=snap.app, field_desc=desc, progress=progress)
+                if watcher.done():
+                    self.overlay.message("Focus moved — stopped", tone="muted")
+                    self.stats["cancelled"] += 1
+                    return
+                n = len(p.result.hits)
+                log.info("bubble: mode=%s intent=%s hits=%d retrieve=%.2fs query=%r", p.mode, p.result.plan.intent,
+                         n, p.timings["retrieve_s"], "[encrypted store]" if getattr(
+                             self.store.conn, "_discrete_encrypted", False) else p.query[:80])
+                if p.mode == "empty":
+                    self.stats["empty"] += 1
+                    self.overlay.message("Nothing on file about that", tone="muted")
+                    self._spawn(self._record_gap(p))
+                    return
+                if p.mode == "thin":
+                    self._spawn(self._record_gap(p))
+                self.overlay.status(f"Writing from {n} source{'s' if n != 1 else ''}" if n else "Writing")
+                snap.restore()
 
-            def emit(chunk: str) -> bool:
-                nonlocal moved
-                if not self._focus_matches(snap):
-                    moved = True
-                    return False
-                if not type_text(chunk, pid=snap.pid):
-                    return False
-                emitted.append(chunk)
-                return True
+                def emit(chunk: str) -> bool:
+                    nonlocal moved
+                    if not self._focus_matches(snap):
+                        moved = True
+                        return False
+                    if not type_text(chunk, pid=snap.pid):
+                        return False
+                    emitted.append(chunk)
+                    return True
 
-            typed = await self.engine.write(p, emit=emit, should_continue=lambda: not watcher.done())
-            if moved and not typed:
-                self.overlay.message("Focus moved — stopped", tone="muted")
-                self.stats["cancelled"] += 1
-            elif typed:
-                self.stats["completed"] += 1
-                PERF.sample("bubble.total", since_ms(t0), n=len(typed))  # hotkey → last word typed
-                self.overlay.done(f"Done · {time.perf_counter() - t0:.1f}s")
-                log.info("bubble: typed %d chars; first chunk %.2fs after retrieval, total %.2fs", len(typed),
-                         p.timings.get("first_chunk_s", 0.0), time.perf_counter() - t0)
-            else:
-                self.overlay.message("Nothing to add here", tone="muted")
+                typed = await self.engine.write(p, emit=emit, should_continue=lambda: not watcher.done())
+                if moved and not typed:
+                    self.overlay.message("Focus moved — stopped", tone="muted")
+                    self.stats["cancelled"] += 1
+                elif typed:
+                    self.stats["completed"] += 1
+                    PERF.sample("bubble.total", since_ms(t0), n=len(typed))  # hotkey → last word typed
+                    self.overlay.done(f"Done · {time.perf_counter() - t0:.1f}s")
+                    log.info("bubble: typed %d chars; first chunk %.2fs after retrieval, total %.2fs", len(typed),
+                             p.timings.get("first_chunk_s", 0.0), time.perf_counter() - t0)
+                else:
+                    self.overlay.message("Nothing to add here", tone="muted")
         except EmptyField:
             self.overlay.message("No text in this field", tone="warn")
         except asyncio.CancelledError:
@@ -214,8 +220,12 @@ class BubbleService:
                                  tone="muted")
         except (NotConfigured, *EXPECTED_ERRORS) as exc:
             self.stats["failed"] += 1
-            log.warning("bubble failed: %s", exc)
-            self.overlay.message("Couldn't reach the model", tone="warn")
+            if deadline is not None and deadline.expired():
+                log.warning("bubble: no answer within %.0fs; stopped", _FOREGROUND_TIMEOUT_S)
+                self.overlay.message("Took too long — stopped", tone="warn")
+            else:
+                log.warning("bubble failed: %s", exc)
+                self.overlay.message("Couldn't reach the model", tone="warn")
         except Exception:
             self.stats["failed"] += 1
             log.exception("bubble crashed")
