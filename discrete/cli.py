@@ -51,8 +51,10 @@ async def _session():
     try:
         yield store
     finally:
-        await flush_usage(store)
-        await store.close()
+        try:
+            await flush_usage(store)
+        finally:
+            await store.close()
 
 
 async def cmd_run(args) -> int:
