@@ -122,9 +122,9 @@ def test_answer_failure_detection(monkeypatch, tmp_path, stderr, answer, returnc
 
 
 def test_successful_answer_retains_existing_metrics(monkeypatch, tmp_path):
-    processes(monkeypatch, FakeProcess("answer", "record needle\n[1.0s] done (retrieve 0.5s, first chunk +0.2s)"))
+    processes(monkeypatch, FakeProcess("answer", "[screen 1]\nrecord needle\n[1.0s] done (retrieve 0.5s, first chunk +0.2s)"))
     result = run.ask(run.Case("q", "recall", expect_any=["needle"]), tmp_path / "db", tmp_path)
-    assert result.rank == 1 and result.records == ["record needle"]
+    assert result.rank == 1 and result.records == ["[screen 1]\nrecord needle"]
     assert result.retrieval_ms == 500 and result.first_chunk_ms == 700
 
 
@@ -485,3 +485,136 @@ def test_an_answered_question_is_never_an_infrastructure_failure():
     assert run._infra_reason(stderr, "You asked what the repo is about.", 0, case) == ""
     # An empty answer with a provider error is still infrastructure.
     assert run._infra_reason("openai.APIStatusError: 503 service_overloaded", "", 0, case)
+
+
+def test_record_blocks_exclude_diagnostics_and_keep_later_sports_evidence(monkeypatch, tmp_path):
+    stderr = """[ 0.20s] searching memory
+WARNING discrete.retrieval.support support verification timed out; results left unverified
+INFO discrete.retrieval found records
+[ 2.59s] mode=ask intent=recall hits=3
+[screen 117 · Tue Oct 06 18:00 · FotMob · AX]
+FotMob
+Home
+Matches
+Teams
+""" + "Menu item\n" * 40 + """
+[episode 5 · Tue Oct 06 18:02] Cricket scores
+India 180/4 versus Australia 175/8
+[claim 66 · visited · observed · Tue Oct 06 18:03]
+Checked the cricket scoreboard.
+[ 4.20s] done (retrieve 2.59s, first chunk +0.20s)
+mode=ask
+WARNING finished
+"""
+    processes(monkeypatch, FakeProcess("India 180/4", stderr))
+    result = run.ask(run.Case("Which scores?", "recall", expect_any=["180/4"]), tmp_path / "db", tmp_path, 0)
+    assert len(result.records) == 3 and result.rank == 2
+    assert result.records[0].count("Menu item") == 40
+    assert all("WARNING" not in block and "mode=" not in block and "INFO" not in block for block in result.records)
+    captured = []
+    monkeypatch.setattr(run, "_chat_json", lambda model, prompt: captured.append(prompt) or
+                        {"supported": True, "answers_question": True})
+    run.judge(result, "fake")
+    assert "India 180/4" in captured[0] and "WARNING" not in captured[0]
+    assert run.parse_records(stderr.splitlines()) == result.records
+    assert run.parse_records(result.records) == result.records
+
+
+@pytest.mark.parametrize("header", [
+    "[entity 42] Cricket", "[profile]", "[profile: what is known about them, each point backed by memories]",
+    "[day digest]", "[attention: where their time went, computed from every capture]",
+    "[attention provenance: inferred, unverified sequence; describe what preceded it, never assert causation]",
+    "[page 12 · Tue Oct 06 18:00] Cricket", "[trail 2] Browsing",
+    "Timeline of pages/windows (★ matched the question directly; → opened shortly after a ★ page):",
+    "★ · Tue Oct 06 18:00 · Cricket · espn.com", "→ · Tue Oct 06 18:01 · Scores · espn.com",
+    "effect: observation 4 / sighting 2 2026-10-06 18:00:00 Cricket",
+    "18:00:00 obs 4 [Cricket] --navigation 0.90, 2s--> 18:00:02 obs 5 [Scores]",
+    "verified action trail: obs 4 opened claim 5: score page",
+])
+def test_parser_recognizes_rendered_header_variants(header):
+    assert run.parse_records([header, "  supporting body", "[entity 99] next", "next body"]) == [
+        header + "\n  supporting body", "[entity 99] next\nnext body"]
+
+
+def test_why_chain_status_and_ambiguous_visits_are_evidence():
+    status = "recent navigation; support verified; confidence=0.90"
+    ambiguous = "multiple visits: 2026-10-06 18:00:00 (sighting 4, Cricket). Which visit did you mean?"
+    assert run.parse_records([status, "effect: observation 4 / sighting 2 Cricket"]) == [
+        status, "effect: observation 4 / sighting 2 Cricket"]
+    assert run.parse_records([ambiguous]) == [ambiguous]
+
+
+def test_judge_budget_caps_blocks_without_splitting_the_last_one(monkeypatch):
+    monkeypatch.setattr(run, "JUDGE_BLOCK_CHARS", 40)
+    monkeypatch.setattr(run, "JUDGE_RECORD_CHARS", 85)
+    blocks = [f"[screen {i}]\n" + "x" * 100 for i in range(4)]
+    assert run.judge_records(blocks) == [blocks[0][:40], blocks[1][:40]]
+    assert blocks[0].endswith("x" * 100)  # Stored evidence stays full length.
+    case = run.Case("q", "recall", expect_any=["needle"])
+    assert run.first_rank(["[screen 1]\n" + "menu\n" * 50, "[screen 2]\nneedle"], case) == 2
+    assert run.first_rank([f"[screen {i}]\nbody" for i in range(run.K)] + ["[screen 99]\nneedle"], case) is None
+
+
+@pytest.mark.parametrize("jobs", [None, 2])
+def test_rejudge_saved_line_lists_uses_only_judge_and_compare_reads_output(monkeypatch, tmp_path, capsys, jobs):
+    monkeypatch.setattr(run, "RESULTS", tmp_path)
+    original = run.CaseResult("scores?", "recall", False, answer="India 180/4", strings_ok=True,
+                              records=["WARNING support verification timed out", "[screen 117] FotMob", "Home",
+                                       "[episode 5] Cricket", "India 180/4", "[ 4.00s] done"], rank=4,
+                              answer_ms=2000, attempts=2)
+    failed = run.CaseResult("failed?", "recall", False, infra_error=True, error="timeout")
+    data = {"name": "branch", "judge_model": "saved-model", "infra_retries": 1, "max_infra_errors": 0.5,
+            "summary": run.summarize([original, failed]) | {"answer_cost_usd": 0.25},
+            "cases": [asdict(r) | {"correct": r.correct} for r in [original, failed]]}
+    source = json.dumps(data)
+    (tmp_path / "branch.json").write_text(source)
+    calls = []
+
+    def fake_judge(result, model):
+        calls.append((result.question, model, result.records))
+        if len(calls) == 1:
+            raise TimeoutError("fake outage")
+        verdict(result, model)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("rejudge must not answer, preflight, or load case expectations")
+
+    monkeypatch.setattr(run, "judge", fake_judge)
+    monkeypatch.setattr(run, "ask", forbidden)
+    monkeypatch.setattr(run, "preflight", forbidden)
+    monkeypatch.setattr(run, "load_cases", forbidden)
+    monkeypatch.setattr(run.time, "sleep", lambda delay: None)
+    monkeypatch.setattr(sys, "argv", ["run_g46.py", "--rejudge", "branch"] +
+                        (["--jobs", str(jobs)] if jobs else []))
+    assert run.main() == 0
+    saved = json.loads((tmp_path / "branch-rj.json").read_text())
+    assert saved["name"] == "branch-rj" and saved["jobs"] == (jobs or 4)
+    assert len(calls) == 2 and all(call[:2] == ("scores?", "saved-model") for call in calls)
+    assert calls[0][2] == ["[screen 117] FotMob\nHome", "[episode 5] Cricket\nIndia 180/4"]
+    assert saved["cases"][0]["correct"] and saved["cases"][0]["judge_attempts"] == 2
+    assert saved["cases"][0]["answer_ms"] == 2000 and saved["cases"][0]["rank"] == 4
+    assert saved["cases"][1]["infra_error"] and saved["cases"][1]["judge_attempts"] == 0
+    assert saved["summary"]["overall_correct"] == 1 and saved["summary"]["infra_errors"] == 1
+    assert saved["summary"]["answer_cost_usd"] == 0.25
+    assert (tmp_path / "branch.json").read_text() == source
+    monkeypatch.setattr(sys, "argv", ["run_g46.py", "--compare", "branch", "branch-rj"])
+    assert run.main() == 0
+    output = capsys.readouterr().out
+    assert "branch-rj" in output and "overall_correct" in output and "INFRA" in output
+
+
+def test_interleaved_warning_does_not_split_record_or_drop_body():
+    assert run.parse_records("[screen 1]\nHome\nWARNING discrete.writer diagnostic\nScores\n[ 4.0s] done\nnoise") == [
+        "[screen 1]\nHome\nScores"]
+
+
+def test_failed_rejudge_clears_stale_verdict_reason(monkeypatch):
+    result = run.CaseResult("q", "recall", False, supported=True, answers_question=True, judge_reason="old support")
+
+    def failed(*args):
+        raise TimeoutError("outage")
+
+    monkeypatch.setattr(run, "judge", failed)
+    run.judge_with_retries(result, "fake", 0)
+    assert result.infra_error and result.supported is None and result.answers_question is None
+    assert result.judge_reason == "" and result.error == "judge error: outage"

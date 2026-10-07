@@ -922,3 +922,5 @@ Sources: Cognition "agent memory repo" (cognition.com/agent-memory-repo), Hindsi
 - /tmp/handover.sh waits for g46-branch-v2 to finish, kills round-1 phase 2, checks out e7a1150 in ../exp_discrete_eval (detached), and runs `bench/private/eval_branch2.sh` -> results/branch2-driver.log
   (live-branch-r2, live-branch-v2-r2, g46-branch-geminiverify, g46-base+branchretrieval; then both compares; ends "ALL DONE").
 - If interrupted: check which results/*.json exist; re-run only the missing `score` lines from eval_branch2.sh.
+- Harness bug found: the judge gets `records[:30]` *lines*; raw screen-text records (many short lines) push later records out, so correct answers are marked unsupported (g46-branch aggregate 0/2 is this artifact: e.g. the cricket score came from a record the judge never saw). Codex task harness-judge-blocks-r1: block-based judge input with a char budget + `--rejudge NAME` (judge-only, writes NAME-rj.json). Plan: rejudge ALL runs (base + branch) for a fair comparison.
+- Also seen: support verification times out on many non-why queries too (8 s, muse as verifier per .env), in base and branch alike.
