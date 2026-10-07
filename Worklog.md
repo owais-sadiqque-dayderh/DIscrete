@@ -1133,3 +1133,24 @@ user's running app in `exp_discrete` is untouched. Brief: `../hardening_2026-10-
 - Integrated W1 (conflict in capture/screen.py: took W1's frame matching + W2's `max_pending`). My jarvis follow-up now
   matches daemons by exact binary path from `ps` (W2's test bans pgrep/pkill); still finds the running exp daemon
   77405 only. **Integration: 802 passed, 0 failed; ruff clean.** Waiting on W3 (formation) and W5 (retrieval).
+- ~02:45 IST: **W5 retrieval done** (kaustubh Opus): kept PR-03 cc896cd; fixed two regressions in Codex's QA-01 (continuation/
+  "world" questions and DISCRETE_SUPPORT_CHECK=0 lost all records → explicit "unchecked" state, e74cd13) and QA-02's
+  120-char caption cut (85% of real captions longer → 400, 8e787a4). Real user failures diagnosed on a /tmp copy of the
+  live exp db (no model calls), 5 causes fixed: "summarise all the messages…" routed to page-title listing (and without
+  "?" even to the edit path); "opened from" lookup matched only the full subject (missed 12/13 linked rows); verifier got
+  114 raw pages instead of 3 items; one failed verifier batch wiped every batch; empty list now falls back to recall.
+  QA-03 6861a5a, QA-04 603dafa (focus/URL/field/deny re-checked before each typed chunk; typed text recorded in finally),
+  R11 0a2453c, 60 s total Bubble deadline 5247ba5, writer context capped to 4,000 chars before cursor 4580a35,
+  completion-question routing 57f980c. Field/window checks covered by mocks only. Report `W5-retrieval.md`.
+- ~02:50 IST: **W3 formation done** (kaustubh Opus): ME-03 178e848+05a951f, ME-04 faaea55, ME-08 56fea35 (save a late
+  vector only if the row is still live with unchanged text), ME-10 9ed702d, ME-05 pipeline side 2325127 (contract: never
+  invalidate when the new evidence is older than the claim's latest support → mark both contested), PR-05 formation part
+  c998003, ME-09 partial 211417c (drop summary sentences asserting unverified actions / copied on-screen instructions),
+  C2-05 0bb9b29, trail verifier budget b9daa0c (same as claim verification + VERIFY_LM_EXTRA_TOKENS), ME-02 design note
+  `docs/visits_design.md` 943b3e8. Report `W3-formation.md`.
+- **All five merged into `feat/production-hardening`.** My review caught a regression in ME-03: requiring identical text
+  + a shared observation re-introduced duplicate actions (the Phase-7 "download page + Finder" case; W3 had rewritten that
+  test to expect 2). Fixed in 99cb3c8: similarity proposes, and a merge is refused only when BOTH wordings carry an
+  argument the other lacks (recipient, amount, file, URL); trade-off documented (an identical verbatim repeat within 3 h
+  reads as one action). **Suite: 930 passed, 0 failed; ruff clean.** (The provenance timing test fails only under heavy
+  machine load; passes alone.) Next: independent review of d8847a5..HEAD.
