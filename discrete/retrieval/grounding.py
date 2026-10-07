@@ -18,6 +18,8 @@ class GroundingDecision:
 def evaluate(result: RetrievalResult) -> GroundingDecision:
     if result.why_chain and result.why_chain.candidates:
         return GroundingDecision("ambiguous", 0, 0)
+    if result.plan.intent != "why" and any(h.verification == "timed_out" for h in result.hits):
+        return GroundingDecision("unverified", 0, 0)
     if result.page_answer and (result.plan.page_operation or isinstance(result.plan, EventQueryPlan)):
         return GroundingDecision("pages", len(result.hits), 0)
     intent = result.plan.intent

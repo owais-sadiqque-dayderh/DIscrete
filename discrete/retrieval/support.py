@@ -6,8 +6,8 @@ such as ownership, payment, authorship or preference: a calculator showing
 call it one. This final batched check keeps directly supporting records and fails
 closed when verification is unavailable or malformed. It costs one verifier round
 trip per query (batches run together), so VERIFY_LM should be a fast model. A
-provider slower than SUPPORT_TIMEOUT_S (SUPPORT_TIMEOUT_WHY_S for why) cannot
-authorize factual output. The deliberate why fallback remains explicitly hedged. DISCRETE_SUPPORT_CHECK=0
+provider slower than SUPPORT_TIMEOUT_S (SUPPORT_TIMEOUT_WHY_S for why) gets
+an explicitly unverified, hedged answer from the bounded evidence pack. DISCRETE_SUPPORT_CHECK=0
 turns it off.
 """
 
@@ -21,6 +21,7 @@ from ..config import T, verifier_endpoint
 from ..llm import EXPECTED_ERRORS, complete_json
 from ..models import Hit, RetrievalResult
 from ..perf import PERF
+from ..timeutil import iso
 
 log = logging.getLogger("discrete.retrieval.support")
 
@@ -54,6 +55,12 @@ action, not of motive. Use each record's "context" for how it relates.
 For relative temporal questions (right after/before an event), retain the event
 anchor itself and visits whose context places them immediately after/before it.
 The anchor establishes the boundary; it is not the first item of the answer list.
+The bounded same-session timeline may include several subsequent navigation steps
+(e.g. opening folders then a file). Retain all such requested visits, not just
+the single closest visit. Their context and capture timestamps establish order.
+For activity around a clock/date, use occurred_at/occurred_to (local timestamps),
+not dates or clocks quoted inside screen content. An episode overlapping that
+interval supports an overview; a captured screen supports what was visible then.
 """
 
 
@@ -68,7 +75,8 @@ async def _supported(result: RetrievalResult, records: list[dict]) -> set[int]:
 
 
 def _record(i: int, h: Hit) -> dict:
-    out = {"index": i, "kind": h.ref_kind, "text": h.text, "modality": h.modality, "occurred_at": h.occurred_at}
+    out = {"index": i, "kind": h.ref_kind, "text": h.text, "modality": h.modality, "occurred_at": iso(h.occurred_at),
+           "occurred_to": iso(h.occurred_to)}
     if h.via:
         out["context"] = h.via
     return out

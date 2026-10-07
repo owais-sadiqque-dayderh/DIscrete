@@ -21,7 +21,11 @@ async def test_timeout_never_authorizes_grounded_output(fake, monkeypatch, inten
     hit = Hit('observation', 1, 'Report', 'Relevant but unchecked', strong=True)
     result = RetrievalResult('q', QueryPlan('q', intent=intent), [hit], exhaustive=True, digest='Unchecked digest')
     await verify_support(result)
-    assert evaluate(result).mode == 'empty'
+    assert evaluate(result).mode == 'unverified'
+    assert not hit.eligible
+    from discrete.bubble.engine import render_records
+    assert 'not verified' in render_records(result)
+    assert 'Relevant but unchecked' in render_records(result)
     assert hit.verification == 'timed_out'
     assert result.digest == ''
 
@@ -85,3 +89,23 @@ async def test_one_failed_batch_keeps_the_others(fake, monkeypatch):
     await verify_support(result)
     assert [h.ref_id for h in result.hits] == list(range(16))
     assert all(h.verification == 'unverified' for h in hits[16:])
+
+
+async def test_timeout_writer_discloses_and_hedges_without_rejected_evidence(store, fake):
+    from discrete.bubble.engine import BubbleEngine, Prepared, render_records
+
+    timed_out = Hit('observation', 1, 'Report', 'A visible report', strong=True, verification='timed_out')
+    rejected = Hit('observation', 2, 'Rejected', 'Unsupported ownership', verification='rejected')
+    result = RetrievalResult('q', QueryPlan('q'), [timed_out, rejected])
+    p = Prepared(field_text='q?', query='q', app='Notes', field_desc='body', result=result, decision=evaluate(result))
+    engine = BubbleEngine(store)
+    assert p.mode == 'unverified'
+    prompt = engine.messages(p)[-1]['content']
+    assert 'NOT verified' in prompt and "'it looks like'" in prompt
+    assert 'Unsupported ownership' not in render_records(result)
+    fake.writer_reply = 'It looks like you viewed a report.'
+    chunks = []
+    answer = await engine.write(p, lambda s: chunks.append(s) or True)
+    assert answer.lstrip().startswith('Support check timed out; this answer is not verified.')
+    assert 'viewed a report' in answer
+    assert ''.join(chunks) == answer

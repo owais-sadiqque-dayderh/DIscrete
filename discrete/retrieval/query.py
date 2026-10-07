@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 from datetime import timedelta
 
+from dateparser import parse as parse_date
 from dateparser.search import search_dates
 
 from .. import textkit as tk
@@ -40,7 +41,7 @@ _WHY = re.compile(r"^\s*why\b|\bwhy (?:did|do|was|were|have|had) i\b|\bwhat (?:m
 _ABOUT_USER = re.compile(
     r"\babout me\b|\bmy (?:interests|hobbies|habits|routines?|projects|preferences|work|tools)\b"
     r"|\b(?:what|which) (?:kinds?|sorts?|types?) of\b.*\b(?:i|me)\b"
-    r"|\b(?:am i|do i|i'm)\b.*\b(?:interested|into|building|working on|usually|tend to|often|prefer|rely on)\b"
+    r"|\b(?:am i|do i|i'm)\b.*\b(?:interested|into|building|working on|usually|tend to|often|prefer|rely on|normally)\b"
     r"|\bwho am i\b|\bdescribe me\b", re.I)
 # "what time on Monday did I…" asks when, not how long: no bare "time on".
 _TIME_SPENT = re.compile(r"\b(?:how much time|how long (?:did|do|have) i (?:spend|spent|been)|most (?:of my )?time|"
@@ -326,8 +327,19 @@ def parse_interval(text: str, ref: float | None = None) -> tuple[float, float] |
     # A clock-only anchor identifies the captured moment across stored days. It
     # must not silently become today's date (or discard yesterday's captures).
     without_clock = re.sub(r"\b\d{1,2}:\d{2}\s*(?:am|pm)?\b", "", text, flags=re.I)
-    if is_why(text) and re.search(r"\b\d{1,2}:\d{2}\b", text) and not _TEMPORAL_CUE.search(without_clock):
+    if re.search(r"\b\d{1,2}:\d{2}\b", text) and not _TEMPORAL_CUE.search(without_clock):
         return None
+    # Parse named dates separately: search_dates can miss a cross-midnight phrase.
+    named = re.findall(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2}(?:,?\s+\d{4})?\b", text, re.I)
+    if named:
+        dates = [parse_date(d, settings={"PREFER_DATES_FROM": "past", "RELATIVE_BASE": local.replace(tzinfo=None)}) for d in named]
+        dates = [d for d in dates if d is not None]
+        if dates:
+            if "midnight" in low and "around" in low:
+                # Between two adjacent days means their shared boundary.
+                center = day_bounds(from_local(dates[-1]))[0]
+                return center - 900, center + 900
+            return day_bounds(from_local(dates[0]))
     # No parser result can survive the cue filter without a cue in the input.
     # Avoid language/date detection work on ordinary effect titles.
     if not _TEMPORAL_CUE.search(text):

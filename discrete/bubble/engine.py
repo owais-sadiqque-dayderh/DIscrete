@@ -131,7 +131,8 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
         from ..retrieval.why import render_chain
 
         return render_chain(result.why_chain)
-    if result.plan.intent == "enumerate":
+    timed_out = any(h.verification == "timed_out" for h in result.hits)
+    if result.plan.intent == "enumerate" and not timed_out:
         # One compact line per page, time-ordered, so the whole trail fits (planS3 §17).
         verified = [h for h in result.hits if h.eligible]
         if not verified:
@@ -157,8 +158,9 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
     if result.digest and result.digest_verification in ELIGIBLE:
         blocks.append(f"[day digest]\n{tk.truncate(result.digest, 1200)}")
         used += len(blocks[-1])
-    for h in result.hits:
-        if not h.eligible and result.plan.intent != "why":
+    hits = result.hits[:T.TOP_K] if timed_out and result.plan.intent != "why" else result.hits
+    for h in hits:
+        if not h.eligible and h.verification != "timed_out" and result.plan.intent != "why":
             continue
         if h.ref_kind == "claim":
             kind = f"{h.claim_kind} ({h.action})" if h.action else h.claim_kind
@@ -184,7 +186,7 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
             head = f"[entity {h.ref_id}] {h.title}"
             body = h.body
         if not h.eligible:
-            head += f" [support {h.verification}; inferred context only]"
+            head += f" [support {h.verification}; not verified, inferred context only]"
         block = f"{head}\n{tk.truncate(body, 1100)}"
         if used + len(block) > max_chars and blocks:
             break
@@ -269,6 +271,10 @@ class BubbleEngine:
                 return False
             out += chunk
             return True
+
+        if p.mode == "unverified":
+            if not push("Support check timed out; this answer is not verified. "):
+                return out
 
         max_tokens = T.ENUMERATE_WRITER_MAX_TOKENS if p.mode == "enumerate" else T.BUBBLE_WRITER_MAX_TOKENS
         # aclosing: an early return must close the HTTP stream now, not at interpreter exit.

@@ -25,7 +25,7 @@ from .page_activity import page_activity
 from .query import EventQueryPlan, build_plan, fallback_plan, page_request, relative_event
 from .rerank import llm_rerank, valid_order
 from .support import verify_support
-from .temporal import relative_timeline, temporal_answer
+from .temporal import clock_timeline, relative_timeline, temporal_answer
 from .why import chain_hits, resolve_why
 
 log = logging.getLogger("discrete.retrieval.hybrid")
@@ -184,6 +184,9 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress,
             return result
         return await _search(store, plan, result, field_text=field_text, progress=progress,
                              qvec=await try_embed(query))
+    clock_result = RetrievalResult(query=query, plan=fallback_plan(query))
+    if await clock_timeline(store, clock_result):
+        return clock_result
     unresolved_event = False
     structural = fallback_plan(query) if relative_event(query) else None
     if isinstance(structural, EventQueryPlan):
