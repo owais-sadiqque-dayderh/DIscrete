@@ -1093,3 +1093,7 @@ user's running app in `exp_discrete` is untouched. Brief: `../hardening_2026-10-
 - Baseline in worktrees: 723 pass, 1 fails (`test_habits_need_several_days_projects_do_not`, date-dependent; W4).
 - Next: review each branch diff, merge into `feat/production-hardening`, full suite, then an independent Claude
   (kaustubh, medium) review; offline only. A paid re-evaluation needs the user's OK (credit).
+- 02:07 IST: W1 and W3 (Codex) failed on the Codex usage limit (resets 05:53 IST) after partial work (W1: PR-01, PR-02,
+  PR-04-part committed; W3: ME-03 committed; both left uncommitted edits). Relaunched both as round 2 on the user's
+  second Claude account (claudeAgent_kaustubh, Opus medium, no nested subagents), told to review the committed fixes and
+  finish/discard the uncommitted edits. W2/W4/W5 still running on Codex (W4: 4 commits, W5: 3 commits, W2: 1 so far).
