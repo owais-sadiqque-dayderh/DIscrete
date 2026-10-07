@@ -266,7 +266,7 @@ def test_every_cli_command_has_a_handler():
     p = build_parser()
     sub = next(a for a in p._actions if a.dest == "cmd")
     needs = {"ask": ["x"], "query": ["x"], "why": ["x"], "answer": ["1", "x"], "history": ["1"], "revert": ["1"],
-             "forget": ["1"], "correct": ["1", "x"]}
+             "forget": ["1"], "erase": ["1"], "correct": ["1", "x"]}
     for name in sub.choices:
         args = p.parse_args([name, *needs.get(name, [])])
         assert callable(args.func), name
