@@ -207,7 +207,7 @@ class HistoryMixin(StoreBase):
                         f"AND NOT (e.op = 'redo' AND json_extract(e.data, '$.reapplies') = ?) "
                         f"AND r.claim_id IN ({_ph(touched)})", (event_id, event_id, *touched)).fetchall() \
                         if touched else []
-                    if ev["op"] == "profile":
+                    if ev["op"] == "profile" or "profile_before" in data:
                         later += conn.execute("SELECT id, op FROM memory_events WHERE id > ? AND op='profile' "
                                               "AND undone_by IS NULL", (event_id,)).fetchall()
                     if later:
@@ -245,9 +245,10 @@ class HistoryMixin(StoreBase):
                 side["links"] = links
                 if links:
                     conn.execute(f"UPDATE links SET status='reverted' WHERE id IN ({_ph(links)})", links)
-                if ev["op"] == "profile":
-                    side["profile_was"], side["profile_set"] = data.get("previous"), self._current_profile(conn)
-                    self._set_profile(conn, data.get("previous"))
+                if ev["op"] == "profile" or "profile_before" in data:
+                    previous = data.get("previous") if ev["op"] == "profile" else data["profile_before"]
+                    side["profile_was"], side["profile_set"] = previous, self._current_profile(conn)
+                    self._set_profile(conn, previous)
                 rid = self._log_event(conn, "revert", "user", claim_id=ev["claim_id"], changes=out,
                                       reason=reason or f"revert of #{event_id} ({ev['op']})", data=side)
                 conn.execute("UPDATE memory_events SET undone_by=? WHERE id=?", (rid, event_id))

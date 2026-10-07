@@ -261,6 +261,11 @@ class ClaimsMixin(HistoryMixin):
                         r["text"] != by_id[r["id"]]["text"] for r in current):
                     return []  # another draft/refinement already replaced the inputs
                 replaced: dict[int, int] = {}
+                profile_before = self._current_profile(conn)
+                cited = {c for sec in (profile_before or {}).get("sections", []) for point in sec["points"]
+                         for c in point["claims"]}
+                for row in conn.execute("SELECT derived_from FROM claims WHERE status='live' AND kind='pattern'"):
+                    cited.update(json.loads(row[0] or "[]"))
                 for out in outputs[: len(cluster) + 2]:
                     inputs = [int(x) for x in (out.get("input_ids") or []) if int(x) in cluster_ids]
                     text = str(out.get("text") or "").strip()
@@ -276,7 +281,10 @@ class ClaimsMixin(HistoryMixin):
                     ).fetchone()[0] or 1
                     draft = ClaimDraft(
                         kind=primary["kind"], text=text, context=primary["context"],
-                        reasoning="consolidated", modality=primary["modality"], episode_id=primary["episode_id"],
+                        reasoning="consolidated", modality=("stated" if any(by_id[i]["modality"] == "stated"
+                            and tk.norm_key(by_id[i]["text"]) == tk.norm_key(text) for i in inputs)
+                            else "engaged" if any(by_id[i]["modality"] in {"engaged", "stated"} for i in inputs)
+                            else "passive"), episode_id=primary["episode_id"],
                         occurred_from=min(by_id[i]["occurred_from"] for i in inputs),
                         occurred_to=max(by_id[i]["occurred_to"] for i in inputs),
                         evidence=[{"observation_id": r[0], "quote": r[1] if r[2] == "supports" else ""} for r in ev],
@@ -286,17 +294,46 @@ class ClaimsMixin(HistoryMixin):
                     self._carry_mentions(conn, inputs, nid)
                     new_ids.append(nid)
                     for i in inputs:
-                        replaced.setdefault(i, nid)
+                        equivalent = tk.norm_key(by_id[i]["text"]) == tk.norm_key(text)
+                        # input_ids prove support for the output, not entailment of each premise.
+                        # Keep cited or user-stated premises unless equivalence is established.
+                        if equivalent or (i not in cited and by_id[i]["modality"] != "stated"):
+                            replaced.setdefault(i, nid)
                 ts = now()
+                dependencies = self._remap_dependencies(conn, {old: nid for old, nid in replaced.items()
+                    if tk.norm_key(by_id[old]["text"]) == tk.norm_key(
+                        conn.execute("SELECT text FROM claims WHERE id=?", (nid,)).fetchone()[0])})
                 changes = [self._set_state(conn, old, status="superseded", valid_to=ts, superseded_by=nid)
-                           for old, nid in replaced.items()]
+                           for old, nid in replaced.items()] + dependencies
                 if new_ids:
                     self._log_event(conn, "merge", "consolidate", claim_id=new_ids[0], created=new_ids,
                                     changes=changes, run_id=run_id,
-                                    reason=f"merged {len(replaced)} overlapping claims into {len(new_ids)}")
+                                    reason=f"merged {len(replaced)} overlapping claims into {len(new_ids)}",
+                                    data={"profile_before": profile_before, "profile_after": self._current_profile(conn)}
+                                    if profile_before != self._current_profile(conn) else None)
             return new_ids
 
         return await self._call(_run)
+
+    def _remap_dependencies(self, conn, replaced: dict[int, int]) -> list[dict]:
+        changes = []
+        if not replaced:
+            return changes
+        for p in conn.execute("SELECT id, derived_from FROM claims WHERE status='live' AND kind='pattern'").fetchall():
+            ids = json.loads(p["derived_from"] or "[]")
+            if not set(ids) & replaced.keys():
+                continue
+            updated = json.dumps(sorted({replaced.get(i, i) for i in ids}))
+            conn.execute("UPDATE claims SET derived_from=?, updated_at=? WHERE id=?", (updated, now(), p["id"]))
+            changes.append({"id": p["id"], "fields_before": {"derived_from": p["derived_from"]},
+                            "fields_after": {"derived_from": updated}})
+        profile = self._current_profile(conn)
+        if profile:
+            for sec in profile.get("sections", []):
+                for point in sec["points"]:
+                    point["claims"] = sorted({replaced.get(i, i) for i in point["claims"]})
+            self._set_profile(conn, profile)
+        return changes
 
     def _carry_mentions(self, conn, old_ids: list[int], new_id: int) -> None:
         for (eid,) in conn.execute(

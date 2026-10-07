@@ -220,3 +220,15 @@ async def test_checked_verdict_expires_when_claim_revision_changes(store):
     assert (a, b) not in await store.checked_pairs()
     await store.mark_pair_checked(a, b, "nonsense", "invalid model output")
     assert (a, b) not in await store.checked_pairs()
+
+
+async def test_merge_preserves_stated_authority_only_for_its_proposition(store):
+    a = await _claim(store, "The user likes the editor", n=1)
+    b = await store.create_claim(ClaimDraft(kind="preference", text="The user prefers the editor", modality="stated"))
+    [same] = await store.consolidate_cluster(await store.get_claims([a, b]), [{
+        "text": "The user prefers the editor", "input_ids": [a, b]}])
+    assert (await store.get_claim(same))["modality"] == "stated"
+    [general] = await store.consolidate_cluster(await store.get_claims([same]), [{
+        "text": "The user likes software tools", "input_ids": [same]}])
+    assert (await store.get_claim(general))["modality"] != "stated"
+    assert (await store.get_claim(same))["status"] == "live"

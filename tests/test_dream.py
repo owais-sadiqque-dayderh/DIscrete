@@ -279,3 +279,18 @@ async def test_conflicts_include_high_similarity_and_old_beliefs(store, fake, mo
     fake.conflicts = {"pairs": [{"index": 0, "verdict": "conflict", "reason": "one primary editor"}]}
     assert (await dr._conflicts(store, "r"))["resolved"] == 1
     assert (await store.get_claim(a))["status"] == "invalidated"
+
+
+async def test_merge_remaps_equivalent_pattern_and_profile_support(store):
+    ids = await _football(store)
+    p = await store.add_pattern(_pattern(ids)["text"], "interest", ids, reason="test", run_id="r")
+    await store.save_profile({"written_at": now(), "sections": [{"heading": "Interests", "points": [
+        {"text": "They check scores.", "claims": [ids[0]]}]}]}, run_id="r")
+    [merged] = await store.consolidate_cluster(await store.get_claims(ids[:2]), [{
+        "text": (await store.get_claim(ids[0]))["text"], "input_ids": ids[:2]}])
+    assert set(json.loads((await store.get_claim(p))["derived_from"])) == {merged, ids[2]}
+    assert (await store.get_profile())["sections"][0]["points"][0]["claims"] == [merged]
+    [event] = await store.recent_events(op="merge")
+    await store.revert_event(event["id"])
+    assert set(json.loads((await store.get_claim(p))["derived_from"])) == set(ids)
+    assert (await store.get_profile())["sections"][0]["points"][0]["claims"] == [ids[0]]
