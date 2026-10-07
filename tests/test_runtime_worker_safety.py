@@ -23,6 +23,44 @@ async def test_ingest_store_error_reporting_cannot_kill_worker(store, monkeypatc
         await asyncio.gather(task, return_exceptions=True)
 
 
+async def test_one_capture_that_keeps_failing_is_dropped_not_fatal(store, monkeypatch):
+    from discrete.config import T
+
+    rt = Runtime(store, bubble=False)
+    seen = []
+    async def ingest(cap):
+        seen.append(cap)
+        if cap == "poison":
+            raise ValueError("bad capture")
+    monkeypatch.setattr(rt, '_ingest', ingest)
+    monkeypatch.setattr(asyncio, 'sleep', lambda *_: asyncio.tasks.__sleep0())
+    task = asyncio.create_task(rt._ingest_loop())
+    await rt.queue.put("poison")
+    await rt.queue.put("good")
+    await asyncio.wait_for(rt.queue.join(), 1)
+    try:
+        assert not task.done() and seen.count("poison") == 3 and seen[-1] == "good"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert T.INGEST_MAX_DROPPED_IN_A_ROW > 1
+
+
+async def test_every_capture_failing_means_the_store_is_broken(store, monkeypatch):
+    from discrete.config import T
+
+    rt = Runtime(store, bubble=False)
+    async def ingest(cap):
+        raise ValueError("disk full")
+    monkeypatch.setattr(rt, '_ingest', ingest)
+    monkeypatch.setattr(asyncio, 'sleep', lambda *_: asyncio.tasks.__sleep0())
+    task = asyncio.create_task(rt._ingest_loop())
+    for n in range(T.INGEST_MAX_DROPPED_IN_A_ROW):
+        await rt.queue.put(n)
+    with pytest.raises(ValueError, match="disk full"):
+        await asyncio.wait_for(task, 1)
+
+
 async def test_essential_worker_exit_is_fatal(store):
     rt = Runtime(store, bubble=False)
     async def done():

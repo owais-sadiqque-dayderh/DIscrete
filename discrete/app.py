@@ -187,20 +187,27 @@ class Runtime:
             log.warning("could not persist runtime error counter %s", name)
 
     async def _ingest_loop(self) -> None:
+        dropped_in_a_row = 0
         while True:
             cap = await self.queue.get()
             try:
-                # Keep ownership of the dequeued capture across transient failures.
-                # Persistent failures exit through essential-worker supervision.
+                # Keep ownership of the dequeued capture across transient failures. One
+                # capture that keeps failing is dropped; several in a row mean the store
+                # itself is failing, which exits through essential-worker supervision.
                 for attempt in range(3):
                     try:
                         await self._ingest(cap)
+                        dropped_in_a_row = 0
                         break
                     except Exception:
                         log.exception("ingest failed")
                         await self._report_error("ingest_errors")
                         if attempt == 2:
-                            raise
+                            dropped_in_a_row += 1
+                            await self._report_error("ingest_dropped")
+                            if dropped_in_a_row >= T.INGEST_MAX_DROPPED_IN_A_ROW:
+                                raise
+                            break
                         await asyncio.sleep(0.5 * 2 ** attempt)
             finally:
                 self.queue.task_done()

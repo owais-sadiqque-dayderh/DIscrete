@@ -377,6 +377,8 @@ class T:
     ENRICH_CONCURRENCY = _typed("ENRICH_CONCURRENCY", 2)
     CAPTURE_QUEUE_MAX = _typed("CAPTURE_QUEUE_MAX", 16)
     CAPTURE_MAX_PENDING = _typed("CAPTURE_MAX_PENDING", 8)
+    # Captures that fail every retry, in a row, before the store counts as broken.
+    INGEST_MAX_DROPPED_IN_A_ROW = _typed("INGEST_MAX_DROPPED_IN_A_ROW", 5)
     # Rows holding a caption task (and their images) at once; the rest wait on disk.
     ENRICH_MAX_PENDING = _typed("ENRICH_MAX_PENDING", 8)
     # Windows remembered for the frame-duplicate check.
