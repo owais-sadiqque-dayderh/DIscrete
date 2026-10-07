@@ -924,3 +924,17 @@ Sources: Cognition "agent memory repo" (cognition.com/agent-memory-repo), Hindsi
 - If interrupted: check which results/*.json exist; re-run only the missing `score` lines from eval_branch2.sh.
 - Harness bug found: the judge gets `records[:30]` *lines*; raw screen-text records (many short lines) push later records out, so correct answers are marked unsupported (g46-branch aggregate 0/2 is this artifact: e.g. the cricket score came from a record the judge never saw). Codex task harness-judge-blocks-r1: block-based judge input with a char budget + `--rejudge NAME` (judge-only, writes NAME-rj.json). Plan: rejudge ALL runs (base + branch) for a fair comparison.
 - Also seen: support verification times out on many non-why queries too (8 s, muse as verifier per .env), in base and branch alike.
+
+### ~14:25 IST — rejudged results (harness 1821835: block-based judge input) — USE THESE, the old 30-line judge was unfair to every run
+| run (code @ commit) | overall | why | recall | profile | temporal | unans. | enum | aggr |
+|---|---|---|---|---|---|---|---|---|
+| g46-base-rj (main) | **0.913** | – | 28/30 | 3/3 | 4/4 | 4/5 | 1/2 | 2/2 |
+| g46-branch-rj (528a57b, old drafts) | 0.889 (1 infra) | – | 28/30 | 2/3 | 4/4 | 3/4 | 1/2 | 2/2 |
+| g46-branch-v2-rj (528a57b, redrafted) | 0.911 (1 infra) | – | 27/29 | 2/3 | 4/4 | 5/5 | 1/2 | 2/2 |
+| live-base-rj (main) | **0.533** | 3/6 | 5/9 | 1/3 | 2/4 | 4/5 | 1/2 | 0/1 |
+| live-branch-rj (528a57b) | 0.586 (1 infra) | 1/6 | 6/9 | 2/3 | 2/4 | 5/5 | 1/1 | 0/1 |
+| live-branch-v2-rj (528a57b) | 0.600 | 2/6 | 6/9 | 2/3 | 2/4 | 5/5 | 1/2 | 0/1 |
+| **live-branch-r2-rj (e7a1150 why fix)** | **0.690** (1 infra) | **5/6** | 6/9 | 2/3 | 2/4 | 4/4 | 1/2 | 0/1 |
+- g46: branch ≈ main (the old "0.652 -> 0.756" gain was a judge artifact). live1006: branch +0.157, driven by why (3/6 -> 5/6) and profile/recall.
+- why answers (r2) trace true origins: Kaustubh DM -> Omar/Agently, Cognition X post -> Agent Memory Repo, EmbeddingGemma 2 post -> OpenRouter. Miss: Helium starts at the Google search; the model-free chain finds Theo's post (obs 76, media_mention), but the support verifier rejects that record because it is not told which term linked it. Codex task why-edge-evidence-r1: persist the edge term (m015), self-explanatory chain records, verifier guidance.
+- Round 2 still running (branch2-driver.log): live-branch-v2-r2, g46-branch-geminiverify, g46-base+branchretrieval. Rejudge each with `bench/run_g46.py --rejudge NAME`.
