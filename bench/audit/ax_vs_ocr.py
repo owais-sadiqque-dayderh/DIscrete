@@ -15,19 +15,16 @@ from __future__ import annotations
 
 import argparse
 import collections
-import os
-import sqlite3
 import statistics
 import sys
 import time
 from pathlib import Path
 
-from PIL import Image
-
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from discrete import textkit as tk  # noqa: E402
 from discrete.capture import ocr  # noqa: E402
+from discrete.encryption import open_database, open_frame  # noqa: E402
 
 
 def main() -> None:
@@ -35,8 +32,7 @@ def main() -> None:
     ap.add_argument("--db", default="~/.cache/exp_discrete/discrete.db")
     ap.add_argument("--limit", type=int, default=1000)
     args = ap.parse_args()
-    conn = sqlite3.connect(f"file:{os.path.expanduser(args.db)}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = open_database(args.db, read_only=True)
     rows = conn.execute("SELECT * FROM observations WHERE origin='user' AND screen_text != '' ORDER BY id").fetchall()
 
     frag = collections.defaultdict(lambda: [0, 0, 0])  # lines, single-token lines, duplicate lines
@@ -58,7 +54,7 @@ def main() -> None:
         p = r["frame_path"]
         if not p or not Path(p).exists():
             continue
-        with Image.open(p) as im:
+        with open_frame(p) as im:
             img = im.convert("RGB")
         t = time.perf_counter()
         seen = set(tk.content_tokens(ocr.ocr_image(img)))

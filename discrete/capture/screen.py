@@ -23,6 +23,7 @@ from PIL import Image
 from .. import textkit as tk
 from ..aio import spawn
 from ..config import T, caption_endpoint, frames_dir
+from ..encryption import write_frame
 from ..models import ObservationDraft
 from ..perf import PERF, since_ms
 from . import accessibility as ax
@@ -202,7 +203,7 @@ class ScreenObserver:
         if img is None:
             return ""
         path = self.dir / f"{int(time.time() * 1000)}_{tag}.jpg"
-        img.save(path, "JPEG", quality=T.FRAME_JPEG_QUALITY)
+        write_frame(path, img, quality=T.FRAME_JPEG_QUALITY)
         return str(path)
 
     # ----------------------------------------------------------------- flush

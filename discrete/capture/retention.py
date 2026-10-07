@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import time
 
-from ..config import T, frames_dir
+from ..config import T, db_path, frames_dir
+from ..encryption import _assert_ready, store_lock
 
 log = logging.getLogger("discrete.capture.retention")
 
@@ -16,13 +17,16 @@ def purge_frames(*, ttl_days: float | None = None) -> int:
         return 0
     cutoff = time.time() - ttl * 86400
     removed = 0
-    for path in frames_dir().glob("*.jpg"):
-        try:
-            if path.stat().st_mtime < cutoff:
-                path.unlink()
-                removed += 1
-        except OSError:
-            continue
+    with store_lock(db_path().expanduser().resolve()):
+        _assert_ready(db_path().expanduser().resolve())
+        # Encrypted frames retain their names and mtimes: purge needs no key.
+        for path in frames_dir().glob("*.jpg"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                continue
     return removed
 
 

@@ -43,6 +43,7 @@ Restart the terminal after granting, then check everything:
 | `discrete run [--no-bubble]` | the daemon: capture, captions, episodes, drafting, consolidation |
 | `discrete ask "…" [--records] [--overlay]` | Bubble's pipeline headlessly; answer printed |
 | `discrete query "…"` | show exactly what retrieval returns (debugging) |
+| `discrete why "…" [--chain] [--backfill]` | inspect visit-level attention provenance and quoted evidence, without model calls; optionally rebuild the graph |
 | `discrete stats` | store summary and **model use per component** (calls, tokens, cost) |
 | `discrete bench [--since last-run] [--eval] [--save N] [--compare N]` | cost, latency per stage, capture volume, quality, storage; saved snapshots and comparisons ([`docs/C7.md`](docs/C7.md)) |
 | `discrete process [--recover] [--consolidate]` | draft waiting episodes now; `--recover` also retries failed work |
@@ -59,6 +60,61 @@ set per component in `.env`, with request settings (`_EXTRA_TOKENS`,
 `_REASONING_EFFORT`, `_TEMPERATURE`, `_JSON_MODE`, `_TIMEOUT_S`, `_EXTRA_BODY`), so any
 OpenAI-compatible model, reasoning models included, needs no code change. Check a
 new model with `discrete doctor --models`.
+
+## Encryption at rest (opt-in)
+
+Install the encryption extra on macOS (Python 3.13 arm64 wheels are available):
+
+```bash
+uv pip install --python .venv/bin/python --only-binary=sqlcipher3 -e '.[encryption]'
+# Or: .venv/bin/python -m pip install --only-binary=sqlcipher3 -e '.[encryption]'
+```
+
+For an existing store, stop the daemon, Bubble, and other store users, unlock your
+login Keychain, then run:
+
+```bash
+.venv/bin/discrete encrypt
+# With a custom database/frame directory:
+.venv/bin/discrete --db /path/to/discrete.db encrypt --frames-dir /path/to/frames
+```
+
+Then set `DISCRETE_ENCRYPT_AT_REST=true` in your configuration and restart.
+For a fresh data directory, enable the flag before the first run. The default
+is **false** on this branch; plaintext evaluation stores still use standard SQLite.
+Enabling the flag on an existing plaintext store fails with a migration instruction.
+An already encrypted store stays encrypted even if the flag is later turned off.
+
+SQLCipher encrypts the entire database, including screen text, claims, FTS indexes,
+embedding blobs and WAL pages. Frames use per-file AES-256-GCM with random nonces;
+OCR/caption/enrichment readers decrypt only in memory. A random 256-bit master key
+lives in macOS Keychain via the native Security binding; separate database/frame
+subkeys are derived in memory. Keep the database's `.encryption.json` sidecar with
+any copy; it holds a key identifier, never a key. A missing/denied/wrong key raises
+an error and never creates a replacement key for existing encrypted data.
+
+```bash
+.venv/bin/discrete rotate-key          # stop store users first; rotates DB + frames
+.venv/bin/discrete encrypt --recover   # recover ANY interrupted conversion/rotation
+DISCRETE_ENCRYPT_AT_REST=false .venv/bin/discrete decrypt  # plaintext debugging copy in place
+.venv/bin/discrete export --allow-plaintext --dir /path/to/export
+```
+
+Conversions stage, verify, and atomically replace each file. A durable journal
+blocks ordinary access during recovery: staging rolls back, a committed migration
+rolls forward. No original backup is retained by default; `--keep-backup` creates a
+timestamped directory with a `restore.json` path map. **An encryption backup contains
+the original plaintext**, and decrypt deliberately writes plaintext. Old Keychain
+items remain so retained backups/copies stay recoverable. Retention preserves
+original frame ages and deletes encrypted frames without needing their keys.
+
+Automatic Markdown exports are disabled for encrypted stores. Existing Markdown,
+Git history, manifests, logs and evaluation artifacts are outside this conversion;
+remove or protect them separately. Keys are device-local, so a database backup
+alone is insufficient for disaster recovery. Touch ID/user-presence checks and a
+signed helper with narrower Keychain access are follow-ups; this does not yet
+provide Recall-style per-view authentication. See [design, research and timing
+results](docs/encryption.md) for the threat model, recovery details and limitations.
 
 ## Memory that learns, explains and can be undone
 

@@ -261,6 +261,11 @@ def frames_dir() -> Path:
     return p
 
 
+def encrypt_at_rest() -> bool:
+    """Opt-in for new stores. Existing encrypted files are always detected on read."""
+    return _typed("ENCRYPT_AT_REST", False)
+
+
 def memory_export_dir() -> Path | None:
     """Where the Markdown mirror of memory goes (export.py): DISCRETE_MEMORY_EXPORT_DIR,
     default <data dir>/memory; "off" turns the automatic export after each dream off."""
@@ -487,6 +492,16 @@ class T:
     WHY_BEFORE_MIN = _typed("WHY_BEFORE_MIN", 10.0)
     WHY_BEFORE_MAX = _typed("WHY_BEFORE_MAX", 5)
     WHY_IMMEDIATE = _typed("WHY_IMMEDIATE", 2)
+    # Deterministic attention provenance: no model calls, visit-level evidence.
+    PROVENANCE = _typed("PROVENANCE", True)
+    PROVENANCE_WINDOW_S = _typed("PROVENANCE_WINDOW_S", 600.0)
+    PROVENANCE_BATCH = _typed("PROVENANCE_BATCH", 200)
+    PROVENANCE_MAX_PARENTS = _typed("PROVENANCE_MAX_PARENTS", 6)
+    WHY_CHAIN_DEPTH = _typed("WHY_CHAIN_DEPTH", 8)
+    WHY_CHAIN_WINDOW_S = _typed("WHY_CHAIN_WINDOW_S", 1800.0)
+    WHY_CHAIN_MIN_CONFIDENCE = _typed("WHY_CHAIN_MIN_CONFIDENCE", 0.55)
+    WHY_EFFECT_POOL = _typed("WHY_EFFECT_POOL", 300)
+    WHY_TIME_TOLERANCE_S = _typed("WHY_TIME_TOLERANCE_S", 180.0)
     # Enumeration ("list all …") bypasses TOP_K/MMR: it returns every distinct page.
     ENUMERATE_MAX = _typed("ENUMERATE_MAX", 200)
     ENUMERATE_POOL = _typed("ENUMERATE_POOL", 400)

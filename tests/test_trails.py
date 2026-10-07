@@ -86,7 +86,10 @@ async def test_reverting_a_trail_retires_its_links(store, fake):
     assert await store.links_into("claim", [cid]) == []
 
 
-async def test_why_retrieval_puts_the_trail_right_after_the_action(store, fake):
+async def test_why_retrieval_puts_the_trail_right_after_the_action(store, fake, monkeypatch):
+    from discrete.config import T
+
+    monkeypatch.setattr(T, "PROVENANCE", False)  # legacy action-trail path remains usable
     theo, _, search, _, cid = await _helium(store)
     fake.trail = {"links": [
         {"observation_id": theo, "role": "trigger", "quote": "Helium File Edit", "confidence": 0.7,
@@ -107,7 +110,10 @@ async def test_why_retrieval_puts_the_trail_right_after_the_action(store, fake):
     assert result.hits[1].via.startswith(f"led to claim {cid}") and result.hits[1].strong
 
 
-async def test_without_a_trail_the_moments_before_the_action_are_offered(store, fake):
+async def test_without_a_trail_the_moments_before_the_action_are_offered(store, fake, monkeypatch):
+    from discrete.config import T
+
+    monkeypatch.setattr(T, "PROVENANCE", False)  # exercise the compatibility fallback
     theo, music, search, _, cid = await _helium(store)
     action = Hit("claim", cid, "The user downloaded the Helium browser for macOS", "", claim_kind="event",
                  action="downloaded", occurred_at=T0 + 40, strong=True)

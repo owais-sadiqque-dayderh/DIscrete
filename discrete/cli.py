@@ -19,6 +19,7 @@ from pathlib import Path
 
 from . import textkit as tk
 from .config import ConfigError, T, all_endpoints, data_dir, db_path
+from .encryption import EncryptionError
 from .evaluation import bench
 from .evaluation.check_cli import register_check
 from .evaluation.harness import compare, default_cases, run_suite, save_baseline
@@ -193,6 +194,21 @@ async def cmd_query(args) -> int:
         if args.gap and d.mode in ("thin", "empty"):
             outcome = await maybe_record_gap(store, args.text, result=result)
             _print(f"gap outcome: {outcome.kind} {outcome.missed or outcome.gap_id or ''}")
+    return 0
+
+
+async def cmd_why(args) -> int:
+    """Debug raw provenance without opening any model endpoint."""
+    from .process.provenance import build_provenance
+    from .retrieval.why import render_chain, resolve_why
+
+    store = await Store.open()
+    try:
+        if args.backfill:
+            _print(f"built {await build_provenance(store, backfill=True)} attention edges")
+        _print(render_chain(await resolve_why(store, args.text), details=args.chain))
+    finally:
+        await store.close()
     return 0
 
 
@@ -395,6 +411,8 @@ async def _refresh_export(store) -> None:
     from .config import memory_export_dir
     from .export import export_markdown
 
+    if getattr(store.conn, "_discrete_encrypted", False):
+        return  # Plaintext export requires a fresh, explicit user action.
     out = memory_export_dir()
     if out is not None and (out / ".discrete-export").exists():
         await export_markdown(store, out, git=T.MEMORY_EXPORT_GIT)
@@ -468,9 +486,27 @@ async def cmd_export(args) -> int:
 
     out = _export_dir(args.dir)
     async with _session() as store:
-        report = await export_markdown(store, out, git=args.git or T.MEMORY_EXPORT_GIT)
+        report = await export_markdown(store, out, git=args.git or T.MEMORY_EXPORT_GIT, allow_plaintext=args.allow_plaintext)
     _print(json.dumps(report, indent=2, default=str))
     _print(f"open {out}/MEMORY.md (or the folder as an Obsidian vault)")
+    return 0
+
+
+async def cmd_encryption(args) -> int:
+    from dataclasses import asdict
+
+    from .config import frames_dir
+    from .encryption_migration import migrate_encryption, recover_migration
+
+    path = db_path()
+    if args.recover:
+        report = await asyncio.to_thread(recover_migration, path)
+    else:
+        root = Path(args.frames_dir) if args.frames_dir else (
+            path.parent / "frames" if args.db else frames_dir())
+        operation = "rotate" if args.cmd == "rotate-key" else args.cmd
+        report = await asyncio.to_thread(migrate_encryption, path, root, operation=operation, keep_backup=args.keep_backup)
+    _print(json.dumps(asdict(report), indent=2))
     return 0
 
 
@@ -503,6 +539,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
     register_check(sub)
+
+    for name, help_text in (("encrypt", "encrypt the store and frames offline using macOS Keychain"),
+                            ("decrypt", "decrypt the store and frames to plaintext for debugging"),
+                            ("rotate-key", "replace the data key and re-encrypt the store and frames")):
+        pcipher = sub.add_parser(name, help=help_text)
+        pcipher.add_argument("--frames-dir", default="", help="frame directory (with --db: defaults to <db parent>/frames)")
+        pcipher.add_argument("--keep-backup", action="store_true", help="retain a timestamped copy of the ORIGINAL files")
+        pcipher.add_argument("--recover", action="store_true", help="recover any interrupted encrypt/decrypt/key rotation")
+        pcipher.set_defaults(func=cmd_encryption)
 
     pt = sub.add_parser("tasks", help="list research/work threads across drafted episodes")
     pt.add_argument("-n", type=int, default=20, help="maximum tasks to list")
@@ -546,6 +591,12 @@ def build_parser() -> argparse.ArgumentParser:
     pq.add_argument("--field", default="")
     pq.add_argument("--gap", action="store_true", help="verify and record a gap if unanswerable")
     pq.set_defaults(func=cmd_query)
+
+    pw = sub.add_parser("why", help="model-free attention provenance diagnosis")
+    pw.add_argument("text")
+    pw.add_argument("--chain", action="store_true", help="include literal endpoint quotes")
+    pw.add_argument("--backfill", action="store_true", help="rebuild stored attention edges without model calls")
+    pw.set_defaults(func=cmd_why)
 
     pe = sub.add_parser("eval", help="score the golden retrieval cases")
     pe.add_argument("--cases", help="case file (default golden/cases.yaml)")
@@ -619,6 +670,7 @@ def build_parser() -> argparse.ArgumentParser:
     px.add_argument("--dir", default="", help="default: DISCRETE_MEMORY_EXPORT_DIR or <data dir>/memory")
     px.add_argument("--git", action="store_true",
                     help="commit the export to git (keeps every version, forgotten ones too)")
+    px.add_argument("--allow-plaintext", action="store_true", help="explicitly export plaintext from an encrypted store")
     px.set_defaults(func=cmd_export)
 
     pat = sub.add_parser("attention", help="where your time went: per site, app or page")
@@ -644,6 +696,9 @@ def main(argv: list[str] | None = None) -> None:
         code = 130
     except ConfigError as exc:
         _err(f".env: {exc}")
+        code = 2
+    except EncryptionError as exc:
+        _err(f"encryption: {exc}")
         code = 2
     sys.exit(code or 0)
 

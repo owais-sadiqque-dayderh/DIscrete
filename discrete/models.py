@@ -151,6 +151,59 @@ class RetrievalResult:
     hits: list[Hit] = field(default_factory=list)
     exhaustive: bool = False
     digest: str = ""
+    why_chain: WhyChain | None = None
 
     def of(self, kind: str) -> list[Hit]:
         return [h for h in self.hits if h.ref_kind == kind]
+
+
+@dataclass(frozen=True)
+class AttentionMoment:
+    """A visit, not a widened deduplicated observation interval."""
+
+    sighting_id: int
+    observation_id: int
+    at: float
+    ended_at: float
+    fields: dict[str, str]
+    app: str = ""
+    session_id: str = ""
+    episode_id: int | None = None
+    keys: int = 0
+    clicks: int = 0
+    clipboard: int = 0
+    updated_at: float = 0.0
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.fields.values())
+
+    @property
+    def title(self) -> str:
+        return self.fields.get("page_title") or self.fields.get("window_title") or self.app
+
+
+@dataclass(frozen=True)
+class ProvenanceEdge:
+    source: int
+    target: int
+    kind: str
+    confidence: float
+    source_field: str
+    source_quote: str
+    target_field: str
+    target_quote: str
+    gap_s: float
+
+
+@dataclass
+class WhyChain:
+    effect: AttentionMoment | None = None
+    moments: list[AttentionMoment] = field(default_factory=list)
+    edges: list[ProvenanceEdge] = field(default_factory=list)
+    trails: list[dict] = field(default_factory=list)
+    reason: str = "effect not found"
+
+    @property
+    def confidence(self) -> float:
+        return min((e.confidence for e in self.edges), default=0.0)

@@ -49,7 +49,8 @@ class IndexMixin(StoreBase):
             try:
                 rows = self.rconn.execute(f"SELECT rowid FROM {table} WHERE {table} MATCH ? ORDER BY {rank} LIMIT ?",
                                           (match, limit)).fetchall()
-            except sqlite3.OperationalError as exc:  # malformed MATCH expression
+            except getattr(self.rconn, "_discrete_operational_error", sqlite3.OperationalError) as exc:
+                # SQLCipher has its own DB-API exception classes.
                 log.debug("fts %s: %s", table, exc)
                 return []
             return [int(r[0]) for r in rows]

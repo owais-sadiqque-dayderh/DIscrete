@@ -73,6 +73,7 @@ async def verify_support(result: RetrievalResult) -> None:
         return
     if not verifier_endpoint().configured:
         result.hits, result.digest = [], ""
+        result.why_chain = None
         return
     fixed = {id(h) for h in result.hits if _preverified(h)}
     order = {id(h): n for n, h in enumerate(result.hits)}
@@ -92,10 +93,15 @@ async def verify_support(result: RetrievalResult) -> None:
     except TimeoutError:
         log.warning("retrieval support verification timed out; results left unverified")
         PERF.count("retrieve.support_timeout")
+        # Deterministic connections have never been independently verified. The
+        # legacy timeout behavior must not expose them as an answerable chain.
+        result.hits = [h for h in result.hits if not h.via.startswith("attention provenance")]
+        result.why_chain = None
         return
     except (*EXPECTED_ERRORS, ValueError) as exc:
         log.warning("retrieval support verification failed: %s", exc)
         result.hits, result.digest = [], ""
+        result.why_chain = None
         return
     kept = []
     for batch, ok in zip(batches, found, strict=True):
@@ -109,6 +115,12 @@ async def verify_support(result: RetrievalResult) -> None:
     kept_claims = {h.ref_id for h in kept if h.ref_kind == "claim"}
     kept += [h for h in result.hits if id(h) in fixed and _target(h) in kept_claims]
     result.hits = sorted(kept, key=lambda h: order[id(h)])
+    if result.why_chain and result.why_chain.edges:
+        provenance = [h for h in checked if h.via.startswith("attention provenance")]
+        # A partially verified chain would give the writer an unverified jump.
+        if any(id(h) not in {id(k) for k in kept} for h in provenance):
+            result.hits = [h for h in result.hits if not h.via.startswith("attention provenance")]
+            result.why_chain = None
 
 
 def _target(h: Hit) -> int:

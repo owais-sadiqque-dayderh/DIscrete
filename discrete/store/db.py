@@ -456,6 +456,33 @@ def m012_episode_draft_state(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX ix_ep_unmerged ON episodes(started_at, id) WHERE status!='merged'")
 
 
+def m013_attention_provenance(conn: sqlite3.Connection) -> None:
+    """Quoted, deterministic visit-to-visit connections; cascade with raw evidence."""
+    conn.execute("""CREATE TABLE attention_provenance(
+      source INTEGER NOT NULL REFERENCES sightings(id) ON DELETE CASCADE,
+      target INTEGER NOT NULL REFERENCES sightings(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL,
+      confidence REAL NOT NULL CHECK(confidence BETWEEN 0 AND 1),
+      source_field TEXT NOT NULL, source_quote TEXT NOT NULL,
+      target_field TEXT NOT NULL, target_quote TEXT NOT NULL,
+      gap_s REAL NOT NULL CHECK(gap_s >= 0),
+      CHECK(source != target), PRIMARY KEY(source, target, kind))""")
+    conn.execute("CREATE INDEX ix_provenance_target ON attention_provenance(target, confidence DESC)")
+    conn.execute("""CREATE TABLE provenance_inputs(
+      sighting_id INTEGER PRIMARY KEY REFERENCES sightings(id) ON DELETE CASCADE,
+      updated_at REAL NOT NULL, rules_key TEXT NOT NULL)""")
+    # Enrichment/redaction changes can invalidate either end. Rebuild destinations
+    # in their bounded neighborhood, including out-of-order capture imports.
+    conn.execute("""CREATE TRIGGER provenance_observation_changed AFTER UPDATE OF
+      screen_text, caption, window_title, page_title, url, navigated_from, origin ON observations BEGIN
+        DELETE FROM provenance_inputs WHERE sighting_id IN
+          (SELECT target FROM attention_provenance WHERE source IN (SELECT id FROM sightings WHERE obs_id=new.id));
+        DELETE FROM attention_provenance WHERE source IN (SELECT id FROM sightings WHERE obs_id=new.id)
+          OR target IN (SELECT id FROM sightings WHERE obs_id=new.id);
+        DELETE FROM provenance_inputs WHERE sighting_id IN (SELECT id FROM sightings WHERE obs_id=new.id);
+      END""")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_base,
     m002_draft_attempts_and_digest_counts,
@@ -469,6 +496,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m010_episode_draft_chunks,
     m011_tasks,
     m012_episode_draft_state,
+    m013_attention_provenance,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)
@@ -507,14 +535,19 @@ def migrate(conn: sqlite3.Connection) -> int:
 
 
 def connect(path: str, *, read_only: bool = False) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=30)
-    conn.row_factory = sqlite3.Row
-    if read_only:
-        # A second connection for retrieval: WAL lets it read while the writer writes.
-        conn.execute("PRAGMA query_only=ON")
+    from ..encryption import open_database
+
+    conn = open_database(path, read_only=read_only)
+    try:
+        if read_only:
+            # A second connection for retrieval: WAL lets it read while the writer writes.
+            conn.execute("PRAGMA query_only=ON")
+            return conn
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        migrate(conn)
         return conn
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    migrate(conn)
-    return conn
+    except BaseException:
+        conn.close()
+        raise

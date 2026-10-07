@@ -31,6 +31,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.6", "pyright>=1.1.380"]
+encryption = [
+    "sqlcipher3>=0.6.2,<0.7",
+    "cryptography>=43",
+    "pyobjc-framework-Security>=10.0; sys_platform == 'darwin'",
+]
 
 [project.scripts]
 discrete = "discrete.cli:main"

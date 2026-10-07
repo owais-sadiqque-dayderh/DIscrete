@@ -3,16 +3,15 @@
     .venv/bin/python bench/audit/show_obs.py ID [ID...] [--db PATH] [--chars N]
 """
 import argparse
-import os
-import sqlite3
+
+from discrete.encryption import open_database
 
 ap = argparse.ArgumentParser()
 ap.add_argument("ids", nargs="+", type=int)
 ap.add_argument("--db", default="~/.cache/exp_discrete/discrete.db")
 ap.add_argument("--chars", type=int, default=900)
 a = ap.parse_args()
-conn = sqlite3.connect(f"file:{os.path.expanduser(a.db)}?mode=ro", uri=True)
-conn.row_factory = sqlite3.Row
+conn = open_database(a.db, read_only=True)
 for i in a.ids:
     r = conn.execute("SELECT * FROM observations WHERE id=?", (i,)).fetchone()
     print(f"### {r['id']} {r['app']} | {r['window_title'][:90]} | {r['url'][:80]} | {r['text_source']} | {r['event_kind']} "

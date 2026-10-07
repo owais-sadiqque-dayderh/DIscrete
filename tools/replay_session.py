@@ -7,12 +7,11 @@ import asyncio
 import json
 from pathlib import Path
 
-from PIL import Image
-
 from discrete.capture.enrich import Enricher, EnrichJob
 from discrete.capture.redact import SecretMemory, redact_capture
 from discrete.capture.suppress import classify_origin
 from discrete.config import T
+from discrete.encryption import open_frame
 from discrete.llm import flush_usage
 from discrete.models import ObservationDraft
 from discrete.perf import PERF
@@ -63,7 +62,7 @@ async def replay(args):
             if not item.get("image"):
                 return
             async with slots:  # decode a frame only when a caption slot is free (bounded memory)
-                with Image.open(item["image"]) as im:
+                with open_frame(item["image"]) as im:
                     job = EnrichJob([im.convert("RGB")], draft.app, draft.window_title, draft.url,
                                     draft.screen_text,
                                     {k: getattr(draft, k) for k in ("keys", "clicks", "scrolls", "clipboard")})

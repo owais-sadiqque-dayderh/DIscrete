@@ -6,14 +6,13 @@ Novel tokens: caption content tokens absent from screen_text, window_title, app,
 url and page_title, after removing caption boilerplate ("user", "viewing", ...).
 """
 import argparse
-import os
-import sqlite3
 import statistics
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from discrete import textkit as tk  # noqa: E402
+from discrete.encryption import open_database  # noqa: E402
 
 BOILER = set("""user users viewing views viewed view screen shows showing shown page open opened displayed visible
 scrolling scrolls scrolled scroll clicking click clicks clicked typing typed type no interaction interactions
@@ -23,8 +22,7 @@ occurs occurring just without having has their they through also""".split())
 ap = argparse.ArgumentParser()
 ap.add_argument("--db", default="~/.cache/exp_discrete/discrete.db")
 a = ap.parse_args()
-conn = sqlite3.connect(f"file:{os.path.expanduser(a.db)}?mode=ro", uri=True)
-conn.row_factory = sqlite3.Row
+conn = open_database(a.db, read_only=True)
 rows = conn.execute("SELECT * FROM observations WHERE origin='user' AND enrich_state='done' AND caption != ''").fetchall()
 nov, titleonly, lens, verbs = [], 0, [], 0
 ACT = ("typed", "typing", "selected", "clicked", "copied", "scrolled", "opened", "submitted", "searched", "installing",

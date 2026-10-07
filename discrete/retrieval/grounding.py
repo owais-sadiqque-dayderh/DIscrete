@@ -25,7 +25,9 @@ def evaluate(result: RetrievalResult) -> GroundingDecision:
     if intent == "enumerate":
         return GroundingDecision("enumerate" if result.hits else "empty", strong, weak)
     if intent == "why" and strong:
-        return GroundingDecision("why", strong, weak)
+        context = any(h.strong and h.via.startswith(("attention provenance", "led to claim", "a step towards claim",
+                                                    "before ", "the page ")) for h in result.hits)
+        return GroundingDecision("why" if context else "thin", strong, weak)
     if strong or (result.exhaustive and result.hits):
         return GroundingDecision("grounded", strong, weak)
     return GroundingDecision("thin" if weak else "empty", strong, weak)

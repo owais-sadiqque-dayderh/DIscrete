@@ -57,6 +57,10 @@ def strip_scaffold(text: str) -> str:
     return " ".join(t for t in tk.content_tokens(text) if t not in _ENUM_SCAFFOLD)
 
 
+def is_why(text: str, plan: QueryPlan | None = None) -> bool:
+    return bool((plan and plan.intent == "why") or _WHY.search(text))
+
+
 KIND_VOCAB = {
     "software": ("tool", "tools", "app", "apps", "software", "program", "programs", "editor", "editors"),
     "website": ("site", "sites", "website", "websites", "domain", "domains", "page", "pages"),
@@ -138,7 +142,7 @@ def fallback_plan(text: str) -> QueryPlan:
         intent = "continuation"
     interval = parse_interval(text)
     kind = ""
-    if intent == "recall" and _WHY.search(text):
+    if intent in ("recall", "continuation") and is_why(text):
         intent = "why"
     elif intent == "recall" and _AGG.search(text):
         intent = "aggregate"
@@ -189,6 +193,11 @@ def parse_interval(text: str, ref: float | None = None) -> tuple[float, float] |
             t = ref - n * 3600
             return t - 3600, t + 3600
         return day_bounds(ref - n * 86400)
+    # A clock-only anchor identifies the captured moment across stored days. It
+    # must not silently become today's date (or discard yesterday's captures).
+    without_clock = re.sub(r"\b\d{1,2}:\d{2}\s*(?:am|pm)?\b", "", text, flags=re.I)
+    if is_why(text) and re.search(r"\b\d{1,2}:\d{2}\b", text) and not _TEMPORAL_CUE.search(without_clock):
+        return None
     try:
         found = search_dates(text, settings={"PREFER_DATES_FROM": "past", "RELATIVE_BASE": local.replace(tzinfo=None)})
     except Exception:

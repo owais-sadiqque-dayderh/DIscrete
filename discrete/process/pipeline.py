@@ -102,7 +102,6 @@ class ProcessPipeline:
             with PERF.timer("draft.episode", ref_id=episode_id) as t:
                 res = await self._draft(episode_id)
                 t.n = res.added + res.reinforced
-            return res
         except (*EXPECTED_ERRORS, DraftConflict) as exc:
             log.warning("episode %s draft failed: %s", episode_id, exc)
             await self.store.draft_failed(episode_id)
@@ -114,6 +113,16 @@ class ProcessPipeline:
             await self.store.bump_metric("draft_cancelled" if isinstance(exc, asyncio.CancelledError) else "draft_failed")
             await self._count_abandoned(episode_id)
             raise
+        # Outside the draft lifecycle: even cancellation here must not reopen a
+        # committed episode. The maintenance pass resumes unfinished graph work.
+        from .provenance import build_provenance
+
+        try:
+            await build_provenance(self.store)
+        except Exception:
+            log.exception("attention provenance failed after episode %s", episode_id)
+            await self.store.bump_metric("provenance_failed")
+        return res
 
     async def _count_abandoned(self, episode_id: int) -> None:
         episode = await self.store.get_episode(episode_id)

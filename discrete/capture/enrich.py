@@ -22,6 +22,7 @@ from PIL import Image
 from .. import textkit as tk
 from ..aio import spawn
 from ..config import T, caption_endpoint
+from ..encryption import open_frame
 from ..llm import EXPECTED_ERRORS, TokenLimit, complete_json, image_part
 from ..models import ObservationDraft
 from ..perf import PERF, since_ms
@@ -115,7 +116,7 @@ class Enricher:
 
             def load(path=r["frame_path"]) -> list[Image.Image]:
                 if path and Path(path).exists():
-                    with Image.open(path) as im:
+                    with open_frame(path) as im:
                         return [im.convert("RGB")]
                 return []
 
@@ -242,7 +243,7 @@ async def backfill_page_fields(store: Store, *, limit: int = 500) -> dict[str, i
     def load(path: str) -> list[Image.Image]:
         if not path or not Path(path).exists():
             return []
-        with Image.open(path) as im:
+        with open_frame(path) as im:
             return [im.convert("RGB")]
 
     async def one(r) -> None:

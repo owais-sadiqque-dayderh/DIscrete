@@ -12,14 +12,13 @@ from __future__ import annotations
 
 import argparse
 import collections
-import os
-import sqlite3
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from discrete import textkit as tk  # noqa: E402
+from discrete.encryption import open_database  # noqa: E402
 
 DRAFT_MAX_OBS = 40
 DRAFT_TEXT_CHARS_PER_OBS = 1200
@@ -29,8 +28,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="~/.cache/exp_discrete/discrete.db")
     args = ap.parse_args()
-    conn = sqlite3.connect(f"file:{os.path.expanduser(args.db)}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = open_database(args.db, read_only=True)
     obs = {r["id"]: r for r in conn.execute("SELECT * FROM observations")}
     ev = conn.execute("SELECT e.*, c.kind, c.episode_id FROM evidence e JOIN claims c ON c.id=e.claim_id").fetchall()
 

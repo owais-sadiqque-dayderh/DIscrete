@@ -194,8 +194,9 @@ def check_store(path: str | Path, *, expect: str | Path | None = None, slo: bool
     """
     expected = load_expectations(expect)
     path = Path(path).expanduser().resolve()
-    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    from ..encryption import open_database
+
+    conn = open_database(str(path), read_only=True)
     try:
         conn.execute("PRAGMA query_only=ON")
         conn.execute("BEGIN")

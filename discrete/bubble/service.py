@@ -180,7 +180,8 @@ class BubbleService:
                 return
             n = len(p.result.hits)
             log.info("bubble: mode=%s intent=%s hits=%d retrieve=%.2fs query=%r", p.mode, p.result.plan.intent,
-                     n, p.timings["retrieve_s"], p.query[:80])
+                     n, p.timings["retrieve_s"], "[encrypted store]" if getattr(
+                         self.store.conn, "_discrete_encrypted", False) else p.query[:80])
             if p.mode == "empty":
                 self.stats["empty"] += 1
                 self.overlay.message("Nothing on file about that", tone="muted")

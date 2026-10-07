@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 from pathlib import Path
+
+from discrete.encryption import open_database
 
 FIELDS = ("source", "origin", "event_kind", "session_id", "started_at", "ended_at", "app", "bundle_id",
           "window_title", "url", "site", "screen_text", "text_source", "keys", "clicks", "scrolls", "clipboard")
@@ -22,11 +23,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--allow-plaintext", action="store_true", help="explicitly export plaintext from an encrypted store")
     args = parser.parse_args()
+    db = open_database(str(args.db), read_only=True)
+    try:
+        if getattr(db, "_discrete_encrypted", False) and not args.allow_plaintext:
+            parser.error("An encrypted store requires --allow-plaintext to export its raw text.")
+        rows = db.execute("SELECT * FROM observations ORDER BY started_at, id").fetchall()
+    finally:
+        db.close()
     args.out.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(f"file:{args.db.expanduser()}?mode=ro", uri=True)
-    db.row_factory = sqlite3.Row
-    rows = db.execute("SELECT * FROM observations ORDER BY started_at, id").fetchall()
     n_frames = 0
     with (args.out / "manifest.jsonl").open("w") as f:
         for r in rows:

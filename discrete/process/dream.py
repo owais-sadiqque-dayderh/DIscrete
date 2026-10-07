@@ -152,10 +152,13 @@ async def run_dream(store: Store) -> dict:
         # The Markdown mirror follows each dream, so its git log is the history of beliefs.
         from ..export import export_markdown
 
-        try:
-            report["export"] = await export_markdown(store, out, git=T.MEMORY_EXPORT_GIT)
-        except OSError as exc:
-            log.warning("memory export failed: %s", exc)
+        if getattr(store.conn, "_discrete_encrypted", False):
+            report["export"] = {"skipped": "encrypted store; use discrete export --allow-plaintext"}
+        else:
+            try:
+                report["export"] = await export_markdown(store, out, git=T.MEMORY_EXPORT_GIT)
+            except OSError as exc:
+                log.warning("memory export failed: %s", exc)
     return report
 
 

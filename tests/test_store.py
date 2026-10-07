@@ -139,7 +139,7 @@ async def test_episode_draft_state_migration_moves_meta_to_columns(tmp_path, mon
 
     path = str(tmp_path / "episode-meta.db")
     with monkeypatch.context() as legacy:
-        legacy.setattr(db, "MIGRATIONS", db.MIGRATIONS[:-1])
+        legacy.setattr(db, "MIGRATIONS", db.MIGRATIONS[:db.MIGRATIONS.index(db.m012_episode_draft_state)])
         conn = db.connect(path)
     try:
         conn.executemany(

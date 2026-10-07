@@ -9,10 +9,9 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-from PIL import Image
-
 from discrete.capture.enrich import Enricher, EnrichJob
 from discrete.config import caption_endpoint, insight_endpoint
+from discrete.encryption import open_frame
 from discrete.llm import complete_json
 from discrete.process.prompts import VERIFY_CLAIMS_PROMPT
 from discrete.store import Store
@@ -61,7 +60,7 @@ async def compare(args):
                     result["captions"] = []
                     for label in ("budget-arithmetic", "scanned-review-ocr"):
                         item = items[label]
-                        with Image.open(item["image"]) as im:
+                        with open_frame(item["image"]) as im:
                             frames = [im.convert("RGB")]
                         d = item["draft"]
                         job = EnrichJob(frames, d["app"], d["window_title"], d["url"], d["screen_text"],

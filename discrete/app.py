@@ -37,6 +37,7 @@ from .process.embed_worker import drain_outbox, embed_row, observation_text
 from .process.entities import promote_recurring
 from .process.episodes import EpisodeTracker
 from .process.pipeline import ProcessPipeline
+from .process.provenance import build_provenance
 from .process.trails import build_trails
 from .store import Store
 from .timeutil import now
@@ -247,7 +248,10 @@ class Runtime:
             await self.store.retry_failed_outbox(older_than_s=T.FAILED_WORK_RETRY_S)
             await drain_outbox(self.store)
 
-        steps = (housekeeping, trails, entities, consolidation, dream, retention)
+        async def provenance() -> None:
+            await build_provenance(self.store)
+
+        steps = (provenance, housekeeping, trails, entities, consolidation, dream, retention)
         while True:
             # Each step on its own: one failing (a model outage, a bad reply) must not
             # starve the others, as a single shared try did.

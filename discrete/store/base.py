@@ -44,7 +44,11 @@ class StoreBase:
     async def open(cls, path: str | None = None):
         path = str(path or db_path())
         conn = connect(path)
-        rconn = None if path == ":memory:" else connect(path, read_only=True)
+        try:
+            rconn = None if path == ":memory:" else connect(path, read_only=True)
+        except BaseException:
+            conn.close()
+            raise
         return cls(conn, rconn)
 
     async def close(self) -> None:

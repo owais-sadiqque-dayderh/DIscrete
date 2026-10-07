@@ -77,7 +77,12 @@ MODE_INSTRUCTIONS = {
         "the records: name the action, then what led to it, in time order with times (e.g. what they saw, then "
         "what they searched or opened, then the action). Records marked 'led to' are the strongest link. Present "
         "the reason as likely ('probably', 'it looks like'), never as their stated motive. If only 'shortly "
-        "before' records exist, say what preceded it without claiming it caused it. Address them as 'you'."
+        "before' records exist, say what preceded it without claiming it caused it. Attention provenance records "
+        "form an ordered chain of stored quotes: mention its origin and intermediate steps. Its confidence is "
+        "an association heuristic, not proof of motive. For state_context, the other app was recently observed "
+        "in the foreground; say it may still have been open, never assert background process liveness. A dialog's "
+        "own instruction can explain the required state. If the records show only the effect, say you don't know "
+        "what caused it. Address them as 'you'."
     ),
     "continuation": (
         "Continue the draft naturally from where it stops. Use a record only where it genuinely fits; never "

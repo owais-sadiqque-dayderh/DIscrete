@@ -135,8 +135,13 @@ def _write_pages(out_dir: Path, pages: dict[str, str], git: bool) -> dict:
     return {"files_written": written, "files_removed": removed, "committed": committed, "commit_sha": sha}
 
 
-async def export_markdown(store: Store, out_dir: Path, *, git: bool = True) -> dict:
+async def export_markdown(store: Store, out_dir: Path, *, git: bool = True, allow_plaintext: bool = False) -> dict:
     """Write the store's current memory pages and optionally commit their diff."""
+    if getattr(store.conn, "_discrete_encrypted", False) and not allow_plaintext:
+        from .encryption import EncryptionError
+
+        raise EncryptionError("Markdown exports contain plaintext. Use `discrete export --allow-plaintext` "
+                              "to explicitly export an encrypted store. Automatic Markdown exports are disabled.")
     claims = sorted(await store.live_claims(), key=lambda row: row["id"])
     strengths = await store.strengths([row["id"] for row in claims])
     evidence = {row["id"]: await store.evidence_for_claim(row["id"]) for row in claims}

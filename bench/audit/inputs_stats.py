@@ -14,8 +14,6 @@ from __future__ import annotations
 import argparse
 import collections
 import json
-import os
-import sqlite3
 import statistics
 import sys
 from pathlib import Path
@@ -23,13 +21,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from discrete import textkit as tk  # noqa: E402
+from discrete.encryption import open_database  # noqa: E402
 
 MIN_CAPTURES = 5
 
 
 def load_db(path: str) -> list[dict]:
-    conn = sqlite3.connect(f"file:{os.path.expanduser(path)}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = open_database(path, read_only=True)
     rows = [dict(r) for r in conn.execute("SELECT * FROM observations ORDER BY started_at, id")]
     conn.close()
     return rows

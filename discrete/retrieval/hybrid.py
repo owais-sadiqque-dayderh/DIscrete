@@ -22,6 +22,7 @@ from .enumerate import enumerate_pages
 from .query import build_plan
 from .rerank import llm_rerank
 from .support import verify_support
+from .why import chain_hits, resolve_why
 
 log = logging.getLogger("discrete.retrieval.hybrid")
 
@@ -243,6 +244,26 @@ async def expand_why(store: Store, result: RetrievalResult) -> None:
     judge: those naming the same thing (with the matching line of screen text, since
     the caption often misses it: a browser's menu bar inside a video), the page it was
     reached from, and the moment or two just before."""
+    chain = await resolve_why(store, result.query, plan=result.plan, hits=result.hits)
+    if chain.effect is not None:
+        result.why_chain = chain
+    if chain.edges:
+        records = chain_hits(chain)
+        ids = {h.ref_id for h in records}
+        result.hits = records + [h for h in result.hits if h.ref_kind != "observation" or h.ref_id not in ids]
+        # Keep independently verified completed-action trails alongside the graph.
+        links = chain.trails
+        rows = {r["id"]: r for r in await store.get_observations([lk["src_id"] for lk in links], user_only=True)}
+        for lk in links:
+            if lk["src_id"] not in rows:
+                continue
+            quotes = json.loads(lk["evidence"] or "[]")
+            role = "led to" if lk["relation"] == "led_to" else "a step towards"
+            h = _trail_hit(rows[lk["src_id"]], quotes[0]["quote"] if quotes else "",
+                           via=f"{role} claim {lk['dst_id']}: {lk['reason']}")
+            h.strong = True
+            result.hits.append(h)
+        return
     anchors = sorted((h for h in result.hits if h.ref_kind == "claim" and h.claim_kind == "event"),
                      key=lambda h: not h.action)[: T.WHY_TARGETS]  # stable: actions first, then rank
     if not anchors:
@@ -266,7 +287,7 @@ async def expand_why(store: Store, result: RetrievalResult) -> None:
         have.add(("observation", r["id"]))
     anchor = anchors[0]
     key = (anchor.ref_kind, anchor.ref_id)
-    if key not in added and anchor.occurred_at:
+    if key not in added and anchor.occurred_at and not T.PROVENANCE:
         added[key] = await _moments_before(store, anchor, result.query, have)
     if not any(added.values()):
         return
