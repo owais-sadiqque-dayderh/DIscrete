@@ -115,7 +115,20 @@ Phases 18–19).
   - `live-base` **0.433 (13/30)**, scored 12:45 with the hardened harness, 0 infra errors. By category: why 4/6,
     unanswerable 4/5, recall 4/9, temporal 1/4, profile 0/3, enumerate 0/2, aggregate 0/1. Supported 0.633, hit@k
     0.52, p50 19.1 s, $0.07. File: `bench/private/results/live-base.json`.
-  - **No branch scores yet.** Everything from the 07:20–08:05 attempt was invalidated by the outage.
+  - **No branch scores yet.**
+- **13:00 — r3 fixes + why effect selection committed** `528a57b` (616 tests).
+  - By default, all six live why chains resolve to their true origins.
+- **Branch evaluation RUNNING** from the frozen worktree `../exp_discrete_eval` @ `528a57b`.
+  - Script: `bench/private/eval_branch.sh`. Log: `bench/private/results/branch-driver.log`, which ends `ALL DONE`
+    plus two compare tables.
+  - Phase 1, 4 parallel jobs: g46-branch, live-branch (old drafts + final code), g46-branch-v2, live-branch-v2
+    (redrafted with the final code).
+  - Phase 2: g46-branch-geminiverify, g46-base+branchretrieval.
+  - Each db is copied to `*-dream.db`, gets the page + provenance backfill (no model), then `dream --force`, then is
+    scored.
+  - If interrupted: check which `results/<name>.json` exist and re-run only the missing jobs. Read per-name logs and
+    the `"valid"` flag.
+ Everything from the 07:20–08:05 attempt was invalidated by the outage.
 - OpenRouter credit: **$7.32** left ($45 total, $37.68 used). Disk: 12 GiB free.
 
 **Evaluation plan, to run once muse answers:**
