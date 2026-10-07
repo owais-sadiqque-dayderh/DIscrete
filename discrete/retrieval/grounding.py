@@ -15,6 +15,8 @@ class GroundingDecision:
 
 
 def evaluate(result: RetrievalResult) -> GroundingDecision:
+    if result.page_answer and result.plan.page_operation:
+        return GroundingDecision("pages", len(result.hits), 0)
     intent = result.plan.intent
     if intent == "edit":
         return GroundingDecision("edit", 0, 0)

@@ -195,8 +195,8 @@ class BubbleEngine:
                     should_continue: Callable[[], bool] = lambda: True) -> str:
         """Stream the writer, emitting at word boundaries so the field never shows half a word.
         `emit` returns False when it could not insert, which stops the run."""
-        if p.mode == "enumerate":
-            text = format_enumerate_answer(p.result)
+        if p.mode in ("enumerate", "pages"):
+            text = p.result.page_answer if p.mode == "pages" else format_enumerate_answer(p.result)
             if not text:
                 return ""
             if needs_space(p.field_text, text):

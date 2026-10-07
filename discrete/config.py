@@ -417,6 +417,9 @@ class T:
     # Attention (store/attention.py): a sighting lasts until the next one, at most this long.
     DWELL_GAP_CAP_S = _typed("DWELL_GAP_CAP_S", 180.0)
     DWELL_LAST_S = _typed("DWELL_LAST_S", 30.0)
+    PAGES = _typed("PAGES", True)
+    PAGE_VISIT_GAP_S = _typed("PAGE_VISIT_GAP_S", 300.0)
+    PAGE_QUERY_TOP = _typed("PAGE_QUERY_TOP", 10)
     ATTENTION_MAX_DAYS = _typed("ATTENTION_MAX_DAYS", 90.0)
     # The Markdown export as a git repo (every export a commit). Off by default: git keeps
     # every version forever, so a forgotten memory would survive in its history.

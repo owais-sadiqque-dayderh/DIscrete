@@ -69,6 +69,8 @@ def _preverified(h: Hit) -> bool:
 
 
 async def verify_support(result: RetrievalResult) -> None:
+    if result.page_answer and result.plan.page_operation:
+        return  # closed page aggregate route, with deterministic output
     if not T.SUPPORT_CHECK or not result.hits or result.plan.intent in ("edit", "continuation", "world"):
         return
     if not verifier_endpoint().configured:

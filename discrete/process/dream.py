@@ -175,9 +175,15 @@ async def attention_context(store: Store) -> str:
     start = now() - T.DREAM_WINDOW_DAYS * 86400
     sites = await store.attention(start, now() + 1, by="site", limit=10)
     apps = await store.attention(start, now() + 1, by="app", limit=6)
-    if not sites:
+    pages = await store.list_pages(start=start, end=now() + 1, limit=12)
+    if not sites and not pages:
         return "(none)"
-    return "\n".join(f"- {a.describe()}" for a in [*sites, *apps])
+    lines = [f"- {a.describe()}" for a in [*sites, *apps]]
+    lines.append("Page-level interest/habit signals (context only; claims still require memory evidence and verification):")
+    lines.extend(f"- {p['title']} ({p['kind']}, {p['canonical_url']}): {p['visits']} visits, "
+                 f"{p['dwell_s'] / 60:.1f} min foreground, {p['active_dwell_s'] / 60:.1f} min active"
+                 for p in pages)
+    return "\n".join(lines)
 
 
 def _render(rows, episodes: dict[int, set[int]]) -> str:

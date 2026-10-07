@@ -483,6 +483,64 @@ def m013_attention_provenance(conn: sqlite3.Connection) -> None:
       END""")
 
 
+def m014_pages(conn: sqlite3.Connection) -> None:
+    """Materialized page totals, with transactional invalidation of raw inputs."""
+    conn.execute("""CREATE TABLE pages(
+      id INTEGER PRIMARY KEY, canonical_url TEXT NOT NULL UNIQUE,
+      site TEXT NOT NULL, title TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('article','repo','video','product','chat','file','listing','search','doc','other')),
+      first_seen REAL NOT NULL DEFAULT 0, last_seen REAL NOT NULL DEFAULT 0,
+      visits INTEGER NOT NULL DEFAULT 0, dwell_s REAL NOT NULL DEFAULT 0,
+      active_dwell_s REAL NOT NULL DEFAULT 0, engaged INTEGER NOT NULL DEFAULT 0)""")
+    _add_column(conn, "observations", "page_id", "INTEGER REFERENCES pages(id) ON DELETE SET NULL")
+    conn.execute("CREATE INDEX ix_obs_page ON observations(page_id)")
+    conn.execute("CREATE INDEX ix_pages_kind ON pages(kind, active_dwell_s DESC)")
+    conn.execute("CREATE INDEX ix_sightings_order ON sightings(started_at, id)")
+    conn.execute("CREATE TABLE page_dirty_observations(obs_id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE page_dirty_totals(page_id INTEGER PRIMARY KEY)")
+    conn.execute("""CREATE TRIGGER page_claim_forgotten AFTER UPDATE OF status ON claims
+      WHEN old.status='forgotten' OR new.status='forgotten' BEGIN
+        INSERT OR IGNORE INTO page_dirty_observations
+          SELECT e.observation_id FROM evidence e JOIN claims c ON c.id=e.claim_id
+          WHERE c.lineage_id=new.lineage_id;
+      END""")
+    # A new/removed sighting changes the preceding dwell and the following visit.
+    for event, ref in (("INSERT", "new"), ("DELETE", "old"), ("UPDATE", "old"), ("UPDATE", "new")):
+        timing = "AFTER" if ref == "new" else "BEFORE"
+        conn.execute(f"""CREATE TRIGGER page_sighting_{event.lower()}_{ref} {timing} {event} ON sightings BEGIN
+          INSERT OR IGNORE INTO page_dirty_observations VALUES ({ref}.obs_id);
+          INSERT OR IGNORE INTO page_dirty_observations
+            SELECT obs_id FROM sightings s JOIN observations o ON o.id=s.obs_id
+            WHERE o.origin='user' AND (s.started_at,s.id)<({ref}.started_at,{ref}.id)
+            ORDER BY s.started_at DESC,s.id DESC LIMIT 1;
+          INSERT OR IGNORE INTO page_dirty_observations
+            SELECT obs_id FROM sightings s JOIN observations o ON o.id=s.obs_id
+            WHERE o.origin='user' AND (s.started_at,s.id)>({ref}.started_at,{ref}.id)
+            ORDER BY s.started_at,s.id LIMIT 1;
+        END""")
+    conn.execute("""CREATE TRIGGER page_observation_insert AFTER INSERT ON observations BEGIN
+      INSERT OR IGNORE INTO page_dirty_observations VALUES (new.id);
+    END""")
+    conn.execute("""CREATE TRIGGER page_observation_change AFTER UPDATE OF
+      url,site,app,bundle_id,window_title,page_title,is_listing,origin ON observations BEGIN
+      INSERT OR IGNORE INTO page_dirty_observations VALUES (new.id);
+      INSERT OR IGNORE INTO page_dirty_totals SELECT old.page_id WHERE old.page_id IS NOT NULL;
+      INSERT OR IGNORE INTO page_dirty_observations
+        SELECT neighbor FROM (SELECT (SELECT s.obs_id FROM sightings s JOIN observations o ON o.id=s.obs_id
+          WHERE o.origin='user' AND (s.started_at,s.id)<(v.started_at,v.id)
+          ORDER BY s.started_at DESC,s.id DESC LIMIT 1) AS neighbor
+          FROM sightings v WHERE v.obs_id=new.id) WHERE neighbor IS NOT NULL;
+      INSERT OR IGNORE INTO page_dirty_observations
+        SELECT neighbor FROM (SELECT (SELECT s.obs_id FROM sightings s JOIN observations o ON o.id=s.obs_id
+          WHERE o.origin='user' AND (s.started_at,s.id)>(v.started_at,v.id)
+          ORDER BY s.started_at,s.id LIMIT 1) AS neighbor
+          FROM sightings v WHERE v.obs_id=new.id) WHERE neighbor IS NOT NULL;
+    END""")
+    conn.execute("""CREATE TRIGGER page_observation_delete BEFORE DELETE ON observations BEGIN
+      INSERT OR IGNORE INTO page_dirty_totals SELECT old.page_id WHERE old.page_id IS NOT NULL;
+    END""")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_base,
     m002_draft_attempts_and_digest_counts,
@@ -497,6 +555,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m011_tasks,
     m012_episode_draft_state,
     m013_attention_provenance,
+    m014_pages,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

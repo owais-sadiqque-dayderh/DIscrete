@@ -518,6 +518,18 @@ async def cmd_attention(args) -> int:
     return 0
 
 
+async def cmd_pages(args) -> int:
+    async with _session() as store:
+        if args.backfill:
+            _err(f"backfilled {await store.backfill_pages()} pages")
+        rows = await store.list_pages(start=_since(args.since) or 0, end=time.time() + 1,
+                                      kind=args.kind, limit=args.top)
+        for p in rows:
+            _print(f"{p['kind']}: {p['title']} — {p['canonical_url']} · {p['visits']} visits · "
+                   f"{p['dwell_s'] / 60:.1f} min ({p['active_dwell_s'] / 60:.1f} active)")
+    return 0
+
+
 async def cmd_tasks(args) -> int:
     async with _session() as store:
         await store.backfill_tasks()
@@ -678,6 +690,14 @@ def build_parser() -> argparse.ArgumentParser:
     pat.add_argument("--by", choices=["site", "app", "page"], default="site")
     pat.add_argument("-n", type=int, default=20)
     pat.set_defaults(func=cmd_attention)
+    from .page_identity import KINDS as PAGE_KINDS
+
+    pp = sub.add_parser("pages", help="page/document identities, return visits and estimated dwell; no model calls")
+    pp.add_argument("--backfill", action="store_true", help="derive pages from existing captures without model calls")
+    pp.add_argument("--since", default="all", help="90m / 6h / 7d / all (default all)")
+    pp.add_argument("--kind", choices=PAGE_KINDS, default="")
+    pp.add_argument("--top", type=int, default=20)
+    pp.set_defaults(func=cmd_pages)
     return p
 
 

@@ -33,6 +33,8 @@ how many episodes and days it was seen.
 
 Where their time went (estimated from every capture; context for emphasis, not citable):
 {attention}
+Page repeat visits and long dwell are interest/habit signals only. Every profile point still
+requires the cited memories and independent verification; typing alone does not prove a saved edit.
 
 Sections, in this order, omitting empty ones: {sections}.
 Rules:

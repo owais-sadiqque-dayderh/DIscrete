@@ -19,7 +19,8 @@ from ..process.trails import thing_terms
 from ..store import KINDS, Store
 from ..timeutil import age_days, day_key, now, to_local
 from .enumerate import enumerate_pages
-from .query import build_plan
+from .page_activity import page_activity
+from .query import build_plan, fallback_plan, page_request
 from .rerank import llm_rerank
 from .support import verify_support
 from .why import chain_hits, resolve_why
@@ -102,6 +103,12 @@ async def retrieve(store: Store, query: str, *, field_text: str = "", progress=N
 
 
 async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> RetrievalResult:
+    if T.PAGES and page_request(query)[0]:
+        structural = fallback_plan(query)
+        if structural.page_operation:
+            result = RetrievalResult(query=query, plan=structural)
+            await page_activity(store, result)
+            return result
     # The planner and the query embedding are independent API calls: run them together.
     qvec_task = asyncio.create_task(try_embed(query))
     try:

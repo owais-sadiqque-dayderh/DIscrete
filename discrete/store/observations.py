@@ -11,6 +11,7 @@ import numpy as np
 from .. import textkit as tk
 from ..config import T
 from ..models import ObservationDraft, world_text
+from ..page_identity import canonical_url, document_identity
 from ..timeutil import now
 from .base import StoreBase, rowid
 
@@ -86,10 +87,15 @@ class ObservationsMixin(StoreBase):
                 sig = tk.minhash(key, permutations=T.DEDUP_MINHASH_PERMUTATIONS)
                 if len(tk.word_shingles(key)) >= T.DEDUP_SHORT_SHINGLES:
                     recent = conn.execute(
-                        "SELECT o.id, m.sig FROM observations o JOIN obs_minhash m ON m.obs_id=o.id "
+                        "SELECT o.id, m.sig, o.url, o.window_title FROM observations o JOIN obs_minhash m ON m.obs_id=o.id "
                         "WHERE o.app=? AND o.site=? ORDER BY o.id DESC LIMIT 200",
                         (draft.app, site),
                     ).fetchall()
+                    # Similar screen text on a different page is still a different
+                    # object. Otherwise its sightings would be credited to the old URL.
+                    identity = canonical_url(draft.url) or document_identity(draft.app, draft.window_title)
+                    recent = [(r["id"], r["sig"]) for r in recent
+                              if (canonical_url(r["url"]) or document_identity(draft.app, r["window_title"])) == identity]
                     if (oid := _near_duplicate(sig, recent)) is not None:
                         _bump(conn, oid)
                         return oid, False

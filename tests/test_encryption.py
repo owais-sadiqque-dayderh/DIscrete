@@ -66,7 +66,10 @@ async def test_encrypted_store_roundtrip_search_and_wal(tmp_path, keys, monkeypa
     path = tmp_path / "store.db"
     store = await Store.open(str(path))
     cid = await store.create_claim(ClaimDraft(kind="fact", text="sensitive_unicorn_marker prefers violet notebooks"))
-    oid, _ = await store.add_observation(ObservationDraft(app="Code", screen_text="violet notebooks", session_id="test"))
+    oid, _ = await store.add_observation(ObservationDraft(app="Code", window_title="sensitive_unicorn_marker.txt",
+                                                         screen_text="violet notebooks", session_id="test"))
+    pages = await store.list_pages()
+    assert len(pages) == 1 and pages[0]["title"] == "sensitive_unicorn_marker.txt"
     await store.save_embeddings([("claim", cid, [1.0, 0.0], "hash")])
     assert cid in await store.fts_ids("claim", "violet")
     assert oid in await store.fts_ids("observation", "violet")
@@ -82,6 +85,7 @@ async def test_encrypted_store_roundtrip_search_and_wal(tmp_path, keys, monkeypa
     monkeypatch.setenv("DISCRETE_ENCRYPT_AT_REST", "false")
     store = await Store.open(str(path))
     assert cid in await store.fts_ids("claim", "violet")
+    assert (await store.list_pages())[0]["canonical_url"] == "doc://code/sensitive_unicorn_marker.txt"
     assert (await store.dense_search("claim", [1.0, 0.0], limit=1))[0][0] == cid
     await store.close()
     assert not path.read_bytes().startswith(enc.SQLITE_HEADER)

@@ -84,6 +84,9 @@ class StoreBase:
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             yield self.conn
+            from .pages import sync_pages
+
+            sync_pages(self.conn)
         except BaseException:
             self.conn.execute("ROLLBACK")
             self._dirty_kinds.clear()
@@ -111,7 +114,10 @@ class StoreBase:
         return row[0]
 
     async def execute(self, sql: str, args: Sequence = ()) -> None:
-        await self._call(lambda: self.conn.execute(sql, args))
+        def run():
+            with self._tx() as conn:
+                conn.execute(sql, args)
+        await self._call(run)
 
     # ------------------------------------------------------ shared write helpers
 

@@ -92,7 +92,7 @@ Return strict JSON:
 
 async def build_plan(text: str) -> QueryPlan:
     plan = fallback_plan(text)
-    if plan.intent == "edit" or not T.QUERY_LLM_PLAN:
+    if plan.intent == "edit" or plan.page_operation or not T.QUERY_LLM_PLAN:
         return plan
     ep = utility_endpoint()
     if not ep.configured:
@@ -154,10 +154,33 @@ def fallback_plan(text: str) -> QueryPlan:
         queries = list(dict.fromkeys(q for q in (strip_scaffold(x) for x in queries) if q))
     elif intent == "recall" and interval:
         intent = "temporal"
+    operation, page_search = page_request(text) if T.PAGES and intent not in ("edit", "continuation", "why") else ("", "")
+    if operation:
+        intent = "enumerate" if operation == "edited" else "aggregate"
     return QueryPlan(raw=text, intent=intent, queries=queries, entities=ents + files, terms=terms,
                      interval=interval, entity_kind_filter=kind, needs_store=intent != "edit",
                      about_user=intent not in ("edit", "continuation") and bool(_ABOUT_USER.search(text)),
-                     time_spent=intent not in ("edit", "continuation") and bool(_TIME_SPENT.search(text)))
+                     time_spent=intent not in ("edit", "continuation") and bool(_TIME_SPENT.search(text)),
+                     page_operation=operation, page_search=page_search)
+
+
+def page_request(text: str) -> tuple[str, str]:
+    """Closed personal activity forms; preference/ownership/causal questions stay on recall."""
+    low = text.lower().strip().rstrip("?")
+    period = r"(?:\s+(?:today|yesterday|this week|last week|this month|last month))?"
+    if re.fullmatch(r"what (?:did|do|have) i read (?:the )?most" + period, low):
+        return "read_most", ""
+    if re.fullmatch(r"(?:which|what) (?:repos|repositories) (?:do|did|have) i (?:return to|returned to|revisit)" + period, low):
+        return "returns", ""
+    if re.fullmatch(r"(?:which|what) (?:docs|documents|files) (?:did|do|have) i (?:edit|edited)" + period, low):
+        return "edited", ""
+    m = re.match(r"^how (?:long|much time)\s+(?:(?:did i spend|do i spend|have i spent)\s+)?on\s+(.+)$", low)
+    if m:
+        target = re.sub(r"\s+(?:today|yesterday|this (?:week|month|morning|evening)|last (?:week|month))$", "", m[1])
+        if target and not re.search(r"\b(?:why|prefer|own|bought|purchase|install|installing|and|or)\b", target):
+            target = {"x": "x.com", "twitter": "x.com"}.get(target.strip(), target.strip())
+            return "duration", target
+    return "", ""
 
 
 def parse_interval(text: str, ref: float | None = None) -> tuple[float, float] | None:

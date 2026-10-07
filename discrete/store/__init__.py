@@ -17,13 +17,14 @@ from .health import HealthMixin
 from .history import RevertConflict
 from .index import KINDS, IndexMixin
 from .observations import ObservationsMixin
+from .pages import PagesMixin
 from .perf import PerfMixin
 from .provenance import ProvenanceMixin
 from .tasks import TasksMixin
 
 
 class Store(ObservationsMixin, EpisodesMixin, DraftsMixin, CorrectionsMixin, BeliefsMixin, EntitiesMixin,
-            IndexMixin, TasksMixin, GapsMixin, HealthMixin, PerfMixin, AttentionMixin, ProvenanceMixin):
+            IndexMixin, TasksMixin, GapsMixin, HealthMixin, PerfMixin, AttentionMixin, ProvenanceMixin, PagesMixin):
     pass
 
 

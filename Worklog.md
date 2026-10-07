@@ -815,3 +815,43 @@ Sources: Cognition "agent memory repo" (cognition.com/agent-memory-repo), Hindsi
 - [ ] Baseline commit in `exp_discrete` (with the user's OK) so changes are diffable.
 - [ ] Free disk; top up credit.
 - [ ] Build the dream/cleanup eval from the 46-question session plus a few days of fresh capture.
+
+## Phase 7 follow-up — First-class pages and documents (2026-10-07)
+
+- Implementation sub-agent; uncommitted, pending the concurrent independent review.
+  No paid API calls, replays, benchmark runs, `.env` changes, or writes in `bench/private/`.
+- `m014_pages`: `pages` + `observations.page_id`, with unique canonical URL, deterministic
+  kind, latest sanitized title, first/last sighting, visits, foreground/active dwell and engagement.
+  Known tracking parameters/fragments are stripped, hosts/default ports normalized; local
+  AXDocument paths use file URLs. URL-less documents use captured window titles scoped to
+  their app. Vision page titles label objects but cannot invent document identities.
+- Transactional invalidation queues refresh affected pages on capture, duplicate sightings,
+  enrichment, origin changes, deletes and sighting updates. Visits count page switches/returns
+  and gaps >= `DISCRETE_PAGE_VISIT_GAP_S` (300 s), rather than distinct observations.
+  Dwell uses existing attention caps/active-input rules and clips query intervals correctly.
+  Near-duplicate collapse cannot credit a different page identity to an older observation.
+- `discrete pages [--backfill] [--since 7d] [--kind repo] [--top N]` backfills without models.
+  Guarded aggregate/enumerate routes answer most-read pages, revisited repo pages, documents
+  with typing, and duration on a named page/site before any planner/embedding/model call.
+  Output distinguishes estimated foreground time and typing signals from confirmed reading
+  or saved edits. Dream/profile page signals remain uncitable context; existing claim evidence,
+  episode/day gates and independent verification still apply.
+- Denied apps/sites and nonuser observations never receive page links. Titles/URLs are redacted;
+  changed privacy settings recheck existing links. Forgotten-lineage evidence is detached and
+  stays detached through backfill; undo restores eligible links. The existing SQLCipher
+  connection covers pages, queues and WAL automatically; encryption tests now exercise pages.
+- Typed settings in config + `.env.example` + README: `DISCRETE_PAGES=true`,
+  `DISCRETE_PAGE_VISIT_GAP_S=300`, `DISCRETE_PAGE_QUERY_TOP=10`. Design: `docs/pages.md`.
+- Copied the live store and any sidecars using filesystem reads only, checking that source
+  sizes/mtimes stayed stable during copying. Ran only deterministic backfill on
+  `/tmp/discrete-pages-live1006-final-maumge6l/branch.db`: **48 pages**, **155 linked observations**,
+  **220 sightings**. A second backfill was identical. Sanitized report:
+  `/tmp/discrete-pages-live1006-final-maumge6l/pages-report.json`.
+  Top foreground pages: Cognition Agent Memory Repo 266.1 s / 4 visits; ChatGPT Explain Agent
+  Memory Repositories 164.6 s / 1; Notes All iCloud listing 107.1 s / 1; Theo's X post 105.2 s / 3;
+  X Home Timeline 102.6 s / 7; Omar Ghandour 86.9 s / 2; GitHub AgentMemoryRepo 83.9 s / 2;
+  OpenRouter Embedding Leaderboard 57.0 s / 2; OpenRouter Activity 47.7 s / 2; GitHub home 40.7 s / 1.
+- Final validation: `.venv/bin/python -m pytest -q` **581 passed** (528 prior + 53 new page tests);
+  `.venv/bin/ruff check discrete tests bench tools` clean; `git diff --check` clean.
+  Title-only identities remain approximate, and backfill cannot recover visit times already
+  lost by legacy capture collapse before sightings existed.

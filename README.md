@@ -133,6 +133,7 @@ The memory-evolution branch adds these features:
 | `discrete graph [NAME]` | show entities and their co-occurrence links; retrieval also searches memories mentioning named entities (`DISCRETE_GRAPH_EXPAND` adds neighbours) |
 | `discrete export [--dir PATH]` | write Markdown with `[[links]]` for an Obsidian vault (default `<data dir>/memory`); refreshed after dreams and when forgetting from an existing export |
 | `discrete attention [--since 7d] [--by site\|app\|page]` | estimate total and active time from window sightings, including duplicate captures; long gaps are capped, and dreaming reads these totals |
+| `discrete pages [--backfill] [--since 7d] [--kind repo] [--top 20]` | page/document identities, return visits and estimated foreground/active dwell; model-free activity answers and dream/profile context. Settings: `DISCRETE_PAGES`, `DISCRETE_PAGE_VISIT_GAP_S` (300), `DISCRETE_PAGE_QUERY_TOP` (10) |
 | Redaction | `DISCRETE_REDACT_SECRETS` (default true) masks recognised credentials in screen text, titles, URLs, captions and Bubble's field; confident credential matches and suspicious OCR key material also drop the screenshot |
 
 Automatic dreaming needs both `DISCRETE_DREAM_INTERVAL_MIN` (default 1440 minutes)

@@ -101,6 +101,9 @@ class QueryPlan:
     about_user: bool = False
     # "Where does my time go": answered from attention totals (store/attention.py).
     time_spent: bool = False
+    # Guarded deterministic activity aggregates using the page store.
+    page_operation: str = ""
+    page_search: str = ""
 
 
 @dataclass
@@ -152,6 +155,7 @@ class RetrievalResult:
     exhaustive: bool = False
     digest: str = ""
     why_chain: WhyChain | None = None
+    page_answer: str = ""
 
     def of(self, kind: str) -> list[Hit]:
         return [h for h in self.hits if h.ref_kind == kind]
