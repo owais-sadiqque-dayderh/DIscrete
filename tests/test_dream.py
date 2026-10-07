@@ -12,7 +12,7 @@ from discrete.models import ClaimDraft, ObservationDraft
 from discrete.process import dream as dr
 from discrete.process.dream import run_dream
 from discrete.process.profile import render_profile
-from discrete.timeutil import now
+from discrete.timeutil import now, to_local
 
 DAY = 86400.0
 
@@ -71,7 +71,10 @@ async def test_code_checks_reject_bad_patterns(store, fake, proposal, why):
     assert report["patterns"]["added"] == 0 and report["patterns"]["rejected"] == {why: 1}
 
 
-async def test_habits_need_several_days_projects_do_not(store, fake):
+async def test_habits_need_several_days_projects_do_not(store, fake, monkeypatch):
+    # All three sittings are on one local calendar day, including when run before dawn.
+    noon = to_local(now()).replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+    monkeypatch.setattr(__name__ + ".now", lambda: noon)
     ids = [await _memory(store, "The user worked on the AMO agent repository", day=0, episode=20 + i,
                          hours_ago=2 * i) for i in range(3)]
     fake.dream = {"patterns": [_pattern(ids, "The user works on AMO in the evenings", "habit"),
@@ -201,3 +204,4 @@ async def test_a_crashing_step_neither_stops_the_others_nor_reruns_every_minute(
     assert "error" in report["patterns"] and "stale" in report and "error" not in report["stale"]
     assert float(await store.get_meta("last_dream", "0")) > 0
     assert ids
+
