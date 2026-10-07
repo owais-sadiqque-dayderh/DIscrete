@@ -131,7 +131,15 @@ class Enricher:
                         return [im.convert("RGB")]
                 return []
 
-            frames = await asyncio.to_thread(load)
+            try:
+                frames = await asyncio.to_thread(load)
+            except Exception:
+                log.warning("quarantining unreadable pending frame for observation %s", r["id"])
+                self.stats["degraded"] += 1
+                await self.store.enrichment_failed(r["id"])
+                if self._on_done is not None:
+                    self._on_done()
+                continue
             row = await self.store.get_observation(r["id"])
             if row is None or row["enrich_state"] != "pending" or r["id"] in self._active:
                 continue  # finished while the frame loaded

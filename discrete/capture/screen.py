@@ -179,7 +179,7 @@ class ScreenObserver:
         self._timer = self._loop.call_later(delay, self._flush_soon)
 
     def _flush_soon(self) -> None:
-        spawn(self._flush(), name="discrete-flush", owner=self._tasks)
+        spawn(self._flush(), name="discrete-flush", owner=self._tasks, max_pending=T.CAPTURE_MAX_PENDING)
 
     # ---------------------------------------------------------------- frames
 
@@ -239,7 +239,8 @@ class ScreenObserver:
         after = own if own is not None else pending["before_img"]
         if after is None:
             self.stats["dropped_failed"] += 1  # degraded: no frame, but still segment the boundary
-        spawn(self._finalize(pending, ctx, after, stale=True), name="discrete-rotate", owner=self._tasks)
+        spawn(self._finalize(pending, ctx, after, stale=True), name="discrete-rotate",
+              owner=self._tasks, max_pending=T.CAPTURE_MAX_PENDING)
 
     async def _flush(self) -> None:
         pending, self._pending = self._pending, None
