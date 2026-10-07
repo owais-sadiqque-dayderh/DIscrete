@@ -272,3 +272,17 @@ async def test_overwritten_trail_restores_predecessor_row_on_undo_and_redo(store
     assert [dict(r) for r in await store.links_into("claim", [cid])] == [dict(before)]
     await store.revert_event(undo)
     assert [dict(r) for r in await store.links_into("claim", [cid])] == [dict(after)]
+
+
+async def test_forget_clears_entity_page_quoting_it_and_marks_it_for_rebuild(store):
+    a = await _claim(store, "The user edits notes in Zed", n=1)
+    b = await _claim(store, "The user reads docs in Zed", n=2)
+    eid = await store.create_entity("Zed", "app", "zed")
+    await store.record_mentions([(eid, "claim", a), (eid, "claim", b)])
+    await store.update_entity_page(eid, "Zed: used for notes and docs.")
+    assert not await store.entities_needing_pages(10)
+    await store.forget_claim(a)
+    page = await store.get_entity(eid)
+    assert page["summary"] == ""
+    assert [r["id"] for r in await store.entities_needing_pages(10)] == [eid]
+    assert not await store.q("SELECT 1 FROM entities_fts WHERE entities_fts MATCH 'notes'")

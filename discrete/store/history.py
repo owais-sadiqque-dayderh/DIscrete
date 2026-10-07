@@ -78,6 +78,10 @@ class HistoryMixin(StoreBase):
                      or c.get("after", {}).get("flag") == "contested"}
         if withdrawn:
             changes += self._withdraw_dependents(conn, withdrawn)
+            if op != "merge":  # a merge only rewords; everything else may leave a page quoting a withdrawn claim
+                self._dirty_entity_pages(conn, {c["id"] for c in changes
+                                                if c.get("after", {}).get("status") in DEAD
+                                                or c.get("after", {}).get("flag") == "contested"})
         cur = conn.execute(
             "INSERT INTO memory_events(at, op, actor, claim_id, created, changes, reason, run_id, data) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
@@ -89,6 +93,17 @@ class HistoryMixin(StoreBase):
         conn.executemany("INSERT OR IGNORE INTO memory_event_refs(event_id, claim_id) VALUES (?, ?)",
                          [(eid, cid) for cid in refs])
         return eid
+
+    def _dirty_entity_pages(self, conn, claim_ids: set[int]) -> None:
+        """Generated entity pages are not authority: clear any page that may quote a withdrawn claim
+        (and its search rows), so it is rebuilt from the claims that remain."""
+        for (eid,) in conn.execute(
+                f"SELECT DISTINCT m.entity_id FROM mentions m JOIN entities e ON e.id=m.entity_id "
+                f"WHERE m.ref_kind='claim' AND m.ref_id IN ({_ph(sorted(claim_ids))}) AND e.summary != ''",
+                sorted(claim_ids)).fetchall():
+            conn.execute("UPDATE entities SET summary='', page_updated_at=0, updated_at=? WHERE id=?", (now(), eid))
+            self._refresh_entity_fts(conn, eid)
+            self._enqueue(conn, "entity", eid)
 
     # ------------------------------------------------------------------ reading
 
