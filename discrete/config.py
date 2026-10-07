@@ -318,10 +318,13 @@ class T:
         ["figma", "illustrator", "photoshop", "sketch", "screen sharing", "remote desktop", "affinity"],
     )]
     LLM_TIMEOUT_S = _typed("LLM_TIMEOUT_S", 60.0)
-    # Transient provider failures behind a router (OpenRouter's upstream 404/502/503) are
-    # retried this many times, waiting LLM_PROVIDER_RETRY_S, then twice that, ...
+    # One retry policy owns all attempts (SDK retries are disabled). Elapsed requests
+    # and backoff gate retry starts; attempts keep their normal transport timeout.
+    # Bubble uses the shorter retry budget, including retrieval.
     LLM_PROVIDER_RETRIES = _typed("LLM_PROVIDER_RETRIES", 3)
     LLM_PROVIDER_RETRY_S = _typed("LLM_PROVIDER_RETRY_S", 1.5)
+    LLM_RETRY_MAX_S = _typed("LLM_RETRY_MAX_S", 90.0)
+    LLM_INTERACTIVE_RETRY_MAX_S = _typed("LLM_INTERACTIVE_RETRY_MAX_S", 8.0)
     # Vision calls in flight at once; captures never wait for them (capture/enrich.py).
     ENRICH_CONCURRENCY = _typed("ENRICH_CONCURRENCY", 2)
     # Rows holding a caption task (and their images) at once; the rest wait on disk.

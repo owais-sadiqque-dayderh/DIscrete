@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 from .. import textkit as tk
 from ..config import USER_NAME, T, writer_endpoint
-from ..llm import stream
+from ..llm import interactive, stream
 from ..models import Hit, RetrievalResult
 from ..perf import PERF
 from ..retrieval.enumerate import shape_enumerate_items
@@ -171,7 +171,10 @@ class BubbleEngine:
             # An empty query retrieves arbitrary records, and the writer paraphrased them
             # as if they were an answer (insights.md §7.35).
             raise EmptyField(repr(field_text[:20]))
-        result = await retrieve(self.store, query, field_text=field_text, progress=progress)
+        # The same verifier/embedding endpoints serve background jobs; only this
+        # request's task tree gets the shorter budget (not concurrent maintenance).
+        with interactive():
+            result = await retrieve(self.store, query, field_text=field_text, progress=progress)
         decision = evaluate(result)
         p = Prepared(field_text=field_text, query=query, app=app or "an app", field_desc=field_desc or "text field",
                      result=result, decision=decision, timings={"retrieve_s": time.perf_counter() - t0})

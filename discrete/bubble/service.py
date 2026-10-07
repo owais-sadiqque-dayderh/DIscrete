@@ -18,7 +18,7 @@ from ..capture.privacy import denied
 from ..capture.redact import redact
 from ..capture.suppress import hold, note_agent_output, release
 from ..config import T, bubble_vision_endpoint
-from ..llm import EXPECTED_ERRORS, NotConfigured, complete_json, embed, image_part
+from ..llm import EXPECTED_ERRORS, NotConfigured, complete_json, embed, image_part, interactive
 from ..perf import PERF, since_ms
 from ..retrieval.gaps import maybe_record_gap
 from ..store import Store
@@ -74,7 +74,8 @@ class BubbleService:
     async def _warm(self) -> None:
         """Open the API connection now so the first trigger skips the TLS handshake."""
         try:
-            await embed(["warm"])
+            with interactive():
+                await embed(["warm"])
         except (NotConfigured, *EXPECTED_ERRORS):
             pass
 
@@ -138,8 +139,9 @@ class BubbleService:
         jpeg = await asyncio.to_thread(shoot)
         if not jpeg:
             return "", ""
-        data = await complete_json(ep, [{"role": "user", "content": [
-            image_part(jpeg, detail="high"), {"type": "text", "text": FIELD_READ_PROMPT}]}], max_tokens=800)
+        with interactive():
+            data = await complete_json(ep, [{"role": "user", "content": [
+                image_part(jpeg, detail="high"), {"type": "text", "text": FIELD_READ_PROMPT}]}], max_tokens=800)
         if not isinstance(data, dict):
             return "", ""
         return str(data.get("current_text") or ""), str(data.get("field_description") or "")

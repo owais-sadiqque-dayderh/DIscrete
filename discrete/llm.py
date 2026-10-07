@@ -17,10 +17,14 @@ import contextlib
 import contextvars
 import json
 import logging
+import math
+import random
 import re
 import time
-from collections.abc import Iterator
-from typing import Any
+from collections.abc import Awaitable, Callable, Iterator
+from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
+from typing import Any, TypeVar
 
 import httpx
 import openai
@@ -56,11 +60,24 @@ EXPECTED_ERRORS: tuple[type[BaseException], ...] = (
     openai.APIError,
     httpx.HTTPError,
     asyncio.TimeoutError,
+    ConnectionError,
 )
 
 
 # The call in flight in this task, so usage a backend reports lands on its record.
 _CURRENT: contextvars.ContextVar[Call | None] = contextvars.ContextVar("discrete_llm_call", default=None)
+_INTERACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar("discrete_llm_interactive", default=False)
+_Result = TypeVar("_Result")
+
+
+@contextlib.contextmanager
+def interactive() -> Iterator[None]:
+    """Use Bubble's short retry budget, inherited by its concurrent retrieval tasks."""
+    token = _INTERACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _INTERACTIVE.reset(token)
 
 
 class UsageMeter:
@@ -150,7 +167,7 @@ class OpenAIBackend:
         key = (ep.base_url, ep.api_key)
         if key not in self._clients:
             self._clients[key] = AsyncOpenAI(
-                base_url=ep.base_url, api_key=ep.api_key, timeout=T.LLM_TIMEOUT_S, max_retries=2
+                base_url=ep.base_url, api_key=ep.api_key, timeout=T.LLM_TIMEOUT_S, max_retries=0
             )
         return self._clients[key]
 
@@ -274,61 +291,124 @@ def _tuned(ep: Endpoint, temperature: float | None, max_tokens: int | None) -> t
 
 
 def provider_glitch(exc: BaseException) -> bool:
-    """A routed provider failing transiently: OpenRouter reports an upstream that briefly
-    lost the model as 404 model_not_found ("Provider returned error"), or a 502/503 the
-    SDK already retried. The same request usually succeeds seconds later. Our own
-    mistakes (a wrong model name in .env, a bad request) are not retried."""
-    if not isinstance(exc, openai.APIStatusError):
-        return False
-    if exc.status_code in (502, 503, 529):
+    """Retry provider/transport failures, never validation or authentication errors.
+
+    Preserve the router-specific upstream 404 exception from 5e7d73a; a wrong
+    model name is still terminal. Status takes precedence over overload wording.
+    """
+    if isinstance(exc, openai.APIStatusError | httpx.HTTPStatusError):
+        status = exc.status_code if isinstance(exc, openai.APIStatusError) else exc.response.status_code
+        if status in (429, 500, 502, 503, 504, 529):
+            return True
+        text = str(exc)
+        return status == 404 and (
+            "Provider returned error" in text or ("model_not_found" in text and "provider_name" in text))
+    if isinstance(exc, openai.APIConnectionError | httpx.TimeoutException | httpx.NetworkError
+                  | httpx.RemoteProtocolError | TimeoutError | ConnectionError):
         return True
-    text = str(exc)
-    return exc.status_code == 404 and (
-        "Provider returned error" in text or ("model_not_found" in text and "provider_name" in text))
+    return isinstance(exc, openai.APIError | LLMError) and "overload" in str(exc).lower()
 
 
-async def _with_glitch_retry(fn, ep: Endpoint):
-    for attempt in range(T.LLM_PROVIDER_RETRIES + 1):
+def _retry_after(exc: BaseException) -> float:
+    response = getattr(exc, "response", None)
+    value = response.headers.get("Retry-After") if response is not None else None
+    if value is None:
+        return 0.0
+    try:
+        seconds = float(value)
+    except ValueError:
         try:
-            return await fn()
-        except openai.APIStatusError as exc:
-            if attempt == T.LLM_PROVIDER_RETRIES or not provider_glitch(exc):
+            seconds = parsedate_to_datetime(value).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+    return max(0.0, seconds) if math.isfinite(seconds) else 0.0
+
+
+@dataclass
+class _RetryPolicy:
+    """Gate additional attempts; in-flight requests keep their transport timeout."""
+
+    ep: Endpoint
+    interactive: bool = field(default_factory=_INTERACTIVE.get)
+    attempts: int = 0
+    deadline: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        budget = T.LLM_INTERACTIVE_RETRY_MAX_S if self.interactive else T.LLM_RETRY_MAX_S
+        self.deadline = time.monotonic() + max(0.0, budget)
+
+    def remaining(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
+
+    def giveup(self) -> None:
+        PERF.count(f"llm.{self.ep.name}.provider_giveup")
+        PERF.count("health.llm_provider_giveup")
+
+    async def retry(self, exc: BaseException, *, replayable: bool = True) -> bool:
+        if not provider_glitch(exc):
+            return False
+        base = max(0.0, T.LLM_PROVIDER_RETRY_S) * (2 ** self.attempts)
+        delay = max(_retry_after(exc), base + random.uniform(0.0, base * 0.25))
+        if not replayable or self.attempts >= T.LLM_PROVIDER_RETRIES or delay >= self.remaining():
+            self.giveup()
+            return False
+        log.info("%s: transient provider failure, retry %d in %.2fs", self.ep.name, self.attempts + 1, delay)
+        await asyncio.sleep(delay)
+        # A suspended process may wake after the deadline: never issue another request then.
+        if self.remaining() <= 0:
+            self.giveup()
+            return False
+        self.attempts += 1
+        PERF.count(f"llm.{self.ep.name}.provider_retry")
+        PERF.count("health.llm_provider_retry")
+        return True
+
+
+async def _with_retry(fn: Callable[[], Awaitable[_Result]], policy: _RetryPolicy, *, metered: bool = True) -> _Result:
+    while True:
+        try:
+            with _metered(policy.ep) if metered else contextlib.nullcontext():
+                # The budget limits retry starts, not healthy (possibly slow) attempts.
+                return await fn()
+        except EXPECTED_ERRORS as exc:
+            if not await policy.retry(exc):
                 raise
-            delay = T.LLM_PROVIDER_RETRY_S * (2 ** attempt)
-            log.info("%s: provider glitch (%s), retry %d in %.1fs", ep.name, exc.status_code, attempt + 1, delay)
-            PERF.count(f"llm.{ep.name}.provider_retry")
-            await asyncio.sleep(delay)
-    raise AssertionError("unreachable")
 
 
 async def complete(ep: Endpoint, messages: list[dict], *, temperature: float | None = 0.0,
                    max_tokens: int | None = None, json_mode: bool = False) -> str:
+    return await _complete(ep, messages, policy=_RetryPolicy(ep), temperature=temperature,
+                           max_tokens=max_tokens, json_mode=json_mode)
+
+
+async def _complete(ep: Endpoint, messages: list[dict], *, policy: _RetryPolicy,
+                    temperature: float | None, max_tokens: int | None, json_mode: bool = False) -> str:
     if not ep.configured:
         raise NotConfigured(f"{ep.name} endpoint not configured")
     temperature, max_tokens = _tuned(ep, temperature, max_tokens)
     json_mode = json_mode and ep.json_mode
 
     async def _once() -> str:
-        with _metered(ep):
-            return await _backend.chat(ep, messages, temperature=temperature, max_tokens=max_tokens,
-                                       json_mode=json_mode)
+        return await _backend.chat(ep, messages, temperature=temperature, max_tokens=max_tokens,
+                                   json_mode=json_mode)
 
-    return await _with_glitch_retry(_once, ep)
+    return await _with_retry(_once, policy)
 
 
 async def complete_json(ep: Endpoint, messages: list[dict], *, temperature: float | None = 0.0,
                         max_tokens: int | None = None) -> Any:
     """JSON-producing call. Tries json mode (unless the model's JSON_MODE is off), then
     a plain call. Raises LLMError if unparseable, TokenLimit if the model ran out."""
+    # JSON-mode fallback shares the original deadline and retry count.
+    policy = _RetryPolicy(ep)
     if ep.json_mode:
-        try:
-            parsed = parse_json(await complete(ep, messages, temperature=temperature, max_tokens=max_tokens,
-                                               json_mode=True))
-            if parsed is not None:
-                return parsed
-        except openai.BadRequestError as exc:  # proxy rejected response_format
-            log.debug("json mode rejected by %s: %s", ep.model, exc)
-    parsed = parse_json(await complete(ep, messages, temperature=temperature, max_tokens=max_tokens))
+        # A 400 (including response_format validation) is terminal. Providers that
+        # do not support JSON mode use <COMPONENT>_JSON_MODE=false instead.
+        parsed = parse_json(await _complete(ep, messages, policy=policy, temperature=temperature,
+                                            max_tokens=max_tokens, json_mode=True))
+        if parsed is not None:
+            return parsed
+    parsed = parse_json(await _complete(ep, messages, policy=policy, temperature=temperature, max_tokens=max_tokens))
     if parsed is None:
         raise LLMError(f"{ep.name}: unparseable JSON")
     return parsed
@@ -357,17 +437,24 @@ async def stream(ep: Endpoint, messages: list[dict], *, temperature: float | Non
     rec = Call(ep.name, ep.model or "", at=time.time())
     t0 = time.perf_counter()
     fn = getattr(_backend, "stream", None)
+    # Streaming is Bubble's interactive writer. Gate retries with its short budget;
+    # even the first delta keeps the transport timeout (reasoning can take longer).
+    policy = _RetryPolicy(ep, interactive=True)
     try:
         if fn is None:
             token = _CURRENT.set(rec)
             try:
-                reply = await _backend.chat(ep, messages, temperature=temperature, max_tokens=max_tokens, json_mode=False)
+                async def _once() -> str:
+                    return await _backend.chat(ep, messages, temperature=temperature,
+                                               max_tokens=max_tokens, json_mode=False)
+
+                reply = await _with_retry(_once, policy, metered=False)
             finally:
                 _CURRENT.reset(token)
             rec.first_ms = (time.perf_counter() - t0) * 1000
             yield reply
             return
-        for attempt in range(T.LLM_PROVIDER_RETRIES + 1):
+        while True:
             try:
                 async with contextlib.aclosing(fn(ep, messages, temperature=temperature,
                                                   max_tokens=max_tokens)) as inner:
@@ -383,12 +470,10 @@ async def stream(ep: Endpoint, messages: list[dict], *, temperature: float | Non
                             rec.first_ms = (time.perf_counter() - t0) * 1000
                         yield piece
                 return
-            except openai.APIStatusError as exc:
+            except EXPECTED_ERRORS as exc:
                 # Only before the first word: text already typed at the cursor cannot be retried.
-                if rec.first_ms is not None or attempt == T.LLM_PROVIDER_RETRIES or not provider_glitch(exc):
+                if not await policy.retry(exc, replayable=rec.first_ms is None):
                     raise
-                PERF.count(f"llm.{ep.name}.provider_retry")
-                await asyncio.sleep(T.LLM_PROVIDER_RETRY_S * (2 ** attempt))
     except BaseException as exc:
         rec.status = _status(exc)
         raise
@@ -410,8 +495,7 @@ async def embed(texts: list[str]) -> list[list[float]]:
     out: list[list[float]] = []
     for i in range(0, len(texts), T.EMBED_BATCH):
         batch = [t if t.strip() else " " for t in texts[i : i + T.EMBED_BATCH]]
-        with _metered(ep):
-            got = await _backend.embed(ep, batch)
+        got = await _with_retry(lambda batch=batch: _backend.embed(ep, batch), _RetryPolicy(ep))
         if len(got) != len(batch):
             raise LLMError(f"embedding: {len(got)} vectors for {len(batch)} texts")
         out.extend(got)
@@ -434,5 +518,4 @@ async def rerank(query: str, docs: list[str], top_n: int) -> list[tuple[int, flo
     ep = rerank_endpoint()
     if not ep.configured:
         raise NotConfigured("rerank endpoint not configured")
-    with _metered(ep):
-        return await _backend.rerank(ep, query, docs, top_n)
+    return await _with_retry(lambda: _backend.rerank(ep, query, docs, top_n), _RetryPolicy(ep))

@@ -20,6 +20,7 @@ HEALTH_COUNTERS = (
     "capture_ax_empty.node_limit", "capture_ax_empty.no_text", "capture_ax_empty.error",
     "capture_ax_empty.stale", "capture_redaction_frame_drops",
     "draft_failed", "draft_abandoned", "draft_cancelled", "trail_failed", "trail_abandoned", "trail_cancelled",
+    "llm_provider_retry", "llm_provider_giveup",
 )
 # Event samples with these names also enter the durable metrics table on flush.
 HEALTH_EVENT_PREFIX = "health."
