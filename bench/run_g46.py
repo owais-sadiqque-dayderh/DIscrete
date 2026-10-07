@@ -314,6 +314,8 @@ def _infra_reason(stderr: str, answer: str, returncode: int, case: Case) -> str:
                    r"(?:model|writer|provider|openrouter|openai|LLM)[^\n]*(?:error|failed|empty|invalid|not configured)")
     if not answer and not case.unanswerable and re.search(model_error, diagnostic_text, re.IGNORECASE):
         return diagnostic_text[-300:].strip()
+    if not answer.strip():
+        return "answer process returned an empty answer"
     return ""
 
 

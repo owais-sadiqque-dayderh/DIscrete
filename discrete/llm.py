@@ -40,6 +40,19 @@ class LLMError(RuntimeError):
     """A model call returned nothing usable."""
 
 
+class StreamError(LLMError):
+    """An interrupted or explicitly failed provider stream; safe to retry before text."""
+
+
+class EmptyCompletion(LLMError):
+    """A finished writer attempt with no visible answer."""
+
+    def __init__(self, finish_reason: str | None = None, reasoning_present: bool = False):
+        self.finish_reason = finish_reason
+        self.reasoning_present = reasoning_present
+        super().__init__(f"empty completion (finish_reason={finish_reason}, reasoning_present={reasoning_present})")
+
+
 class NotConfigured(LLMError):
     pass
 
@@ -208,18 +221,51 @@ class OpenAIBackend:
             payload["temperature"] = temperature
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
-        rsp = await self._client(ep).chat.completions.create(**payload, **self._extras(ep))
-        wrote = False
-        try:
-            async for chunk in rsp:
-                METER.add_usage(ep.name, getattr(chunk, "usage", None))  # final chunk, where sent
-                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                    wrote = True
-                    yield chunk.choices[0].delta.content
-                elif chunk.choices and chunk.choices[0].finish_reason == "length" and not wrote:
-                    raise TokenLimit(ep, max_tokens)
-        finally:
-            await rsp.close()  # an abandoned stream otherwise errors when the loop shuts down
+        # Read SSE explicitly: the SDK accepts EOF without [DONE], hiding truncation.
+        wrote, reasoning_present, finish_reason = False, False, None
+        async with self._client(ep).chat.completions.with_streaming_response.create(
+                **payload, **self._extras(ep)) as rsp:
+            data_lines: list[str] = []
+            async for line in rsp.iter_lines():
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip(" "))
+                    continue
+                if line or not data_lines:
+                    continue
+                data = "\n".join(data_lines)
+                data_lines.clear()
+                if data.strip() == "[DONE]":
+                    if not wrote:
+                        raise EmptyCompletion(finish_reason, reasoning_present)
+                    return
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError as exc:
+                    raise StreamError(f"{ep.name}: invalid stream chunk") from exc
+                if not isinstance(chunk, dict):
+                    raise StreamError(f"{ep.name}: invalid stream chunk")
+                if chunk.get("error"):
+                    raise StreamError(f"{ep.name}: provider stream error: {chunk['error']}")
+                usage = chunk.get("usage")
+                METER.add_usage(ep.name, usage)
+                if isinstance(usage, dict):
+                    details = usage.get("completion_tokens_details") or {}
+                    reasoning_present |= bool(details.get("reasoning_tokens"))
+                for choice in chunk.get("choices") or []:
+                    if choice.get("index", 0) != 0:
+                        continue
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                    delta = choice.get("delta") or {}
+                    reasoning_present |= any(bool(delta.get(k)) for k in
+                                             ("reasoning", "reasoning_content", "reasoning_details"))
+                    content = delta.get("content")
+                    if content:
+                        wrote |= bool(content.strip())
+                        yield content
+            # Some compatible servers omit [DONE]; a finished choice with text is complete.
+            if wrote and finish_reason in ("stop", "length"):
+                return
+            raise StreamError(f"{ep.name}: stream ended without [DONE]")
 
     async def embed(self, ep: Endpoint, texts: list[str]) -> list[list[float]]:
         rsp = await self._client(ep).embeddings.create(model=ep.model or "", input=texts, **self._extras(ep))
@@ -296,6 +342,8 @@ def provider_glitch(exc: BaseException) -> bool:
     Preserve the router-specific upstream 404 exception from 5e7d73a; a wrong
     model name is still terminal. Status takes precedence over overload wording.
     """
+    if isinstance(exc, StreamError | EmptyCompletion):
+        return True
     if isinstance(exc, openai.APIStatusError | httpx.HTTPStatusError):
         status = exc.status_code if isinstance(exc, openai.APIStatusError) else exc.response.status_code
         if status in (429, 500, 502, 503, 504, 529):
@@ -441,21 +489,22 @@ async def stream(ep: Endpoint, messages: list[dict], *, temperature: float | Non
     # even the first delta keeps the transport timeout (reasoning can take longer).
     policy = _RetryPolicy(ep, interactive=True)
     try:
-        if fn is None:
-            token = _CURRENT.set(rec)
-            try:
-                async def _once() -> str:
-                    return await _backend.chat(ep, messages, temperature=temperature,
-                                               max_tokens=max_tokens, json_mode=False)
-
-                reply = await _with_retry(_once, policy, metered=False)
-            finally:
-                _CURRENT.reset(token)
-            rec.first_ms = (time.perf_counter() - t0) * 1000
-            yield reply
-            return
+        empty_attempts = 0
         while True:
+            pending = ""
             try:
+                if fn is None:
+                    token = _CURRENT.set(rec)
+                    try:
+                        reply = await _backend.chat(ep, messages, temperature=temperature,
+                                                    max_tokens=max_tokens, json_mode=False)
+                    finally:
+                        _CURRENT.reset(token)
+                    if not reply.strip():
+                        raise EmptyCompletion()
+                    rec.first_ms = (time.perf_counter() - t0) * 1000
+                    yield reply
+                    return
                 async with contextlib.aclosing(fn(ep, messages, temperature=temperature,
                                                   max_tokens=max_tokens)) as inner:
                     while True:
@@ -467,13 +516,29 @@ async def stream(ep: Endpoint, messages: list[dict], *, temperature: float | Non
                         finally:
                             _CURRENT.reset(token)
                         if rec.first_ms is None:
+                            pending += piece or ""
+                            if not pending.strip():
+                                continue
+                            piece, pending = pending, ""
                             rec.first_ms = (time.perf_counter() - t0) * 1000
                         yield piece
+                if rec.first_ms is None:
+                    raise EmptyCompletion()
                 return
             except EXPECTED_ERRORS as exc:
-                # Only before the first word: text already typed at the cursor cannot be retried.
+                if isinstance(exc, TokenLimit) and rec.first_ms is None:
+                    exc = EmptyCompletion("length", reasoning_present=True)
+                if isinstance(exc, EmptyCompletion):
+                    log.warning("%s: empty writer completion; finish_reason=%s reasoning_present=%s",
+                                ep.name, exc.finish_reason, exc.reasoning_present)
+                    empty_attempts += 1
+                    if empty_attempts > 1:
+                        raise exc
+                    if exc.finish_reason == "length" and max_tokens is not None:
+                        max_tokens += max(256, max_tokens // 2)
+                # Share the transport retry deadline/count; never replay visible text.
                 if not await policy.retry(exc, replayable=rec.first_ms is None):
-                    raise
+                    raise exc
     except BaseException as exc:
         rec.status = _status(exc)
         raise

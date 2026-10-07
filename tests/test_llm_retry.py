@@ -436,3 +436,77 @@ async def test_sdk_hidden_retries_are_disabled():
         assert client.max_retries == 0
     finally:
         await client.close()
+
+
+@pytest.mark.parametrize("failure", ["error", "eof", "partial_error"])
+async def test_sdk_stream_protocol_failure_is_transient(endpoint, failure):
+    # EOF mid-answer (no finish_reason) is truncation; a finished choice without [DONE] is accepted below.
+    chunk = {"choices": [{"index": 0, "delta": {"content": "partial"},
+                          "finish_reason": None if failure == "eof" else "stop"}]}
+    events = ([chunk] if failure != "error" else [])
+    if failure != "eof":
+        events.append({"error": {"code": 400, "message": "upstream generation failed"}})
+    body = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+
+    def respond(request):
+        endpoint.requests.append(request)
+        return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, text=body)
+
+    # Real SSE parsing on mock HTTP; even an error carrying a 400 is a failed stream.
+    llm.get_backend()._http._transport = httpx.MockTransport(respond)
+    pieces = []
+    with pytest.raises(llm.StreamError) as caught:
+        async for piece in llm.stream(EP, MESSAGES):
+            pieces.append(piece)
+    assert llm.provider_glitch(caught.value)
+    assert pieces == ([] if failure == "error" else ["partial"])
+    expected = T.LLM_PROVIDER_RETRIES + 1 if failure == "error" else 1
+    assert len(endpoint.requests) == expected
+
+
+async def test_sdk_finished_stream_without_done_is_complete(endpoint):
+    chunk = {"choices": [{"index": 0, "delta": {"content": "whole answer"}, "finish_reason": "stop"}]}
+    body = f"data: {json.dumps(chunk)}\n\n"
+
+    def respond(request):
+        endpoint.requests.append(request)
+        return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, text=body)
+
+    llm.get_backend()._http._transport = httpx.MockTransport(respond)
+    assert [p async for p in llm.stream(EP, MESSAGES)] == ["whole answer"]
+    assert len(endpoint.requests) == 1
+
+
+async def test_sdk_reasoning_only_empty_stream_retries_once_with_more_tokens(endpoint, caplog):
+    payloads = []
+
+    def respond(request):
+        payloads.append(json.loads(request.content))
+        if len(payloads) == 1:
+            chunks = [{"choices": [{"index": 0, "delta": {"content": None, "reasoning": "thinking"},
+                                    "finish_reason": "length"}]}]
+        else:
+            chunks = [{"choices": [{"index": 0, "delta": {"content": "answer"}, "finish_reason": "stop"}]}]
+        text = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, text=text)
+
+    llm.get_backend()._http._transport = httpx.MockTransport(respond)
+    assert [s async for s in llm.stream(EP, MESSAGES, max_tokens=100)] == ["answer"]
+    assert len(payloads) == 2 and payloads[1]["max_tokens"] > payloads[0]["max_tokens"]
+    assert "finish_reason=length reasoning_present=True" in caplog.text
+
+
+async def test_empty_stream_retry_obeys_shared_deadline(fake, clock, monkeypatch):
+    monkeypatch.setattr(T, "LLM_INTERACTIVE_RETRY_MAX_S", 8.0)
+    calls = 0
+
+    async def stream(ep, messages, **kwargs):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(9.0)
+        yield "   "
+
+    monkeypatch.setattr(fake, "stream", stream, raising=False)
+    with pytest.raises(llm.EmptyCompletion):
+        _ = [s async for s in llm.stream(EP, MESSAGES)]
+    assert calls == 1 and clock.sleeps == [9.0]

@@ -270,3 +270,47 @@ def test_every_cli_command_has_a_handler():
     for name in sub.choices:
         args = p.parse_args([name, *needs.get(name, [])])
         assert callable(args.func), name
+
+
+@pytest.mark.parametrize("mode", ["grounded", "thin", "empty"])
+@pytest.mark.parametrize("recover", [True, False])
+@pytest.mark.parametrize("whitespace", [True, False])
+async def test_empty_writer_retries_then_answers_or_quotes_record(store, fake, monkeypatch, mode, recover, whitespace):
+    from discrete import llm
+    from discrete.bubble.engine import Prepared
+    from discrete.config import T
+    from discrete.models import Hit, QueryPlan, RetrievalResult
+    from discrete.retrieval.grounding import GroundingDecision
+
+    query = "What size range does EmbeddingGemma 2 come in?"
+    hits = [] if mode == "empty" else [Hit("observation", 1, "X post", "Menu\nEmbeddingGemma 2 comes in 300M and 1B sizes.",
+                                          occurred_at=1_791_300_000)]
+    p = Prepared(query, query, "terminal", "answer", RetrievalResult(query, QueryPlan(raw=query, terms=["embeddinggemma"]), hits),
+                 GroundingDecision(mode, 1, 0))
+    calls = 0
+    elapsed = 0.0
+
+    async def stream(ep, messages, **kwargs):
+        nonlocal calls, elapsed
+        calls += 1
+        elapsed += 2.0
+        if calls == 2 and recover:
+            yield "300M and 1B."
+        elif whitespace:
+            yield " \n\t"
+
+    monkeypatch.setattr(fake, "stream", stream, raising=False)
+    monkeypatch.setattr(T, "LLM_PROVIDER_RETRY_S", 0.0)
+    monkeypatch.setattr(llm.time, "perf_counter", lambda: elapsed)
+    typed = []
+    out = await BubbleEngine(store).write(p, lambda text: typed.append(text) or True)
+    assert calls == 2 and "".join(typed) == out
+    assert p.timings["first_chunk_s"] == 4.0
+    if recover:
+        assert out.strip() == "300M and 1B."
+    elif mode == "empty":
+        assert out.strip() == "(nothing on file about that)"
+    else:
+        assert out.strip().startswith("From X post (")
+        assert out.endswith(": EmbeddingGemma 2 comes in 300M and 1B sizes.")
+        assert "Menu" not in out

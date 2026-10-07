@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 from .. import textkit as tk
 from ..config import USER_NAME, T, writer_endpoint
-from ..llm import interactive, stream
+from ..llm import EmptyCompletion, interactive, stream
 from ..models import Hit, RetrievalResult
 from ..perf import PERF
 from ..retrieval.enumerate import shape_enumerate_items
@@ -166,6 +166,20 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
     return "\n\n".join(blocks) or "(no records)"
 
 
+def extractive_fallback(p: Prepared) -> str:
+    """Quote the strongest matching line without inventing an answer."""
+    if p.mode not in ("grounded", "thin") or not p.result.hits:
+        return "(nothing on file about that)"
+    hit = p.result.hits[0]
+    terms = set(tk.tokens(p.query)) | set(p.result.plan.terms)
+    lines = [line.strip() for line in re.split(r"\n|(?<=[.!?])\s+", hit.body) if line.strip()]
+    line = max(lines, key=lambda line: len(terms & set(tk.tokens(line))), default=hit.title)
+    snippet = tk.best_window(line, terms, width=80)[0] or line
+    when = _when_short(hit)
+    source = hit.title or f"{hit.ref_kind} {hit.ref_id}"
+    return f"From {source}{f' ({when})' if when else ''}: {tk.truncate(snippet, 600)}"
+
+
 class BubbleEngine:
     def __init__(self, store: Store, user_name: str = USER_NAME):
         self.store = store
@@ -237,20 +251,27 @@ class BubbleEngine:
 
         max_tokens = T.ENUMERATE_WRITER_MAX_TOKENS if p.mode == "enumerate" else T.BUBBLE_WRITER_MAX_TOKENS
         # aclosing: an early return must close the HTTP stream now, not at interpreter exit.
-        async with contextlib.aclosing(stream(writer_endpoint(), self.messages(p), temperature=0.2,
-                                              max_tokens=max_tokens)) as pieces:
-            async for piece in pieces:
-                if not should_continue():
-                    return out
-                buf += piece
-                if len(buf) < T.BUBBLE_MIN_CHUNK:
-                    continue
-                cut = max(buf.rfind(" "), buf.rfind("\n"))
-                if cut <= 0:
-                    continue
-                chunk, buf = buf[:cut], buf[cut:]
-                if not push(chunk):
-                    return out
+        try:
+            async with contextlib.aclosing(stream(writer_endpoint(), self.messages(p), temperature=0.2,
+                                                  max_tokens=max_tokens)) as pieces:
+                async for piece in pieces:
+                    if not should_continue():
+                        return out
+                    buf += piece
+                    if len(buf) < T.BUBBLE_MIN_CHUNK:
+                        continue
+                    cut = max(buf.rfind(" "), buf.rfind("\n"))
+                    if cut <= 0:
+                        continue
+                    chunk, buf = buf[:cut], buf[cut:]
+                    if not push(chunk):
+                        return out
+        except EmptyCompletion:
+            if not out.strip():
+                buf = extractive_fallback(p)
+        # Also cover custom stream adapters that silently finish without content.
+        if not out.strip() and not buf.strip():
+            buf = extractive_fallback(p)
         tail = buf.rstrip()
         if tail and should_continue():
             push(tail)

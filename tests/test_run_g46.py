@@ -112,7 +112,7 @@ def test_timeout_handles_already_exited_group(monkeypatch, tmp_path):
     ("Traceback: unexpected local error", "", 1, True),
     ("[1.0s] done (retrieve 0.5s, first chunk +0.2s)", "answer", 0, False),
     ("A record with 503 widgets", "answer", 0, False),
-    ("", "", 0, False),
+    ("", "", 0, True),
 ])
 def test_answer_failure_detection(monkeypatch, tmp_path, stderr, answer, returncode, infra):
     processes(monkeypatch, FakeProcess(answer, stderr, returncode))
@@ -618,3 +618,13 @@ def test_failed_rejudge_clears_stale_verdict_reason(monkeypatch):
     run.judge_with_retries(result, "fake", 0)
     assert result.infra_error and result.supported is None and result.answers_question is None
     assert result.judge_reason == "" and result.error == "judge error: outage"
+
+
+@pytest.mark.parametrize("unanswerable", [False, True])
+def test_blank_success_is_retried_but_nothing_on_file_is_scored(monkeypatch, tmp_path, unanswerable):
+    case = run.Case("q", "recall", unanswerable=unanswerable)
+    calls = processes(monkeypatch, FakeProcess(" \n"), FakeProcess("(nothing on file about that)"))
+    monkeypatch.setattr(run.time, "sleep", lambda delay: None)
+    result = run.ask(case, tmp_path / "db", tmp_path, 1)
+    assert len(calls) == result.attempts == 2
+    assert result.answer == "(nothing on file about that)" and not result.infra_error
