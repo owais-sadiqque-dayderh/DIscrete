@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 
 from ..config import T
+from ..perf import PERF
 
 log = logging.getLogger("discrete.capture.ax")
 
@@ -259,7 +260,10 @@ def _walk_text(el, parts: list[str], *, depth: int, max_nodes: int, deadline: fl
                deferred: list[str] | None = None, in_banner: bool = False,
                clipped_parent: bool = False, parent=None,
                meta: list[tuple] | None = None, deferred_meta: list[tuple] | None = None) -> None:
-    if depth > 40 or seen[0] >= max_nodes or time.monotonic() > deadline:
+    if depth > 40:
+        PERF.count("health.capture_ax_depth_limit")
+        return
+    if seen[0] >= max_nodes or time.monotonic() > deadline:
         return
     seen[0] += 1
     role = str(_ax_get(el, "AXRole") or "")
@@ -382,18 +386,27 @@ def _web_visible_text(web_area, viewport: tuple[float, float, float, float], dea
 def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: int,
                      viewport: tuple[float, float, float, float] | None = None) -> str:
     """AX text walk of the focused window of `pid`. Empty when AX is not trusted."""
-    if not _HAS_QUARTZ or not pid or not accessibility_granted():
+    if not _HAS_QUARTZ:
+        PERF.count("health.capture_ax_empty.unavailable")
+        return ""
+    if not pid:
+        PERF.count("health.capture_ax_empty.no_pid")
+        return ""
+    if not accessibility_granted():
+        PERF.count("health.capture_ax_empty.untrusted")
         return ""
     try:
         app_el = AXUIElementCreateApplication(pid)
         _enable_full_tree(app_el, pid)
         win = _ax_get(app_el, "AXFocusedWindow")
         if win is None:
+            PERF.count("health.capture_ax_empty.no_window")
             return ""
         if viewport:
             p = _point_xy(_ax_value(_ax_get(win, "AXPosition"), kAXValueCGPointType))
             s = _size_wh(_ax_value(_ax_get(win, "AXSize"), kAXValueCGSizeType))
             if p is not None and s is not None and any(abs(a - b) > 2 for a, b in zip((*p, *s), viewport, strict=True)):
+                PERF.count("health.capture_ax_empty.viewport_mismatch")
                 return ""  # another window of the same app gained focus; trust captured pixels
         deadline = time.monotonic() + timeout_ms / 1000.0
         searched = [0]
@@ -405,22 +418,39 @@ def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: in
             if web_area is not None:
                 visible_text = _web_visible_text(web_area, viewport, deadline)
                 if visible_text:
+                    if len(visible_text) >= max_chars:
+                        PERF.count("health.capture_ax_text_truncated")
                     return visible_text[:max_chars]
         parts: list[str] = []
         deferred: list[str] = []
         meta: list[tuple] = []
         deferred_meta: list[tuple] = []
-        _walk_text(win, parts, depth=0, max_nodes=max(0, max_nodes - searched[0]),
-                   deadline=deadline, seen=[0],
+        seen = [0]
+        remaining_nodes = max(0, max_nodes - searched[0])
+        _walk_text(win, parts, depth=0, max_nodes=remaining_nodes,
+                   deadline=deadline, seen=seen,
                    viewport=viewport, deferred=deferred, meta=meta, deferred_meta=deferred_meta)
         # Adjacent duplicates are common (title + value of one element).
         out: list[str] = []
         for p in (*_merge_static_runs(parts, meta), *_merge_static_runs(deferred, deferred_meta)):
             if not out or out[-1] != p:
                 out.append(p)
-        return "\n".join(out)[:max_chars]
+        text = "\n".join(out)
+        expired = time.monotonic() > deadline
+        exhausted = seen[0] >= remaining_nodes
+        if expired:
+            PERF.count("health.capture_ax_deadline")
+        if exhausted:
+            PERF.count("health.capture_ax_node_limit")
+        if not text:
+            reason = "deadline" if expired else "node_limit" if exhausted else "no_text"
+            PERF.count(f"health.capture_ax_empty.{reason}")
+        if len(text) >= max_chars:
+            PERF.count("health.capture_ax_text_truncated")
+        return text[:max_chars]
     except Exception as exc:
         log.debug("read_screen_text failed: %s", exc)
+        PERF.count("health.capture_ax_empty.error")
         return ""
 
 

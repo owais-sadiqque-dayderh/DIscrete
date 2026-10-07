@@ -22,6 +22,7 @@ _INSERT_COLS = (
 )
 _INSERT_SQL = (f"INSERT INTO observations({', '.join(_INSERT_COLS)}) "
                f"VALUES ({', '.join('?' * len(_INSERT_COLS))})")
+_LEGACY_SCREEN_TEXT_CAP = 12_000  # older golden captures already lost text at this boundary
 
 
 def _ph(ids: Sequence) -> str:
@@ -102,6 +103,18 @@ class ObservationsMixin(StoreBase):
                     tk.content_hash(draft.world_text()), text_hash, now(), now(),
                 ))
                 oid = rowid(cur)
+                # Older rows lack per-capture flags. Retain the first instrumented
+                # ID so checking an upgraded store does not accuse legacy captures.
+                conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES ('screen_text_flags_from', ?)", (str(oid),))
+                # Flag conservative cap hits per row, even when replaying old text.
+                # A count alone cannot prove that every capped row was acknowledged.
+                cap = next((n for n in (_LEGACY_SCREEN_TEXT_CAP, T.SCREEN_TEXT_MAX_CHARS)
+                            if n - 1 <= len(draft.screen_text) <= n), None)
+                if cap is not None or len(draft.screen_text) > T.SCREEN_TEXT_MAX_CHARS:
+                    conn.execute("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) "
+                                 "DO UPDATE SET value=excluded.value",
+                                 (f"screen_text_truncated:{oid}", str(cap or T.SCREEN_TEXT_MAX_CHARS)))
+                    self._metric(conn, "capture_screen_text_truncated")
                 _sighting(conn, oid)
                 conn.execute("INSERT INTO obs_minhash(obs_id, sig) VALUES (?, ?)", (oid, tk.minhash_bytes(sig)))
                 if draft.origin == "user":

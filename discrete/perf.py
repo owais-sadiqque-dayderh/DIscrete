@@ -15,6 +15,7 @@ No dependencies: any module may import this.
 from __future__ import annotations
 
 import collections
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -60,19 +61,25 @@ class _Timer:
 class PerfLog:
     def __init__(self) -> None:
         self.source = "live"
+        # AX/text helpers emit health events from worker threads while the runtime
+        # flushes. Keep snapshot-and-clear atomic so those events cannot disappear.
+        self._lock = threading.Lock()
         self._calls: collections.deque[Call] = collections.deque(maxlen=_MAX_BUFFERED)
         self._samples: collections.deque[Sample] = collections.deque(maxlen=_MAX_BUFFERED)
 
     def call(self, rec: Call) -> None:
         rec.source = rec.source or self.source
-        self._calls.append(rec)
+        with self._lock:
+            self._calls.append(rec)
 
     def sample(self, stage: str, ms: float, *, n: int | None = None, ref_id: int | None = None) -> None:
-        self._samples.append(Sample(stage, float(ms), time.time(), n, ref_id, self.source))
+        with self._lock:
+            self._samples.append(Sample(stage, float(ms), time.time(), n, ref_id, self.source))
 
     def count(self, name: str, n: int = 1) -> None:
         if n:
-            self._samples.append(Sample(name, None, time.time(), int(n), None, self.source))
+            with self._lock:
+                self._samples.append(Sample(name, None, time.time(), int(n), None, self.source))
 
     @contextmanager
     def timer(self, stage: str, *, n: int | None = None, ref_id: int | None = None) -> Iterator[_Timer]:
@@ -83,9 +90,10 @@ class PerfLog:
         self.sample(stage, (time.perf_counter() - t0) * 1000, n=t.n, ref_id=t.ref_id)
 
     def drain(self) -> tuple[list[Call], list[Sample]]:
-        calls, samples = list(self._calls), list(self._samples)
-        self._calls.clear()
-        self._samples.clear()
+        with self._lock:
+            calls, samples = list(self._calls), list(self._samples)
+            self._calls.clear()
+            self._samples.clear()
         return calls, samples
 
 

@@ -277,6 +277,8 @@ class ScreenObserver:
         t_text = time.perf_counter()
         screen_text, text_source = await asyncio.to_thread(self._screen_text, ctx, after, stale)
         PERF.sample("capture.text", since_ms(t_text), n=len(screen_text))
+        if len(screen_text) >= T.SCREEN_TEXT_MAX_CHARS - 1:
+            PERF.count("health.capture_screen_text_cap_hits")
         drop = meta_secret
         if T.REDACT_SECRETS:
             r = redact_capture("", "", screen_text, text_source, memory=self._secrets)
@@ -286,6 +288,7 @@ class ScreenObserver:
             # none, caption from the text alone. (Catch-all hits such as document ids
             # are masked in the text but keep the frame.)
             self.stats["redacted"] += 1
+            PERF.count("health.capture_redaction_frame_drops")
             before = after = None
         origin = classify_origin(ctx.app, ctx.window_title, screen_text)
         base: dict[str, Any] = dict(
@@ -339,6 +342,8 @@ class ScreenObserver:
         text = "" if stale else ax.read_screen_text(
             ctx.pid, max_nodes=T.AX_WALK_MAX_NODES, timeout_ms=T.AX_WALK_TIMEOUT_MS,
             max_chars=T.SCREEN_TEXT_MAX_CHARS, viewport=ctx.bounds)
+        if stale:
+            PERF.count("health.capture_ax_empty.stale")
         # A long AX tree can still be only chrome while the document is a scanned page
         # or a canvas, so its length cannot establish coverage: OCR every frame
         # (off the event loop). Only OCR lines that AX lacks are kept, and

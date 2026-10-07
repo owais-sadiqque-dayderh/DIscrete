@@ -13,7 +13,7 @@ import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,12 +23,10 @@ import numpy as np
 from ..config import ROOT, T, all_endpoints, data_dir, db_path, frames_dir
 from ..store import Store
 from ..timeutil import from_local, iso, now
+from .slos import EXCLUDED_SOURCES, evaluate_slos
 
 # Below this much activity, per-hour rates are extrapolated from too little.
 SHORT_WINDOW_H = 0.25
-
-# Debugging and measuring runs are not the pipeline's cost or speed.
-EXCLUDED_SOURCES = ("eval", "query", "bench")
 
 # (stage, label) in pipeline order; stages not listed are shown after these.
 STAGES: list[tuple[str, str]] = [
@@ -254,6 +252,7 @@ async def collect(store: Store, window: Window, *, sources: list[str] | None = N
                  "usd_per_capture": round(total_cost / len(spans), 6) if spans else None, "by_source": by_source},
         "models": models,
         "latency_ms": latency,
+        "slos": [asdict(result) for result in evaluate_slos(samples, pipeline_only=False)],
         "captures": captures,
         "quality": eval_metrics,
         "storage": storage,
@@ -382,6 +381,12 @@ def render(snap: dict[str, Any]) -> str:
         out.append("  no timings in this window")
 
     c = snap["captures"]
+    out += ["", "SLOs (p90; unmeasured stages are n/a)"]
+    for result in snap.get("slos", []):
+        out.append(f"  {result['stage']}: {result['status'].upper()}  "
+                   f"p90 {_num(result['p90_ms'])} ms < {result['limit_ms']:g} ms (n={result['n']})")
+        if result.get("reason"):
+            out.append(f"    {result['reason']}")
     out += ["", "CAPTURES"]
     if c.get("rows"):
         out.append(f"  rows {c['rows']} ({_num(c['rows_per_active_hour'])}/active h): screen {c['screen']}, "

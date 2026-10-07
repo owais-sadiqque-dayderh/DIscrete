@@ -335,6 +335,13 @@ class T:
     DEDUP_SHORT_SHINGLES = _typed("DEDUP_SHORT_SHINGLES", 30)
     EPISODE_SWITCH_MIN_S = _typed("EPISODE_SWITCH_MIN_S", 90.0)
     EPISODE_SHIFT_SIM = _typed("EPISODE_SHIFT_SIM", 0.55)
+    EPISODE_SHIFT_OBS = _typed("EPISODE_SHIFT_OBS", 2)
+    EPISODE_MERGE_SIM = _typed("EPISODE_MERGE_SIM", 0.90)
+    EPISODE_MERGE_GAP_S = _typed("EPISODE_MERGE_GAP_S", 60.0)
+    TASK_MATCH_SIM = _typed("TASK_MATCH_SIM", 0.80)
+    TASK_ENTITY_OVERLAP = _typed("TASK_ENTITY_OVERLAP", 0.5)
+    TASK_WINDOW_S = _typed("TASK_WINDOW_S", 86400.0)
+    TASK_RETRIEVAL_SIBLINGS = _typed("TASK_RETRIEVAL_SIBLINGS", 4)
     EPISODE_MAX_S = _typed("EPISODE_MAX_S", 1800.0)
     # An episode closes at this many observations: what the drafter reads in one call.
     EPISODE_MAX_OBS = _typed("EPISODE_MAX_OBS", 40)

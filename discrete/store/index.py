@@ -116,6 +116,9 @@ class IndexMixin(StoreBase):
             with self._tx() as conn:
                 for kind, rid, vec, th in items:
                     self._write_vector(conn, kind, rid, vec, th)
+                for kind, rid, _, _ in items:
+                    if kind == "episode":
+                        self._assign_episode_task(conn, rid)
 
         if items:
             await self._call(_save)

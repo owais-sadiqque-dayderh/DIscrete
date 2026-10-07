@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from ..perf import Call, Sample
 from ..timeutil import now
 from .base import StoreBase
+from .health import HEALTH_EVENT_PREFIX
 
 
 def _window(since: float | None, until: float | None, sources: Sequence[str] | None) -> tuple[str, list]:
@@ -31,6 +32,9 @@ class PerfMixin(StoreBase):
                 conn.executemany(
                     "INSERT INTO perf_samples(at, src, stage, ms, n, ref_id) VALUES (?,?,?,?,?,?)",
                     [(s.at, s.source, s.stage, s.ms, s.n, s.ref_id) for s in samples])
+                for sample in samples:
+                    if sample.ms is None and sample.stage.startswith(HEALTH_EVENT_PREFIX) and sample.n:
+                        self._metric(conn, sample.stage.removeprefix(HEALTH_EVENT_PREFIX), sample.n)
 
         await self._call(_run)
 

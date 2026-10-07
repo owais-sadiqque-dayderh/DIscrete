@@ -80,6 +80,7 @@ class DraftsMixin(ClaimsMixin):
                              "status='closed', updated_at=? WHERE id=?",
                              (title, summary, json.dumps(apps), json.dumps(sites), engaged_fraction, now(), episode_id))
                 self._enqueue(conn, "episode", episode_id)
+                self._assign_episode_task(conn, episode_id, names=candidates)
                 return ops
 
         return await self._call(_commit)

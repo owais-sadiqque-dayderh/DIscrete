@@ -16,6 +16,8 @@ import numpy as np
 import tldextract
 from datasketch import MinHash
 
+from .perf import PERF
+
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@/\-'’]*")
 _EDGE = "._-/'’@"
 _POSSESSIVE = re.compile(r"['’]s$", re.IGNORECASE)
@@ -140,6 +142,10 @@ def best_window(text: str, terms: set[str], width: int = 40) -> tuple[str, float
 
 def truncate(text: str, n: int) -> str:
     text = text or ""
+    if len(text) > n:
+        # Count actual cuts by their limit. In particular, the caption's 4000
+        # character cut is observable without coupling utilities to enrichment.
+        PERF.count(f"health.text_truncated.{n}")
     return text if len(text) <= n else text[: max(0, n - 1)].rstrip() + "…"
 
 

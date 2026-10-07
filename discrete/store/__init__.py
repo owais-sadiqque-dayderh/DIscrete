@@ -18,10 +18,11 @@ from .history import RevertConflict
 from .index import KINDS, IndexMixin
 from .observations import ObservationsMixin
 from .perf import PerfMixin
+from .tasks import TasksMixin
 
 
 class Store(ObservationsMixin, EpisodesMixin, DraftsMixin, CorrectionsMixin, BeliefsMixin, EntitiesMixin,
-            IndexMixin, GapsMixin, HealthMixin, PerfMixin, AttentionMixin):
+            IndexMixin, TasksMixin, GapsMixin, HealthMixin, PerfMixin, AttentionMixin):
     pass
 
 

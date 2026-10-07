@@ -1,14 +1,24 @@
-"""Episodes and day digests. Lifecycle: open → ready → drafting → closed | failed."""
+"""Episodes and day digests. Lifecycle: open → ready → drafting → closed | failed; ready → merged."""
 
 from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime
 
-from ..config import T
+import numpy as np
+
+from ..config import T, embedding_endpoint
 from ..timeutil import day_bounds, day_key, from_local, now
 from .base import StoreBase, rowid
+from .tasks import cosine
+
+
+@dataclass
+class _ObservationCentroid:
+    count: int
+    vector: np.ndarray | None
 
 
 class EpisodesMixin(StoreBase):
@@ -57,14 +67,86 @@ class EpisodesMixin(StoreBase):
         """Claim a ready episode for drafting (guards against double drafting)."""
 
         def _claim():
-            cur = self.conn.execute(
-                "UPDATE episodes SET status='drafting', draft_attempts=draft_attempts+1, updated_at=? "
-                "WHERE id=? AND status='ready'",
-                (now(), episode_id),
-            )
-            return cur.rowcount == 1
+            with self._tx() as conn:
+                self._merge_ready_episode(conn, episode_id)
+                cur = conn.execute(
+                    "UPDATE episodes SET status='drafting', draft_attempts=draft_attempts+1, updated_at=? "
+                    "WHERE id=? AND status='ready'",
+                    (now(), episode_id),
+                )
+                return cur.rowcount == 1
 
         return await self._call(_claim)
+
+    def _merge_ready_episode(self, conn: sqlite3.Connection, episode_id: int) -> None:
+        """Merge only adjacent closed-for-drafting inputs, atomically with claiming.
+
+        Tombstones keep IDs stable. A prior draft attempt/checkpoint/claim is a
+        hard barrier, as are sessions, time gaps and the tracker size caps.
+        Redrafted copies lock existing boundaries while resetting the retry budget.
+        """
+        def eligible(ep: sqlite3.Row | None) -> bool:
+            return (ep is not None and ep['status'] == 'ready' and ep['draft_attempts'] == 0
+                    and not ep['title'] and not ep['summary']
+                    and not conn.execute("SELECT 1 FROM meta WHERE key=?",
+                                         (f"episode_boundary_locked:{ep['id']}",)).fetchone()
+                    and not conn.execute("SELECT 1 FROM episode_draft_chunks WHERE episode_id=?", (ep['id'],)).fetchone()
+                    and not conn.execute("SELECT 1 FROM claims WHERE episode_id=?", (ep['id'],)).fetchone()
+                    and not conn.execute("SELECT 1 FROM episode_tasks WHERE episode_id=?", (ep['id'],)).fetchone())
+
+        def observations(ep: sqlite3.Row) -> _ObservationCentroid:
+            rows = conn.execute(
+                "SELECT o.id, v.vector FROM observations o LEFT JOIN embeddings v "
+                "ON v.ref_kind='observation' AND v.ref_id=o.id AND v.model=? "
+                "WHERE o.episode_id=? AND o.origin='user'",
+                (embedding_endpoint().model or 'unknown', ep['id'])).fetchall()
+            # Partial coverage can make a mixed-topic episode appear homogeneous.
+            if not rows or any(r['vector'] is None for r in rows):
+                return _ObservationCentroid(len(rows), None)
+            vectors = [np.frombuffer(r['vector'], dtype=np.float32) for r in rows]
+            if len({v.shape for v in vectors}) != 1:
+                return _ObservationCentroid(len(rows), None)
+            vectors = [v / max(float(np.linalg.norm(v)), 1e-9) for v in vectors]
+            return _ObservationCentroid(len(rows), np.mean(vectors, axis=0))
+
+        while True:
+            ep = conn.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone()
+            if not eligible(ep):
+                return
+            assert ep is not None
+            near = []
+            for comparison, order in (('<', 'DESC'), ('>', 'ASC')):
+                neighbor = conn.execute(
+                    f"SELECT * FROM episodes WHERE status!='merged' AND (started_at, id){comparison}(?,?) "
+                    f"ORDER BY started_at {order}, id {order} LIMIT 1", (ep['started_at'], episode_id)).fetchone()
+                if neighbor is not None:
+                    near.append(neighbor)
+            own = observations(ep)
+            if own.vector is None:
+                return
+            merged = False
+            for other in near:
+                if not eligible(other) or other['session_id'] != ep['session_id']:
+                    continue
+                gap = max(ep['started_at'], other['started_at']) - min(ep['ended_at'], other['ended_at'])
+                start, end = min(ep['started_at'], other['started_at']), max(ep['ended_at'], other['ended_at'])
+                if gap > T.EPISODE_MERGE_GAP_S or end - start > T.EPISODE_MAX_S:
+                    continue
+                candidate = observations(other)
+                if own.count + candidate.count > T.EPISODE_MAX_OBS or candidate.vector is None:
+                    continue
+                if cosine(own.vector, candidate.vector) < T.EPISODE_MERGE_SIM:
+                    continue
+                conn.execute("UPDATE observations SET episode_id=? WHERE episode_id=?", (episode_id, other['id']))
+                conn.execute("UPDATE episodes SET started_at=?, ended_at=?, updated_at=? WHERE id=?",
+                             (start, end, now(), episode_id))
+                conn.execute("UPDATE episodes SET status='merged', updated_at=? WHERE id=?", (now(), other['id']))
+                self._drop_vector(conn, 'episode', other['id'])
+                self._metric(conn, 'episodes_merged')
+                merged = True
+                break
+            if not merged:
+                return
 
     async def draft_failed(self, episode_id: int) -> None:
         await self.execute(
@@ -120,11 +202,12 @@ class EpisodesMixin(StoreBase):
                     (title, summary, json.dumps(apps), json.dumps(sites), engaged_fraction, now(), episode_id),
                 )
                 self._enqueue(conn, "episode", episode_id)
+                self._assign_episode_task(conn, episode_id)
 
         await self._call(_close)
 
     async def episodes_ready_for_draft(self, *, limit: int = 5) -> list[sqlite3.Row]:
-        return await self.q("SELECT * FROM episodes WHERE status='ready' ORDER BY id LIMIT ?", (limit,))
+        return await self.q("SELECT * FROM episodes WHERE status='ready' ORDER BY started_at, id LIMIT ?", (limit,))
 
     async def reset_stuck_drafting(self) -> None:
         await self.execute("UPDATE episodes SET status='ready' WHERE status='drafting'")
@@ -132,12 +215,12 @@ class EpisodesMixin(StoreBase):
     async def episodes_for_day(self, day: str) -> list[sqlite3.Row]:
         start, end = day_bounds(from_local(datetime.strptime(day, "%Y-%m-%d")))
         return await self.q(
-            "SELECT * FROM episodes WHERE started_at >= ? AND started_at < ? ORDER BY started_at", (start, end)
+            "SELECT * FROM episodes WHERE status!='merged' AND started_at >= ? AND started_at < ? ORDER BY started_at", (start, end)
         )
 
     async def episodes_in_interval(self, start: float, end: float) -> list[sqlite3.Row]:
         return await self.q(
-            "SELECT * FROM episodes WHERE started_at < ? AND ended_at >= ? ORDER BY started_at", (end, start)
+            "SELECT * FROM episodes WHERE status!='merged' AND started_at < ? AND ended_at >= ? ORDER BY started_at", (end, start)
         )
 
     async def days_with_episodes(self) -> list[str]:

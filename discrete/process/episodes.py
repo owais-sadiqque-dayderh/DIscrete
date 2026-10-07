@@ -1,8 +1,8 @@
 """Online episode segmentation (planS2 §3.2).
 
 Boundaries: session change / idle; a sustained (app, site) switch, placed
-retroactively at the switch point; two consecutive semantic-shift
-observations; the episode length cap. A brief alt-tab that returns to the
+retroactively at the switch point; consecutive semantic-shift observations
+across any app/site; the episode length cap. A brief alt-tab that returns to the
 episode's context before `EPISODE_SWITCH_MIN_S` is absorbed.
 
 Tracker state lives in memory. On restart, orphaned open episodes are made
@@ -32,7 +32,6 @@ log = logging.getLogger("discrete.process.episodes")
 class _Pending:
     """Observations since the context left the episode's (app, site)."""
 
-    pair: tuple[str, str]
     since: float
     obs: list[tuple[int, object, np.ndarray | None]] = field(default_factory=list)  # (id, row, vec)
 
@@ -76,31 +75,34 @@ class EpisodeTracker:
 
         if pair == st.pair:
             st.switch = None  # a brief excursion returned: absorbed
-        elif st.switch is not None and st.switch.pair == pair:
+        elif st.switch is not None:
+            # Away from the original context, even when the detour changes app/site.
             st.switch.obs.append((obs_id, row, vec))
-            if t - st.switch.since >= T.EPISODE_SWITCH_MIN_S:
-                moved = st.switch.obs
-                closed += await self._split(moved[:-1], obs_id, row, session_id, vec)
-                return closed
         else:
-            st.switch = _Pending(pair=pair, since=t, obs=[(obs_id, row, vec)])
+            st.switch = _Pending(since=t, obs=[(obs_id, row, vec)])
 
-        # Semantic shift: two consecutive low-similarity observations (same context).
-        if vec is not None and pair == st.pair:
+        # Topic shifts can occur in any app/site. Missing vectors break the run:
+        # otherwise two unrelated distant rows could masquerade as consecutive.
+        if vec is not None:
             sim = float(st.centroid @ vec) if st.centroid is not None else 1.0
             if sim < T.EPISODE_SHIFT_SIM:
                 st.low_sim.append((obs_id, row, vec))
-                if len(st.low_sim) >= 2:
-                    moved = st.low_sim[:-1]
-                    closed += await self._split(moved, obs_id, row, session_id, vec)
+                if len(st.low_sim) >= max(2, T.EPISODE_SHIFT_OBS):
+                    closed += await self._split(st.low_sim[:-1], obs_id, row, session_id, vec)
                     return closed
             else:
                 st.low_sim.clear()
+        else:
+            st.low_sim.clear()
+
+        if st.switch is not None and t - st.switch.since >= T.EPISODE_SWITCH_MIN_S:
+            closed += await self._split(st.switch.obs[:-1], obs_id, row, session_id, vec)
+            return closed
 
         await self.store.assign_episode([obs_id], st.episode_id)
         st.n += 1
         st.last_obs_at = max(st.last_obs_at, row["ended_at"])
-        if vec is not None and pair == st.pair and not st.low_sim:
+        if vec is not None and not st.low_sim:
             st.centroid = _update(st.centroid, vec, st.n)
         # Close at the length the drafter reads in one call, or at the time cap: a longer
         # episode used to lose its head before drafting (a whole download, install and the
@@ -130,9 +132,16 @@ class EpisodeTracker:
             await self.store.assign_episode(rest, self.state.episode_id)
             self.state.n += len(rest)
             self.state.last_obs_at = max(self.state.last_obs_at, row["ended_at"])
+            vectors = [v for _, _, v in [*moved, (obs_id, row, vec)] if v is not None]
+            if vectors:
+                c = np.mean(vectors, axis=0)
+                self.state.centroid = c / max(float(np.linalg.norm(c)), 1e-9)
             self.state.pair = pair_of(row)
         await self.store.mark_episode_ready(old)
-        return [old]
+        closed = [old]
+        if self.state.n >= T.EPISODE_MAX_OBS or self.state.last_obs_at - self.state.started_at >= T.EPISODE_MAX_S:
+            closed += await self.close_current()
+        return closed
 
     async def close_current(self) -> list[int]:
         if not self.state:

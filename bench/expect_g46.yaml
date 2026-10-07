@@ -1,0 +1,8 @@
+# Verified against g46/branch.db (baseline misses the completed download).
+screen_text_cap: 12000
+chrome_max_share: 0.30
+claims:
+  - name: chatgpt_download
+    kind: event
+    action: downloaded
+    text_regex: 'downloaded.*ChatGPT\.dmg'

@@ -5,8 +5,9 @@ consolidation changed, the captures and their captions are the same and only the
 built on them needs rebuilding. On the copy this keeps observations, captions, sightings,
 episodes (boundaries) and entity *candidates* (they come from capture), and deletes
 claims and everything derived from them: evidence, mentions, links/trails, the change
-log, digests, gaps, promoted entities, aliases, edges, their embeddings and outbox rows.
-Episodes go back to ``ready``; then run
+log, digests, gaps, promoted entities, aliases, edges, tasks, derived embeddings,
+outbox rows and coverage records. Non-merged episodes go back to ``ready`` with
+their boundaries locked against further pre-draft merging; then run
 
     .venv/bin/python -m discrete.cli --db OUT process --recover --consolidate
 
@@ -22,10 +23,10 @@ from pathlib import Path
 #: Tables wholly derived from drafting and consolidation.
 DERIVED = (
     "evidence", "mentions", "links", "memory_event_refs", "memory_events", "digests", "gaps",
-    "entity_edges", "entity_aliases", "entities", "suppressions", "retrieval_misses", "claims",
-    "episode_draft_chunks",
+    "entity_edges", "entity_aliases", "entities_fts", "entities", "suppressions", "retrieval_misses", "claims",
+    "episode_draft_chunks", "episode_tasks", "tasks",
 )
-DERIVED_KINDS = ("claim", "entity", "digest")
+DERIVED_KINDS = ("claim", "entity", "digest", "episode", "task")
 
 
 def redraft(src: Path, out: Path) -> dict[str, int]:
@@ -46,16 +47,21 @@ def redraft(src: Path, out: Path) -> dict[str, int]:
         # The dense-index cache is keyed on this counter: bump it so no stale matrix is reused.
         conn.execute("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key LIKE 'vectors:%'")
         conn.execute("DELETE FROM meta WHERE key IN ('last_consolidation', 'last_dream')")
+        conn.execute("DELETE FROM meta WHERE key LIKE 'draft_coverage:%'")
+        # Resetting attempts removes the merger's usual prior-draft guard. Lock
+        # every retained boundary so a redraft remains a drafting-only rebuild.
+        conn.execute("INSERT OR IGNORE INTO meta(key,value) "
+                     "SELECT 'episode_boundary_locked:' || id, '1' FROM episodes WHERE status!='merged'")
         counts["episodes"] = conn.execute(
-            "UPDATE episodes SET status='ready', title='', summary='', draft_attempts=0"
+            "UPDATE episodes SET status='ready', title='', summary='', apps='[]', sites='[]', "
+            "engaged_fraction=0, draft_attempts=0 WHERE status!='merged'"
         ).rowcount
-    for fts in ("claims_fts", "episodes_fts", "entities_fts"):
+    # Entity FTS owns its content (no delete triggers): clear it above. Only the
+    # external-content indexes can rebuild from their emptied/reset source rows.
+    for fts in ("claims_fts", "episodes_fts"):
         if fts in tables:
-            try:
-                with conn:
-                    conn.execute(f"INSERT INTO {fts}({fts}) VALUES ('rebuild')")
-            except sqlite3.OperationalError:
-                pass  # not an external-content index: its delete triggers already kept it in sync
+            with conn:
+                conn.execute(f"INSERT INTO {fts}({fts}) VALUES ('rebuild')")
     conn.execute("VACUUM")
     conn.close()
     return counts

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -98,10 +99,18 @@ class ProcessPipeline:
             log.warning("episode %s draft failed: %s", episode_id, exc)
             await self.store.draft_failed(episode_id)
             await self.store.bump_metric("draft_failed")
+            await self._count_abandoned(episode_id)
             return None
-        except BaseException:
+        except BaseException as exc:
             await self.store.draft_failed(episode_id)
+            await self.store.bump_metric("draft_cancelled" if isinstance(exc, asyncio.CancelledError) else "draft_failed")
+            await self._count_abandoned(episode_id)
             raise
+
+    async def _count_abandoned(self, episode_id: int) -> None:
+        episode = await self.store.get_episode(episode_id)
+        if episode is not None and episode["status"] == "failed":
+            await self.store.bump_metric("draft_abandoned")
 
     async def _draft(self, episode_id: int) -> DraftOutcome:
         outcome = DraftOutcome(episode_id=episode_id)
@@ -110,6 +119,8 @@ class ProcessPipeline:
         sites = sorted({r["site"] for r in rows if r["site"]})
         engaged = sum(1 for r in rows if r["keys"] or r["clicks"] or r["clipboard"]) / max(1, len(rows))
         if not rows or not self.ep.configured:
+            if rows and not self.ep.configured:
+                await self.store.bump_metric("draft_skipped_unconfigured", len(rows))
             title = " / ".join(apps)[:80] or "(no user activity)"
             await self.store.close_episode(episode_id, title=title, summary="", apps=apps, sites=sites,
                                            engaged_fraction=engaged)
@@ -118,6 +129,10 @@ class ProcessPipeline:
         # Every observation is read: an episode longer than one call (recovered, or from
         # before EPISODE_MAX_OBS) is drafted in consecutive chunks, never truncated.
         chunks = [rows[i:i + T.DRAFT_MAX_OBS] for i in range(0, len(rows), T.DRAFT_MAX_OBS)]
+        reached = {r["id"] for chunk in chunks for r in chunk}
+        if dropped := {r["id"] for r in rows} - reached:
+            await self.store.bump_metric("draft_window_dropped", len(dropped))
+            raise DraftConflict("draft window omitted observations")
         chrome = await self._chrome(rows)
         # Hash the entire observation snapshot, not just each chunk: an edit,
         # append or reassignment invalidates all earlier results. Include the
@@ -134,6 +149,7 @@ class ProcessPipeline:
             else:
                 part = await self._call_draft(chunk, chrome)
                 await self.store.save_draft_chunk(episode_id, index, input_hash, part)
+            await self.store.record_draft_coverage(episode_id, input_hash, index, [r["id"] for r in chunk])
             parts.append(part)
         data = parts[0] if len(parts) == 1 else {
             "title": " / ".join(dict.fromkeys(str(p.get("title") or "") for p in parts if p.get("title"))),
@@ -239,13 +255,14 @@ class ProcessPipeline:
         return ClaimWrite(cd)
 
     async def _call_draft(self, rows, chrome: dict[tuple[str, str], set[str]] | None = None) -> dict:
-        prompt = self._draft_prompt(rows, chrome)
+        prompt = self._draft_prompt(rows, chrome, record_losses=True)
         data = await complete_json(self.ep, [{"role": "user", "content": prompt}], max_tokens=2500)
         if not isinstance(data, dict):
             raise LLMError("draft: not an object")
         return data
 
-    def _draft_prompt(self, rows, chrome: dict[tuple[str, str], set[str]] | None = None) -> str:
+    def _draft_prompt(self, rows, chrome: dict[tuple[str, str], set[str]] | None = None,
+                      *, record_losses: bool = False) -> str:
         seen_lines: set[str] = set()
         blocks = []
         for r in rows:
@@ -256,7 +273,10 @@ class ProcessPipeline:
                 if k and k not in seen_lines:
                     seen_lines.add(k)
                     kept.append(line)
-            excerpt = tk.truncate("\n".join(kept), T.DRAFT_TEXT_CHARS_PER_OBS)
+            content = "\n".join(kept)
+            if record_losses and len(content) > T.DRAFT_TEXT_CHARS_PER_OBS:
+                PERF.count("health.draft_text_truncated")
+            excerpt = tk.truncate(content, T.DRAFT_TEXT_CHARS_PER_OBS)
             acted = "acted" if (r["keys"] or r["clicks"] or r["clipboard"]) else "viewed only"
             page = f" page={r['page_title']!r}" if r["page_title"] else ""
             blocks.append(

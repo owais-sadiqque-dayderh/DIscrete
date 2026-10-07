@@ -27,6 +27,7 @@ always points at raw screen evidence, so it can be shown and checked.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -213,7 +214,11 @@ async def build_trails(store: Store, *, limit: int = 20) -> int:
                 links = await trail_for(store, claim)
                 t.n = len(links)
             made += len(links)
+        except asyncio.CancelledError:
+            await store.bump_metric("trail_cancelled")
+            raise
         except Exception as exc:  # noqa: BLE001 - one action must not stop the others
+            await store.bump_metric("trail_failed")
             if not isinstance(exc, EXPECTED_ERRORS):
                 log.exception("trail for claim %s crashed", claim["id"])
             key = f"trail_attempts:{claim['id']}"
@@ -222,4 +227,5 @@ async def build_trails(store: Store, *, limit: int = 20) -> int:
             log.warning("trail for claim %s failed (attempt %d): %s", claim["id"], attempts, exc)
             if attempts >= T.TRAIL_MAX_ATTEMPTS:  # give up for good, visibly
                 await store.record_trail(claim["id"], [], reason=f"failed {attempts} times: {exc}"[:200])
+                await store.bump_metric("trail_abandoned")
     return made

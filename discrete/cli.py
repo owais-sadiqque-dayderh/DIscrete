@@ -20,6 +20,7 @@ from pathlib import Path
 from . import textkit as tk
 from .config import ConfigError, T, all_endpoints, data_dir, db_path
 from .evaluation import bench
+from .evaluation.check_cli import register_check
 from .evaluation.harness import compare, default_cases, run_suite, save_baseline
 from .llm import flush_usage
 from .perf import PERF
@@ -481,11 +482,32 @@ async def cmd_attention(args) -> int:
     return 0
 
 
+async def cmd_tasks(args) -> int:
+    async with _session() as store:
+        await store.backfill_tasks()
+        rows = await store.list_tasks(limit=args.n)
+        if args.json:
+            _print(json.dumps([dict(r) for r in rows], indent=2))
+        else:
+            from .timeutil import to_local
+
+            for r in rows:
+                _print(f"[task:{r['id']}] {r['title']} ({r['status']}, {r['n_episodes']} episodes) "
+                       f"{to_local(r['first_seen']):%Y-%m-%d %H:%M}–{to_local(r['last_seen']):%Y-%m-%d %H:%M}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="discrete")
     p.add_argument("--db", help="store path (default: $DISCRETE_DATA_DIR/discrete.db)")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
+    register_check(sub)
+
+    pt = sub.add_parser("tasks", help="list research/work threads across drafted episodes")
+    pt.add_argument("-n", type=int, default=20, help="maximum tasks to list")
+    pt.add_argument("--json", action="store_true", help="print structured task rows")
+    pt.set_defaults(func=cmd_tasks)
 
     prun = sub.add_parser("run", help="capture and process continuously, with Bubble on the hotkey")
     prun.add_argument("--no-bubble", action="store_true", help="capture only; do not arm the hotkey")

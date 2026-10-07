@@ -425,6 +425,22 @@ def m010_episode_draft_chunks(conn: sqlite3.Connection) -> None:
       END""")
 
 
+def m011_tasks(conn: sqlite3.Connection) -> None:
+    """Tasks span drafted episodes; each episode belongs to at most one task."""
+    conn.execute("""CREATE TABLE tasks(
+      id INTEGER PRIMARY KEY,
+      title TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      first_seen REAL NOT NULL,
+      last_seen REAL NOT NULL)""")
+    conn.execute("CREATE INDEX ix_tasks_time ON tasks(last_seen)")
+    conn.execute("""CREATE TABLE episode_tasks(
+      episode_id INTEGER PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      entities TEXT NOT NULL DEFAULT '[]')""")
+    conn.execute("CREATE INDEX ix_episode_tasks_task ON episode_tasks(task_id)")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_base,
     m002_draft_attempts_and_digest_counts,
@@ -436,6 +452,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m008_sightings,
     m009_evidence_field,
     m010_episode_draft_chunks,
+    m011_tasks,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

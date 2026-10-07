@@ -173,6 +173,7 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> R
         pool = await _rerank(query, pool, cold)
     with PERF.timer("retrieve.mmr"):
         result.hits = await _mmr(store, pool, T.TOP_K)
+    await expand_tasks(store, result)
     if plan.intent == "why":
         with PERF.timer("retrieve.why"):
             await expand_why(store, result)
@@ -181,6 +182,32 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> R
     if plan.time_spent:
         await add_attention(store, result)
     return result
+
+
+async def expand_tasks(store: Store, result: RetrievalResult) -> None:
+    """Bounded siblings of strong matches, within the requested interval.
+
+    These are context, not automatically strong support; the normal support
+    verifier still judges each sibling against the question.
+    """
+    if T.TASK_RETRIEVAL_SIBLINGS <= 0 or result.plan.intent not in ('recall', 'why'):
+        return
+    anchors = [h.ref_id for h in result.hits if h.ref_kind == 'episode' and h.strong and not h.via]
+    for kind in ('observation', 'claim'):
+        ids = [h.ref_id for h in result.hits if h.ref_kind == kind and h.strong and not h.via]
+        anchors += [r['episode_id'] for r in await store.live_rows(kind, ids) if r['episode_id'] is not None]
+    anchors = list(dict.fromkeys(anchors))
+    if not anchors:
+        return
+    have = {(h.ref_kind, h.ref_id) for h in result.hits}
+    for ep in await store.task_siblings(anchors, limit=T.TASK_RETRIEVAL_SIBLINGS, interval=result.plan.interval):
+        if ('episode', ep['id']) in have or not ep['summary']:
+            continue
+        h = Hit('episode', ep['id'], ep['title'] or 'episode', ep['summary'],
+                occurred_at=ep['started_at'], occurred_to=ep['ended_at'], via=f"task {ep['task_id']} sibling")
+        if h.in_interval(result.plan.interval):
+            result.hits.append(h)
+            have.add(('episode', ep['id']))
 
 
 async def add_attention(store: Store, result: RetrievalResult) -> None:

@@ -15,7 +15,6 @@ import argparse
 import collections
 import json
 import os
-import re
 import sqlite3
 import statistics
 import sys
@@ -161,7 +160,7 @@ def main() -> None:
     for r in user:
         prev = set().union(*seen_prev[r["app"]]) if seen_prev[r["app"]] else set()
         ks = [tk.norm_key(ln) for ln in lines_of(r["screen_text"])]
-        for k, ln in zip(ks, lines_of(r["screen_text"])):
+        for k, ln in zip(ks, lines_of(r["screen_text"]), strict=True):
             if k in prev:
                 rep += len(ln)
             else:

@@ -26,13 +26,16 @@ async def store_card(store: Store) -> str:
     lines = [
         f"Coverage: {iso(s['first_observation'])} → {iso(s['last_observation'])}",
         f"Rows: {s['observations']} observations ({s['observations_agent']} self/discarded), {s['episodes']} episodes "
-        f"{s['episodes_by_status']}, {s['claims_live']} live claims {s['claims_by_kind']}, "
+        f"{s['episodes_by_status']}, {s['tasks']} tasks, {s['claims_live']} live claims {s['claims_by_kind']}, "
         f"{s['entities']} entities (+{s['entity_candidates']} candidates), {s['open_gaps']} open gaps",
         "Top apps: " + ", ".join(f"{r['app']} ({r['n']})" for r in apps),
         "Top entities: " + ", ".join(f"{r['name']} ({r['n']})" for r in top),
         f"Health: index coverage {s['index_coverage']}, outbox {s['outbox_pending']}, "
+        f"task coverage {s['task_episodes']}/{s['episodes_by_status'].get('closed', 0)} closed episodes, "
         f"captions pending {s['enrich_pending']}, confidence top-value share {top_share:.0%}, "
-        f"lineage anomalies {await store.lineage_anomalies()}",
+        f"lineage anomalies {await store.lineage_anomalies()}, failed drafts {s['drafts_failed_current']}, "
+        f"caption text >4000 chars (at risk) {s['caption_text_at_risk']}; silent-loss counters "
+        + ", ".join(f"{k}={v}" for k, v in s["silent_loss"].items()),
         "Counters: " + ", ".join(f"{k}={int(v)}" for k, v in sorted(counters.items())),
     ]
     text = "\n".join(lines)
