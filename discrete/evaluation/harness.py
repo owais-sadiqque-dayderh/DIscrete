@@ -198,7 +198,7 @@ async def run_suite(store: Store, path: Path, *, answers: bool = False) -> Suite
     current = await store.snapshot_id()
     results = [await run_case(store, c, answers=answers) for c in cases]
     return SuiteResult(cases=results, health=await health_checks(store),
-                       stale=bool(snapshot) and snapshot != current, snapshot=current)
+                       stale=(bool(snapshot) and snapshot != current) or current != await store.snapshot_id(), snapshot=current)
 
 
 def baseline_path(cases_path: Path) -> Path:
@@ -215,6 +215,9 @@ def compare(result: SuiteResult, cases_path: Path) -> dict:
     if not path.exists():
         return {"baseline": None, "regressions": []}
     base = json.loads(path.read_text())
+    if result.stale or base.get("snapshot") != result.snapshot:
+        return {"baseline": base, "regressions": [], "incomparable": True,
+                "baseline_snapshot_matches": False, "note": "snapshot mismatch; rerun the baseline on the same inputs"}
     cur = result.metrics()
     regressions = []
     for m in ("hit_at_k", "mrr", "refusal_accuracy", "answer_support_rate", "answer_correct_rate"):

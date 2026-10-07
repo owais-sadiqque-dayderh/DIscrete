@@ -172,7 +172,7 @@ async def collect(store: Store, window: Window, *, sources: list[str] | None = N
     """The whole report as plain data (what `--save` writes)."""
     lo, hi = window.since, window.until
     present = await store.perf_sources()
-    srcs = sources or [s for s in present if s not in EXCLUDED_SOURCES]
+    srcs = sources if sources is not None else [s for s in present if s not in EXCLUDED_SOURCES]
     calls = await store.perf_calls(lo, hi, srcs)
     samples = await store.perf_samples(lo, hi, srcs)
     spans = await store.activity_spans(lo, hi)
@@ -202,7 +202,7 @@ async def collect(store: Store, window: Window, *, sources: list[str] | None = N
             "cost_usd": round(cost, 6),
             "usd_per_call": round(cost / n, 6),
             "cost_share": round(cost / total_cost, 3) if total_cost else None,
-            "cost_missing_calls": sum(r["cost"] is None and r["status"] == "ok" for r in rows),
+            "cost_missing_calls": sum(r["cost"] is None for r in rows),
             "latency_ms": _pct([r["ms"] for r in ok]) if ok else None,
             "first_token_ms": _pct(firsts) if firsts else None,
         }
@@ -242,6 +242,9 @@ async def collect(store: Store, window: Window, *, sources: list[str] | None = N
                "data_dir": str(data_dir()),
                "mb_per_active_hour": round((db_mb + frames_mb) / all_h, 2) if all_h > 0 else None}
 
+    unknown_calls = sum(c["cost"] is None for c in calls)
+    dropped_calls = counters.get("telemetry.dropped_calls", 0)
+    dropped_samples = counters.get("telemetry.dropped_samples", 0)
     return {
         "meta": {"name": name, "created_at": iso(now()), "window": {"label": window.label, "since": iso(lo),
                  "until": iso(hi) or iso(now())}, "sources": srcs, "sources_present": present, "git": _git(),
@@ -249,6 +252,9 @@ async def collect(store: Store, window: Window, *, sources: list[str] | None = N
         "activity": {"active_hours": round(active_h, 4), "captures_in_window": len(spans),
                      "daemon_hours": round(runtime_up_ms / 3.6e6, 3)},
         "cost": {"usd_total": round(total_cost, 6), "usd_per_active_hour": per_h(total_cost),
+                 "unknown_calls": unknown_calls, "priced_calls": len(calls) - unknown_calls,
+                 "dropped_calls": dropped_calls, "dropped_samples": dropped_samples,
+                 "is_lower_bound": bool(unknown_calls or dropped_calls),
                  "usd_per_capture": round(total_cost / len(spans), 6) if spans else None, "by_source": by_source},
         "models": models,
         "latency_ms": latency,
@@ -347,6 +353,11 @@ def render(snap: dict[str, Any]) -> str:
 
     out.append(f"COST  total ${cost['usd_total']:.4f}   per active hour {_usd(cost['usd_per_active_hour'])}   "
                f"per capture {_usd(cost['usd_per_capture'])}")
+    if cost.get("is_lower_bound"):
+        out.append(f"  lower bound: {cost.get('unknown_calls', 0)} calls have unknown prices; "
+                   f"{cost.get('dropped_calls', 0)} call measurements dropped")
+    if cost.get("dropped_samples"):
+        out.append(f"  {cost['dropped_samples']} stage measurements dropped")
     other = {s: v for s, v in cost["by_source"].items() if s != "live"}
     if other:
         out.append("  by source: " + ", ".join(f"{s} ${v:.5f}" for s, v in cost["by_source"].items()))
