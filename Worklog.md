@@ -1120,3 +1120,16 @@ user's running app in `exp_discrete` is untouched. Brief: `../hardening_2026-10-
   My follow-up dcef089 in jarvis: stop also kills a lease-less daemon started by an older jarvis (matched by this
   checkout's exact binary path — verified it matches the running exp daemon, not other checkouts); start refuses while
   such a daemon runs and warns (never kills) when another checkout holds Option+Tab.
+- ~03:20 IST: **W1 privacy done** (kaustubh Opus): PR-01 3960a40 (one gate right before every vision call: any frame
+  not already screened — cached before-frames, frames reloaded from disk — is OCR'd + checked; OCR failure withholds it),
+  PR-02 6a95339+cc596bb, PR-04 ea34f94+c32df71 (no full-display fallback; canonical hosts; unknown browser URL blocks
+  only when denied sites are set; Chrome/Edge/Brave incognito detected via AppleScript, Safari/Arc private windows NOT
+  detectable), PR-05 capture part 8809205, PR-06 a8cb9ca (doctor prints only OK/ISSUE; `--models` uses a synthetic
+  image), ME-01 abeaca8 (pHash only a hint; text must match the latest row; in-memory dedup cache removed), live-run
+  aabfe24: part of `dropped_failed` was a real bug (window-switch events lack the tab URL so the page's cached frame was
+  never matched) — fixed; counter renamed `missing_frame`; Screen-Recording warning now needs 3 distinct flat windows.
+  Dropped on purpose: Codex's "never merge rows whose numbers differ" (would stop most merges on pages with clocks).
+  Cost note: more OCR per capture. Report `W1-privacy.md`.
+- Integrated W1 (conflict in capture/screen.py: took W1's frame matching + W2's `max_pending`). My jarvis follow-up now
+  matches daemons by exact binary path from `ps` (W2's test bans pgrep/pkill); still finds the running exp daemon
+  77405 only. **Integration: 802 passed, 0 failed; ruff clean.** Waiting on W3 (formation) and W5 (retrieval).
