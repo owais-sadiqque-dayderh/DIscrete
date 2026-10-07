@@ -125,7 +125,6 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
                 line += f"\n    ({caption})"
             lines.append(line)
         return tk.truncate("\n".join(lines), max_chars * 2)
-    terms = set(result.plan.terms)
     blocks: list[str] = []
     used = 0
     if result.why_chain and result.why_chain.edges and not result.why_chain.verified:
@@ -152,9 +151,9 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
             body = h.body
         elif h.ref_kind == "observation":
             head = f"[screen {h.ref_id}{_when(h)} · {h.title}]"
-            caption, _, screen = h.body.partition("\n")
-            snippet = tk.best_window(screen, terms, width=110)[0] if terms and screen else screen
-            body = "\n".join(p for p in (caption, tk.truncate(snippet or screen, 900)) if p)
+            body = h.body
+            if h.source_spans:
+                head += " · source chars " + ", ".join(f"{a}:{b}" for a, b in h.source_spans)
         elif h.ref_kind == "episode":
             head = f"[episode {h.ref_id}{_when(h)}] {h.title}"
             body = h.body

@@ -141,6 +141,7 @@ class Hit:
     # For lasting claims: "established: seen in 4 episodes over 3 days" (store/beliefs.py).
     strength: str = ""
     verification: Verification = "unverified"
+    source_spans: list[tuple[int, int]] = field(default_factory=list)
 
     @property
     def text(self) -> str:
