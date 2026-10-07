@@ -75,6 +75,15 @@ def action_verb(item: dict) -> str:
     return verb if verb in ACTION_VERBS else ""
 
 
+def _relate_line(text: str, context: str, seen_from: float, seen_to: float) -> str:
+    """A claim for the relation prompt, with the context and time that decide whether
+    two claims really conflict."""
+    seen = f"{to_local(seen_from):%Y-%m-%d %H:%M}"
+    if f"{to_local(seen_to):%Y-%m-%d %H:%M}" != seen:
+        seen += f" to {to_local(seen_to):%Y-%m-%d %H:%M}"
+    return f"{text} | context: {json.dumps(context or '', ensure_ascii=False)} | seen: {seen}"
+
+
 def max_events(span_min: float) -> int:
     """Event room for an episode of this length (long episodes do several things)."""
     extra = int(max(0.0, span_min - 5) // max(T.DRAFT_EVENT_MINUTES, 0.5))
@@ -421,8 +430,12 @@ class ProcessPipeline:
         if not asked:
             return
         blocks = "\n\n".join(
-            RELATE_BLOCK.format(n=n, kind=d.cd.kind, text=d.cd.text,
-                                candidates="\n".join(f"[id={c['id']}] {c['text']}" for c in d.candidates))
+            RELATE_BLOCK.format(n=n, kind=d.cd.kind,
+                                text=_relate_line(d.cd.text, d.cd.context, d.cd.occurred_from, d.cd.occurred_to),
+                                candidates="\n".join(
+                                    f"[id={c['id']}] "
+                                    + _relate_line(c["text"], c["context"], c["occurred_from"], c["occurred_to"])
+                                    for c in d.candidates))
             for n, d in asked
         )
         data = await complete_json(self.ep, [{"role": "user", "content": RELATE_PROMPT.format(blocks=blocks)}],
@@ -456,7 +469,10 @@ class ProcessPipeline:
             w.operation, w.target_id = "reinforced", by_rel["same"][0]["id"]
         elif by_rel["contradicts"]:
             old = by_rel["contradicts"][0]
-            if old["modality"] == "stated" or (cd.modality == "passive" and old["modality"] == "engaged"):
+            # Arrival order is not time order: evidence seen before the old claim's
+            # latest support cannot end it (a retried or recovered episode), only dispute it.
+            older = cd.occurred_from < max(old["valid_from"], old["occurred_to"])
+            if older or old["modality"] == "stated" or (cd.modality == "passive" and old["modality"] == "engaged"):
                 w.contested_id = old["id"]
             else:
                 w.operation, w.target_id = "invalidated", old["id"]
