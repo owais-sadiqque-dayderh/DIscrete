@@ -1155,3 +1155,8 @@ user's running app in `exp_discrete` is untouched. Brief: `../hardening_2026-10-
   reads as one action). **Suite: 930 passed, 0 failed; ruff clean.** (The provenance timing test fails only under heavy
   machine load; passes alone.) Next: independent review of d8847a5..HEAD.
 - ~02:55 IST: independent report-only review r1 of d8847a5..HEAD launched (kaustubh Opus medium) → `../hardening_2026-10-08/REVIEW-r1.md`.
+- ~02:55 IST: review r1 on kaustubh failed immediately ("Claude API rate limit reached") — both subscriptions are now
+  rate-limited. Scheduled task "Relaunch hardening review r1 on Codex" fires 06:00 IST (after the 05:53 Codex reset);
+  brief saved in `../hardening_2026-10-08/REVIEW_BRIEF.md`. The scheduled run must delete itself (it is weekly).
+  **State:** `feat/production-hardening` = all five workers merged + orchestrator fixes, 930 tests pass; not yet reviewed;
+  the user's live app still runs the old code from `exp_discrete` — do NOT restart it on the new branch before review.
