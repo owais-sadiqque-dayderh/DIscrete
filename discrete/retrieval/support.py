@@ -6,8 +6,8 @@ such as ownership, payment, authorship or preference: a calculator showing
 call it one. This final batched check keeps directly supporting records and fails
 closed when verification is unavailable or malformed. It costs one verifier round
 trip per query (batches run together), so VERIFY_LM should be a fast model. A
-provider slower than SUPPORT_TIMEOUT_S leaves the results unverified, as they were
-before this check existed, so Bubble's wait stays bounded. DISCRETE_SUPPORT_CHECK=0
+provider slower than SUPPORT_TIMEOUT_S (SUPPORT_TIMEOUT_WHY_S for why) leaves
+results unverified, as before this check existed, so Bubble's wait stays bounded. DISCRETE_SUPPORT_CHECK=0
 turns it off.
 """
 
@@ -88,15 +88,23 @@ async def verify_support(result: RetrievalResult) -> None:
     # verified records; it goes to the writer only when it is itself supporting.
     if result.digest:
         records[0].append({"index": len(records[0]), "kind": "day digest", "text": result.digest[:1200]})
+    why = result.plan.intent == "why" or result.why_chain is not None
+    # Why packs take ~10 s to verify; Bubble already shows "tracing back" while waiting.
+    timeout = T.SUPPORT_TIMEOUT_WHY_S if why else T.SUPPORT_TIMEOUT_S
     try:
         # Bounded request size even for a long page list; the batches run together.
         found = await asyncio.wait_for(asyncio.gather(*(_supported(result, r) for r in records)),
-                                       timeout=T.SUPPORT_TIMEOUT_S)
+                                       timeout=timeout)
     except TimeoutError:
         log.warning("retrieval support verification timed out; results left unverified")
         PERF.count("retrieve.support_timeout")
-        # Deterministic connections have never been independently verified. The
-        # legacy timeout behavior must not expose them as an answerable chain.
+        if why:
+            if result.why_chain:
+                result.why_chain.verified = False
+            for h in result.hits:
+                if h.via.startswith("attention provenance"):
+                    h.strong = False
+            return
         result.hits = [h for h in result.hits if not h.via.startswith("attention provenance")]
         result.why_chain = None
         return
@@ -118,11 +126,38 @@ async def verify_support(result: RetrievalResult) -> None:
     kept += [h for h in result.hits if id(h) in fixed and _target(h) in kept_claims]
     result.hits = sorted(kept, key=lambda h: order[id(h)])
     if result.why_chain and result.why_chain.edges:
-        provenance = [h for h in checked if h.via.startswith("attention provenance")]
-        # A partially verified chain would give the writer an unverified jump.
-        if any(id(h) not in {id(k) for k in kept} for h in provenance):
-            result.hits = [h for h in result.hits if not h.via.startswith("attention provenance")]
-            result.why_chain = None
+        _verified_prefix(result)
+
+
+def _verified_prefix(result: RetrievalResult) -> None:
+    """Keep verified paths adjacent to the effect, stopping at each rejected record."""
+    chain = result.why_chain
+    if chain is None or chain.effect is None:
+        return
+    supported = {(h.ref_id, h.occurred_at) for h in result.hits if h.via.startswith("attention provenance")}
+    verified = {m.sighting_id for m in chain.moments if (m.observation_id, m.at) in supported}
+    adjacent = {chain.effect.sighting_id} & verified
+    edges = []
+    pending = list(adjacent)
+    # Edges/moments are chronological, not effect-first; follow incoming links.
+    while pending:
+        target = pending.pop()
+        for edge in chain.edges:
+            if edge.target == target and edge.source in verified:
+                edges.append(edge)
+                if edge.source not in adjacent:
+                    adjacent.add(edge.source)
+                    pending.append(edge.source)
+    if edges:
+        chain.edges = [e for e in chain.edges if e in edges]
+        chain.moments = [m for m in chain.moments if m.sighting_id in adjacent]
+        chain.verified = True
+        retained = {(m.observation_id, m.at) for m in chain.moments}
+        result.hits = [h for h in result.hits if not h.via.startswith("attention provenance") or
+                       (h.ref_id, h.occurred_at) in retained]
+    else:
+        result.hits = [h for h in result.hits if not h.via.startswith("attention provenance")]
+        result.why_chain = None
 
 
 def _target(h: Hit) -> int:

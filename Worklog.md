@@ -907,3 +907,11 @@ Sources: Cognition "agent memory repo" (cognition.com/agent-memory-repo), Hindsi
   `.venv/bin/ruff check discrete tests bench tools` clean; `git diff --check` clean.
   Title-only identities remain approximate, and backfill cannot recover visit times already
   lost by legacy capture collapse before sightings existed.
+
+### 13:45 IST — live-branch scored; why REGRESSION found (root-caused)
+- live-branch (branch code, old drafts, valid): **0.367** vs live-base 0.433. why **1/6** (base 4/6), unanswerable 5/5 (base 4/5), recall 4/9, temporal 1/4, profile 0/3. p50 15.1 s.
+- Cause: `retrieval/support.py` verifier timeout is SUPPORT_TIMEOUT_S=8 s; muse takes ~9-11 s on why queries. The r3 fix drops all attention-provenance hits + why_chain on timeout -> writer refuses ("no reason on file"). On timeout, main left results unverified, so it still answered.
+- Proof: `DISCRETE_SUPPORT_TIMEOUT_S=40 ... ask "Why did I start browsing embedding models on OpenRouter?"` on a live-branch-dream copy -> mode=why, correct EmbeddingGemma 2 -> openrouter.ai answer.
+- Fix delegated to Codex (clientRequestId why-support-timeout-r1): SUPPORT_TIMEOUT_WHY_S=25, hedged unverified chain on timeout, keep the verified prefix on partial rejection.
+- Implication: all branch why numbers in the current eval run are understated; re-score after the fix (move the frozen worktree to the fix commit).
+- Why it's slow: each job answers 30-46 questions one at a time (~15-20 s answer + judge each). Redraft re-drafts whole sessions with muse (~12 min). 4 jobs share muse, so some answers come back empty -> infra retries.

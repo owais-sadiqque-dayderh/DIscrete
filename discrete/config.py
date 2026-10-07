@@ -488,6 +488,7 @@ class T:
     # Verifier pass that drops related-but-unsupporting records (retrieval/support.py).
     SUPPORT_CHECK = _typed("SUPPORT_CHECK", True)
     SUPPORT_TIMEOUT_S = _typed("SUPPORT_TIMEOUT_S", 8.0)  # slower: results stay unverified
+    SUPPORT_TIMEOUT_WHY_S = _typed("SUPPORT_TIMEOUT_WHY_S", 25.0)
     TOP_K = _typed("TOP_K", 8)
     # "Why did I …" (retrieval/hybrid.py expand_why): matched actions whose trails are
     # followed, and, with no trail, how far back and how many moments before the action.

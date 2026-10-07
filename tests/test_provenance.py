@@ -212,13 +212,14 @@ async def test_error_does_not_assume_unrelated_or_long_absent_app_is_running(sto
         store, 'why did Birch say "Import profile still in use"?')).edges)
 
 
-async def test_chain_records_require_support_and_partial_chain_fails_closed(store, fake):
+async def test_chain_records_require_support_and_adjacent_rejection_fails_closed(store, fake):
     await obs(store, 0, "Direct Messages", "Mina shared https://reports.test/quartz")
     await obs(store, 20, "Quartz report", url="https://reports.test/quartz")
     result = RetrievalResult("why did I open Quartz report?", fallback_plan("why did I open Quartz report?"))
     await expand_why(store, result)
     assert result.why_chain.edges and all(not h.strong for h in result.hits)
     await verify_support(result)
+    assert result.why_chain.verified
     assert all(h.strong for h in result.hits) and evaluate(result).mode == "why"
     result.hits = chain_hits(result.why_chain)
     fake.support_indices = [1]
@@ -323,7 +324,7 @@ async def test_no_connecting_evidence_stays_refusal_after_support(store, fake):
     assert result.why_chain.reason == "why not known" and evaluate(result).mode == "thin"
 
 
-async def test_chain_support_timeout_fails_closed(store, fake, monkeypatch):
+async def test_chain_support_timeout_keeps_hedged_sequence(store, fake, monkeypatch):
     import asyncio
 
     from discrete.retrieval import support
@@ -338,9 +339,21 @@ async def test_chain_support_timeout_fails_closed(store, fake, monkeypatch):
         await asyncio.sleep(1)
 
     monkeypatch.setattr(support, "_supported", slow)
-    monkeypatch.setattr(T, "SUPPORT_TIMEOUT_S", 0.001)
+    monkeypatch.setattr(T, "SUPPORT_TIMEOUT_WHY_S", 0.001)
+    result.hits[0].strong = True
     await verify_support(result)
-    assert not result.hits and result.why_chain is None
+    assert result.why_chain is chain and chain.edges and not chain.verified
+    assert result.hits and all(not h.strong for h in result.hits)
+    assert evaluate(result).mode == "why"
+    from discrete.bubble.engine import BubbleEngine, Prepared, render_records
+
+    records = render_records(result)
+    assert "inferred, unverified sequence" in records
+    prepared = Prepared(q, q, "Browser", "input", result, evaluate(result))
+    prompt = "\n".join(m["content"] for m in BubbleEngine(store).messages(prepared))
+    assert "inferred, unverified sequence must be hedged" in prompt
+    assert "never assert causation" in records
+    assert "never assert causation" in render_chain(chain)
 
 
 async def test_drafting_builds_graph_even_without_model_configuration(store, fake):
@@ -416,3 +429,98 @@ async def test_cancelled_graph_pass_does_not_reopen_committed_episode(store, fak
     with pytest.raises(asyncio.CancelledError):
         await pipe.draft_episode(ep)
     assert (await store.get_episode(ep))["status"] == "closed"
+
+
+@pytest.mark.parametrize("intent,with_chain", [("why", False), ("recall", True), ("recall", False)])
+async def test_support_budget_is_intent_or_chain_aware(fake, monkeypatch, intent, with_chain):
+    import asyncio
+
+    from discrete.models import WhyChain
+    from discrete.retrieval import support
+
+    async def slow(result, records):
+        await asyncio.sleep(0.02)
+        return {0}
+
+    monkeypatch.setattr(support, "_supported", slow)
+    monkeypatch.setattr(T, "SUPPORT_TIMEOUT_S", 0.001)
+    monkeypatch.setattr(T, "SUPPORT_TIMEOUT_WHY_S", 0.2)
+    result = RetrievalResult("q", QueryPlan("q", intent=intent), [Hit("observation", 1, "Notes", "Budget review")],
+                             why_chain=WhyChain() if with_chain else None)
+    await verify_support(result)
+    assert len(result.hits) == 1
+    assert result.hits[0].strong == (intent == "why" or with_chain)
+
+
+def _support_chain():
+    from discrete.models import WhyChain
+
+    moments = [AttentionMoment(i, i, T0 + i * 10, T0 + i * 10 + 1, {"page_title": f"Page {i}"})
+               for i in range(1, 5)]
+    edges = [ProvenanceEdge(i, i + 1, "navigation", 0.9, "page_title", f"Page {i}",
+                            "page_title", f"Page {i + 1}", 10) for i in range(1, 4)]
+    return WhyChain(moments[-1], moments, edges, reason="observed provenance")
+
+
+@pytest.mark.parametrize("supports,retained", [([1, 2, 3], [2, 3, 4]), ([0, 2, 3], [3, 4]),
+                                              ([0, 1, 3], []), ([0, 1, 2], [])])
+async def test_support_keeps_only_contiguous_verified_prefix(fake, supports, retained):
+    chain = _support_chain()
+    result = RetrievalResult("why?", QueryPlan("why?", intent="why"), chain_hits(chain), why_chain=chain)
+    fake.support_indices = supports
+    await verify_support(result)
+    assert [h.ref_id for h in result.hits] == retained
+    if retained:
+        assert result.why_chain is chain and chain.verified
+        assert [m.sighting_id for m in chain.moments] == retained
+        assert [(e.source, e.target) for e in chain.edges] == list(zip(retained, retained[1:], strict=False))
+        assert all(h.strong for h in result.hits)
+        assert evaluate(result).mode == "why"
+        assert "Page 1" not in render_chain(chain)
+    else:
+        assert result.why_chain is None and evaluate(result).mode == "empty"
+
+
+async def test_support_prunes_branches_without_crossing_rejected_source(fake):
+    chain = _support_chain()
+    chain.edges.append(replace(chain.edges[-1], source=1, target=4))
+    result = RetrievalResult("why?", QueryPlan("why?", intent="why"), chain_hits(chain), why_chain=chain)
+    fake.support_indices = [0, 2, 3]
+    await verify_support(result)
+    assert [m.sighting_id for m in chain.moments] == [1, 3, 4]
+    assert {(e.source, e.target) for e in chain.edges} == {(1, 4), (3, 4)}
+
+
+@pytest.mark.parametrize("malformed", [True, False])
+async def test_chain_support_failure_still_fails_closed(fake, monkeypatch, malformed):
+    from discrete.llm import LLMError
+    from discrete.retrieval import support
+
+    failure = ValueError("bad indices") if malformed else LLMError("verifier unavailable")
+
+    async def broken(*args):
+        raise failure
+
+    monkeypatch.setattr(support, "_supported", broken)
+    chain = _support_chain()
+    result = RetrievalResult("why?", QueryPlan("why?", intent="why"), chain_hits(chain),
+                             digest="Day summary", why_chain=chain)
+    await verify_support(result)
+    assert result.hits == [] and result.digest == "" and result.why_chain is None
+
+
+async def test_non_why_timeout_still_removes_provenance_hits(fake, monkeypatch):
+    import asyncio
+
+    from discrete.retrieval import support
+
+    async def slow(*args):
+        await asyncio.sleep(1)
+
+    monkeypatch.setattr(support, "_supported", slow)
+    monkeypatch.setattr(T, "SUPPORT_TIMEOUT_S", 0.001)
+    ordinary = Hit("observation", 9, "Notes", "Budget review")
+    result = RetrievalResult("q", QueryPlan("q", intent="recall"), chain_hits(_support_chain()) + [ordinary])
+    await verify_support(result)
+    assert result.hits == [ordinary] and not ordinary.strong
+    assert result.why_chain is None

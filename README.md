@@ -187,7 +187,10 @@ An independent verifier (`VERIFY_LM_*`, default `INSIGHT_LM_*`) checks actor,
 negation, scope and completion before memories are written, and checks search
 results against the question before Bubble answers (`DISCRETE_SUPPORT_CHECK`).
 That second check runs on every query, so give `VERIFY_LM` a fast model. Search
-fails closed when verification is unavailable. Failed drafting/indexing is retried
+fails closed when verification is unavailable. `DISCRETE_SUPPORT_TIMEOUT_S` (8 s)
+bounds ordinary checks; `DISCRETE_SUPPORT_TIMEOUT_WHY_S` (25 s) gives larger why
+packs time to finish. A why timeout keeps an inferred, unverified sequence: Bubble
+hedges what preceded the action and never asserts causation. Failed drafting/indexing is retried
 after `DISCRETE_FAILED_WORK_RETRY_S` (900 s), then with doubling waits;
 `discrete process --recover` retries everything immediately.
 

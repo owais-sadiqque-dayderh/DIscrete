@@ -331,7 +331,9 @@ def render_chain(chain: WhyChain, *, details: bool = True) -> str:
             return f"{chain.reason}: {visits}. Which visit did you mean?"
         return chain.reason
     by_id = {m.sighting_id: m for m in chain.moments}
-    lines = [f"{chain.reason}; confidence={chain.confidence:.2f}",
+    status = ("support verified" if chain.verified else
+              "inferred, unverified sequence; describe what preceded it, never assert causation")
+    lines = [f"{chain.reason}; {status}; confidence={chain.confidence:.2f}",
              f"effect: observation {chain.effect.observation_id} / sighting {chain.effect.sighting_id} "
              f"{to_local(chain.effect.at):%Y-%m-%d %H:%M:%S} {chain.effect.title}"]
     for edge in chain.edges:

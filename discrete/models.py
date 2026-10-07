@@ -208,6 +208,7 @@ class WhyChain:
     trails: list[dict] = field(default_factory=list)
     reason: str = "effect not found"
     candidates: list[AttentionMoment] = field(default_factory=list)
+    verified: bool = False
 
     @property
     def confidence(self) -> float:

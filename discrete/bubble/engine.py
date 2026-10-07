@@ -127,6 +127,10 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
     terms = set(result.plan.terms)
     blocks: list[str] = []
     used = 0
+    if result.why_chain and result.why_chain.edges and not result.why_chain.verified:
+        blocks.append("[attention provenance: inferred, unverified sequence; "
+                      "describe what preceded it, never assert causation]")
+        used += len(blocks[-1])
     if result.digest:
         blocks.append(f"[day digest]\n{tk.truncate(result.digest, 1200)}")
         used += len(blocks[-1])
