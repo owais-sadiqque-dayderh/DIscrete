@@ -23,7 +23,7 @@ def evaluate(result: RetrievalResult) -> GroundingDecision:
     intent = result.plan.intent
     if intent == "edit":
         return GroundingDecision("edit", 0, 0)
-    eligible = [h for h in result.hits if h.verification == "verified"]
+    eligible = [h for h in result.hits if h.eligible]
     strong = sum(1 for h in eligible if h.strong)
     weak = len(eligible) - strong
     if intent == "continuation":

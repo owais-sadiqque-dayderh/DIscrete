@@ -109,7 +109,10 @@ class QueryPlan:
     premise_check: bool = False
 
 
-Verification = Literal["verified", "unverified", "rejected", "timed_out"]
+# "unchecked": support verification does not apply (turned off, or a continuation/world
+# question). "unverified": it applied but did not complete; only eligible states answer.
+Verification = Literal["verified", "unchecked", "unverified", "rejected", "timed_out"]
+ELIGIBLE: frozenset[str] = frozenset({"verified", "unchecked"})
 
 
 @dataclass
@@ -146,6 +149,10 @@ class Hit:
     @property
     def text(self) -> str:
         return f"{self.title}\n{self.body}"
+
+    @property
+    def eligible(self) -> bool:
+        return self.verification in ELIGIBLE
 
     def in_interval(self, interval: tuple[float, float] | None) -> bool:
         """planS3 §4.1: episodes, observations and events outside the interval are dropped."""

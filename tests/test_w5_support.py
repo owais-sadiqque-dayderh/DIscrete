@@ -48,3 +48,24 @@ async def test_why_timeout_is_explicitly_hedged(fake, monkeypatch):
     await verify_support(result)
     assert evaluate(result).mode == 'why'
     assert 'timed_out' in render_records(result)
+
+
+@pytest.mark.parametrize('intent', ['continuation', 'world'])
+async def test_unchecked_intents_keep_their_records(fake, intent):
+    from discrete.bubble.engine import render_records
+
+    result = RetrievalResult('q', QueryPlan('q', intent=intent), [Hit('observation', 1, 'Report', 'Context line')])
+    await verify_support(result)
+    assert result.hits[0].verification == 'unchecked'
+    assert 'Context line' in render_records(result)
+
+
+async def test_disabled_check_is_unchecked_not_empty(fake, monkeypatch):
+    from discrete.config import T
+
+    monkeypatch.setattr(T, 'SUPPORT_CHECK', False)
+    result = RetrievalResult('q', QueryPlan('q'), [Hit('observation', 1, 'Report', 'Details', strong=True)],
+                             digest='Day digest')
+    await verify_support(result)
+    assert evaluate(result).mode == 'grounded'
+    assert result.digest_verification == 'unchecked'
