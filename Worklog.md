@@ -1097,3 +1097,7 @@ user's running app in `exp_discrete` is untouched. Brief: `../hardening_2026-10-
   PR-04-part committed; W3: ME-03 committed; both left uncommitted edits). Relaunched both as round 2 on the user's
   second Claude account (claudeAgent_kaustubh, Opus medium, no nested subagents), told to review the committed fixes and
   finish/discard the uncommitted edits. W2/W4/W5 still running on Codex (W4: 4 commits, W5: 3 commits, W2: 1 so far).
+- 02:10 IST: W2, W4, W5 (Codex) also stopped on the Codex usage limit (W2: RT-02 committed + large uncommitted diff;
+  W4: dream-test fix, ME-07, PR-07, ME-05 store side committed + in-progress claims/history; W5: PR-03, QA-01, QA-02
+  committed + untracked tests). Relaunched as round 2 on claudeAgent_kaustubh: W5 Opus medium, W2 and W4 Sonnet 5.5
+  medium (to spare that account's 5h limit). IDs in TASKS.json. If kaustubh runs out too, resume on Codex after 05:53.
