@@ -476,3 +476,12 @@ raise SystemExit({exitcode})
     assert ("MATRIX_CONTINUED" in process.stdout) is expected_success
     if not expected_success:
         assert "matrix stopped" in process.stderr
+
+
+def test_an_answered_question_is_never_an_infrastructure_failure():
+    """DIscrete logs 'support verification timed out' as a warning and still answers."""
+    case = run.Case(question="Why did I open ChatGPT?", category="why")
+    stderr = "WARNING discrete.retrieval.support retrieval support verification timed out; results left unverified\n"
+    assert run._infra_reason(stderr, "You asked what the repo is about.", 0, case) == ""
+    # An empty answer with a provider error is still infrastructure.
+    assert run._infra_reason("openai.APIStatusError: 503 service_overloaded", "", 0, case)

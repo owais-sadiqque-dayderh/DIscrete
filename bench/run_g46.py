@@ -247,7 +247,13 @@ def _infra_reason(stderr: str, answer: str, returncode: int, case: Case) -> str:
     transient = r"overload|timed?\s*out|timeout|rate[ _-]?limit|service unavailable|connection (?:error|reset|refused)"
     status = (r"(?:error|status|http|code)[^\n]{0,40}\b(?:429|5\d\d)\b|"
               r"\b(?:429|5\d\d)\b[^\n]{0,40}(?:error|overload|too many requests)|^\s*(?:429|5\d\d)\s*$")
-    if re.search(f"{transient}|{status}", diagnostic_text, re.IGNORECASE | re.MULTILINE):
+    answered = bool(answer.strip()) and answer.strip() != "(nothing on file about that)"
+    # With an answer in hand, only a hard failure (a traceback, an exception, an HTTP error
+    # status, an overload) means the stream was cut short. Soft warnings such as DIscrete's
+    # own "support verification timed out; results left unverified" are normal: scored.
+    hard = r"Traceback|\b\w*(?:Error|Exception):|overload"
+    pattern = f"{hard}|{status}" if answered else f"{transient}|{status}"
+    if re.search(pattern, diagnostic_text, re.IGNORECASE | re.MULTILINE):
         return diagnostic_text[-300:].strip()
     model_error = (r"LLMError|TokenLimit|NotConfigured|API\w*Error|"
                    r"(?:model|writer|provider|openrouter|openai|LLM)[^\n]*(?:error|failed|empty|invalid|not configured)")
