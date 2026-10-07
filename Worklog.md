@@ -980,3 +980,23 @@ Sources: Cognition "agent memory repo" (cognition.com/agent-memory-repo), Hindsi
 - Credit left: **$3.64**.
 - Known gaps: time-of-day phrases ("late at night") in recall; detail recall inside posts/images (EmbeddingGemma sizes, Theo's build time: OCR of embedded media); enumerate from listing pages; "normally use" profile wording; muse returns empty completions on unanswerable records (now a refusal); the support verifier is muse per .env (DIscrete's intended VERIFY_LM is gemini-3.8-flash: faster, would cut why p90).
 - Branch: 82+ commits on feat/memory-evolution since 41e2f9f, 724 tests. Not merged/pushed.
+
+### 2026-10-08 — Final pre-production review (report only), relaunched
+- **Request:** the user asked for an end-to-end review of the whole pipeline, 3 sub-agents per component:
+  optimised + secured, best-in-class methods vs the market, and what can be improved. **No code changes**; report
+  first, then decide.
+- **First attempt failed.** The previous orchestrator spawned Claude instances of itself and hit its 5-hour limit.
+  Only `final_review_2026-10-07/BRIEF.md` was written (shared brief + hard rules: report-only, no paid calls, no live
+  data or keys).
+- **Relaunched as 15 T3 delegated tasks.** clientRequestId pattern `final-review-<id>`; check with `task_status`.
+  - **Components:** c1-capture, c2-formation, c3-evolution, c4-retrieval, c5-platform.
+  - **Lens A (`a-optsec`):** optimisation and security. Codex gpt-6.1-sol, medium reasoning.
+  - **Lens B (`b-methods`):** methods vs the market (screenpipe, Recall, Rewind, Hindsight, mem0, Letta, Honcho,
+    Graphiti/Zep, Supermemory, Cognee, A-MEM, …). Claude Opus on the user's second subscription
+    (claudeAgent_kaustubh), medium effort.
+  - **Lens C (`c-improve`):** correctness, real-data quality, benchmark-miss root causes, production checklist.
+    Codex gpt-6.1-sol, medium reasoning.
+- **Reports:** `exp_hindsight/final_review_2026-10-07/<component>-<lens>.md`.
+- **Next:** merge the 15 reports into `final_review_2026-10-07/FINAL_REPORT.md`, ranked: ship-blockers (P0),
+  must-fix-soon (P1), method verdicts (KEEP/TUNE/REPLACE), and an improvement backlog with effort and impact. Then
+  the user decides what to change.
