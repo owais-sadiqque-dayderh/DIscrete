@@ -478,6 +478,10 @@ This audit shows where each proposed feature starts from. Code paths are relativ
 - **Harness gaps found:** `run_g46.py` lets a `TimeoutExpired` kill the whole run (it should record an error and
   continue). An outage also produces empty answers that are judged as wrong, so the harness should flag a run whose
   error rate exceeds a threshold as invalid instead of reporting a score. Both go to Codex.
+- **Review r2 fixes committed** `f807356` (392 tests): all 9 findings, each with a regression test that fails on
+  the old code. One follow-up from my review: the drafting grace timer and redraft's boundary lock were stored as
+  unbounded per-episode `meta` rows. Codex is moving them to `episodes` columns (m012), task
+  `…exp-discrete-meta-columns-1`.
 - **Re-run plan when muse is healthy:** a new frozen worktree at the final commit (retry policy + review fixes).
   Re-create `branch-v2` with the fixed `redraft.py`, then score everything in parallel, with fewer concurrent jobs
   (≤4) to avoid adding load.
