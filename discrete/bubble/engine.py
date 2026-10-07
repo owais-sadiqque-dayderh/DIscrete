@@ -94,7 +94,7 @@ def _when_short(h: Hit) -> str:
 
 def format_enumerate_answer(result: RetrievalResult) -> str:
     """Deterministic list output — no LLM paraphrase (insights.md §7.38)."""
-    items = shape_enumerate_items(result.hits, result.plan)
+    items = shape_enumerate_items([h for h in result.hits if h.verification == "verified"], result.plan)
     if not items:
         return ""
     lines = [f"- {h.title} ({_when_short(h)})" for h in items]
@@ -110,11 +110,12 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
         return render_chain(result.why_chain)
     if result.plan.intent == "enumerate":
         # One compact line per page, time-ordered, so the whole trail fits (planS3 §17).
-        if not result.hits:
+        verified = [h for h in result.hits if h.verification == "verified"]
+        if not verified:
             return "(no records)"
         lines = ["Timeline of pages/windows (★ matched the question directly; → opened shortly after a ★ "
                  "page in the same app; [listing] = a feed, index or results page):"]
-        for h in result.hits:
+        for h in verified:
             mark = "★" if h.status == "matched" else "→"
             site, _, caption = h.body.partition("\n")
             line = f"{mark}{_when(h)} · {h.title}{' [listing]' if h.is_listing else ''} · {site}"
@@ -131,10 +132,12 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
         blocks.append("[attention provenance: inferred, unverified sequence; "
                       "describe what preceded it, never assert causation]")
         used += len(blocks[-1])
-    if result.digest:
+    if result.digest and result.digest_verification == "verified":
         blocks.append(f"[day digest]\n{tk.truncate(result.digest, 1200)}")
         used += len(blocks[-1])
     for h in result.hits:
+        if h.verification != "verified" and result.plan.intent != "why":
+            continue
         if h.ref_kind == "claim":
             kind = f"{h.claim_kind} ({h.action})" if h.action else h.claim_kind
             strength = f" · {h.strength}" if h.strength else ""
@@ -158,6 +161,8 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
         else:
             head = f"[entity {h.ref_id}] {h.title}"
             body = h.body
+        if h.verification != "verified":
+            head += f" [support {h.verification}; inferred context only]"
         block = f"{head}\n{tk.truncate(body, 1100)}"
         if used + len(block) > max_chars and blocks:
             break

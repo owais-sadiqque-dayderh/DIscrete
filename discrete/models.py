@@ -6,6 +6,7 @@ Dependency direction: models → store → llm → capture/process/retrieval →
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from . import textkit as tk
 
@@ -108,6 +109,9 @@ class QueryPlan:
     premise_check: bool = False
 
 
+Verification = Literal["verified", "unverified", "rejected", "timed_out"]
+
+
 @dataclass
 class Hit:
     ref_kind: str
@@ -136,6 +140,7 @@ class Hit:
     action: str = ""
     # For lasting claims: "established: seen in 4 episodes over 3 days" (store/beliefs.py).
     strength: str = ""
+    verification: Verification = "unverified"
 
     @property
     def text(self) -> str:
@@ -158,6 +163,7 @@ class RetrievalResult:
     digest: str = ""
     why_chain: WhyChain | None = None
     page_answer: str = ""
+    digest_verification: Verification = "unverified"
 
     def of(self, kind: str) -> list[Hit]:
         return [h for h in self.hits if h.ref_kind == kind]

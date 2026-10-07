@@ -220,10 +220,10 @@ def temporal_answer(result: RetrievalResult) -> None:
     """Build plain output only after support verification kept the anchor and visits."""
     if not isinstance(result.plan, EventQueryPlan) or not result.hits:
         return
-    if result.hits[0].via != _ANCHOR:
+    if result.hits[0].via != _ANCHOR or result.hits[0].verification != "verified":
         # A verified neighbor without the event does not establish this boundary.
         result.hits = []
         return
-    neighbors = [h for h in result.hits[1:] if h.via.startswith("right ") and h.strong]
+    neighbors = [h for h in result.hits[1:] if h.via.startswith("right ") and h.verification == "verified"]
     if neighbors:
         result.page_answer = "\n".join(f"- {h.title} ({to_local(h.occurred_at):%H:%M:%S})" for h in neighbors)
