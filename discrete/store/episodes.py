@@ -73,6 +73,26 @@ class EpisodesMixin(StoreBase):
             (T.DRAFT_MAX_ATTEMPTS, now(), episode_id),
         )
 
+    async def draft_chunks(self, episode_id: int, input_hash: str) -> dict[int, dict]:
+        """Read checkpoints for this exact episode input; discard obsolete results."""
+        def _load():
+            with self._tx() as conn:
+                conn.execute("DELETE FROM episode_draft_chunks WHERE episode_id=? AND input_hash!=?",
+                             (episode_id, input_hash))
+                return {r["chunk_index"]: json.loads(r["result"]) for r in conn.execute(
+                    "SELECT chunk_index, result FROM episode_draft_chunks WHERE episode_id=? AND input_hash=?",
+                    (episode_id, input_hash))}
+
+        return await self._call(_load)
+
+    async def save_draft_chunk(self, episode_id: int, chunk_index: int, input_hash: str, result: dict) -> None:
+        """Commit a successful model response before requesting the next chunk."""
+        await self.execute(
+            "INSERT INTO episode_draft_chunks(episode_id, chunk_index, input_hash, result) VALUES (?,?,?,?) "
+            "ON CONFLICT(episode_id, chunk_index) DO UPDATE SET input_hash=excluded.input_hash, result=excluded.result",
+            (episode_id, chunk_index, input_hash, json.dumps(result)),
+        )
+
     async def retry_failed_drafts(self, *, older_than_s: float | None = None) -> None:
         """Give failed episodes another chance after a provider outage.
 

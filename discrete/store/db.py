@@ -409,6 +409,22 @@ def m009_evidence_field(conn: sqlite3.Connection) -> None:
     _add_column(conn, "evidence", "field", "TEXT NOT NULL DEFAULT ''")
 
 
+def m010_episode_draft_chunks(conn: sqlite3.Connection) -> None:
+    """Checkpoint successful draft calls independently of the final claims transaction."""
+    conn.execute("""CREATE TABLE episode_draft_chunks(
+      episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+      chunk_index INTEGER NOT NULL,
+      input_hash TEXT NOT NULL,
+      result TEXT NOT NULL,
+      PRIMARY KEY (episode_id, chunk_index))""")
+    # Both normal drafting and the no-model path close episodes. Clear checkpoints
+    # atomically with closure, so a failed final transaction keeps them for retry.
+    conn.execute("""CREATE TRIGGER episodes_clear_draft_chunks AFTER UPDATE OF status ON episodes
+      WHEN new.status='closed' BEGIN
+        DELETE FROM episode_draft_chunks WHERE episode_id=new.id;
+      END""")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_base,
     m002_draft_attempts_and_digest_counts,
@@ -419,6 +435,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m007_memory_evolution,
     m008_sightings,
     m009_evidence_field,
+    m010_episode_draft_chunks,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

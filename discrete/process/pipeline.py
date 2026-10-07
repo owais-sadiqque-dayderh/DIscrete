@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass, field
 
@@ -117,7 +119,22 @@ class ProcessPipeline:
         # before EPISODE_MAX_OBS) is drafted in consecutive chunks, never truncated.
         chunks = [rows[i:i + T.DRAFT_MAX_OBS] for i in range(0, len(rows), T.DRAFT_MAX_OBS)]
         chrome = await self._chrome(rows)
-        parts = [await self._call_draft(chunk, chrome) for chunk in chunks]
+        # Hash the entire observation snapshot, not just each chunk: an edit,
+        # append or reassignment invalidates all earlier results. Include the
+        # actual prompts so changes to filtering, chunking or draft caps do too.
+        input_hash = hashlib.sha256(json.dumps({
+            "observations": [dict(r) for r in rows],
+            "prompts": [self._draft_prompt(chunk, chrome) for chunk in chunks],
+        }, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        cached = await self.store.draft_chunks(episode_id, input_hash)
+        parts = []
+        for index, chunk in enumerate(chunks):
+            if index in cached:
+                part = cached[index]
+            else:
+                part = await self._call_draft(chunk, chrome)
+                await self.store.save_draft_chunk(episode_id, index, input_hash, part)
+            parts.append(part)
         data = parts[0] if len(parts) == 1 else {
             "title": " / ".join(dict.fromkeys(str(p.get("title") or "") for p in parts if p.get("title"))),
             "summary": " ".join(str(p.get("summary") or "") for p in parts),
@@ -222,6 +239,13 @@ class ProcessPipeline:
         return ClaimWrite(cd)
 
     async def _call_draft(self, rows, chrome: dict[tuple[str, str], set[str]] | None = None) -> dict:
+        prompt = self._draft_prompt(rows, chrome)
+        data = await complete_json(self.ep, [{"role": "user", "content": prompt}], max_tokens=2500)
+        if not isinstance(data, dict):
+            raise LLMError("draft: not an object")
+        return data
+
+    def _draft_prompt(self, rows, chrome: dict[tuple[str, str], set[str]] | None = None) -> str:
         seen_lines: set[str] = set()
         blocks = []
         for r in rows:
@@ -249,10 +273,7 @@ class ProcessPipeline:
         # actions and choices it might skim past; it still has to quote and cite them.
         if found := hints(detect(list(rows))):
             prompt += f"\n{found}\n"
-        data = await complete_json(self.ep, [{"role": "user", "content": prompt}], max_tokens=2500)
-        if not isinstance(data, dict):
-            raise LLMError("draft: not an object")
-        return data
+        return prompt
 
     def _validate(self, item: dict, kind: str, by_id: dict, episode_id: int, t0: float, t1: float,
                   outcome: DraftOutcome) -> ClaimDraft | None:

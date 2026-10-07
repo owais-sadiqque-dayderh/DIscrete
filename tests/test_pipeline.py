@@ -472,6 +472,151 @@ async def test_a_long_episode_is_drafted_in_chunks_and_nothing_is_dropped(store,
     assert f"observation_id={ids[0]}]" in drafts[0] and f"observation_id={ids[-1]}]" in drafts[-1]
 
 
+def _research_chunk(prompt):
+    ids = [int(oid) for oid in re.findall(r"\[observation_id=(\d+)\]", prompt)]
+    return ids, {"title": f"Research {ids[0]}", "summary": f"Reviewed topics {ids}.", "claims": [
+        {"kind": "event", "text": f"The user reviewed research topic {oid}", "entities": [],
+         "evidence": [{"observation_id": oid, "quote": f"Research topic {oid}"}]} for oid in ids]}
+
+
+@pytest.mark.parametrize("restart", [False, True])
+async def test_failed_second_chunk_reuses_first_and_matches_uninterrupted_draft(tmp_path, fake, monkeypatch, restart):
+    """#18: a paid chunk survives a later failure, including across reopening SQLite."""
+    import json
+
+    from discrete.config import T
+    from discrete.llm import LLMError
+    from discrete.store import Store
+
+    monkeypatch.setattr(T, "DRAFT_MAX_OBS", 2)
+    real = fake.chat
+    calls = []
+    fail_once = False
+
+    async def chat(ep, messages, **kw):
+        nonlocal fail_once
+        prompt = messages[-1]["content"]
+        if "one episode of a person's computer activity" in prompt:
+            ids, result = _research_chunk(prompt)
+            calls.append(ids)
+            if ids[0] == 3 and fail_once:
+                fail_once = False
+                raise LLMError("second chunk temporarily unavailable")
+            return json.dumps(result)
+        return await real(ep, messages, **kw)
+
+    monkeypatch.setattr(fake, "chat", chat)
+
+    async def run(path, *, fail):
+        nonlocal fail_once
+        s = await Store.open(str(path))
+        try:
+            eid, _ = await _one_episode(s, [f"Research topic {i}" for i in range(1, 5)])
+            fail_once = fail
+            outcome = await ProcessPipeline(s).draft_episode(eid)
+            if fail:
+                assert outcome is None
+                assert await s.live_claims() == []  # checkpoints are not committed memories
+                assert [r["chunk_index"] for r in await s.q("SELECT * FROM episode_draft_chunks")] == [0]
+                if restart:
+                    await s.close()
+                    s = await Store.open(str(path))
+                    await s.reset_stuck_drafting()
+                outcome = await ProcessPipeline(s).draft_episode(eid)
+            assert outcome.added == 4
+            assert await s.q("SELECT * FROM episode_draft_chunks") == []
+            claims = []
+            for c in await s.live_claims():
+                evidence = await s.evidence_for_claim(c["id"])
+                claims.append((c["kind"], c["text"], c["context"], c["modality"], c["occurred_from"],
+                               c["occurred_to"], c["confidence"], c["action"],
+                               [(e["observation_id"], e["quote"], e["field"]) for e in evidence]))
+            episode = await s.get_episode(eid)
+            return claims, (episode["title"], episode["summary"])
+        finally:
+            await s.close()
+
+    expected = await run(tmp_path / "uninterrupted.db", fail=False)
+    assert calls == [[1, 2], [3, 4]]
+    calls.clear()
+    assert await run(tmp_path / "retry.db", fail=True) == expected
+    assert calls == [[1, 2], [3, 4], [3, 4]]
+
+
+@pytest.mark.parametrize("change", ["edit", "append", "remove", "chunk_size", "prompt"])
+async def test_chunk_checkpoints_invalidated_when_episode_input_changes(store, fake, monkeypatch, change):
+    import json
+
+    from discrete.config import T
+    from discrete.llm import LLMError
+
+    monkeypatch.setattr(T, "DRAFT_MAX_OBS", 2)
+    eid, ids = await _one_episode(store, [f"Research topic {i}" for i in range(1, 5)])
+    calls = []
+    real = fake.chat
+    fail_once = True
+
+    async def chat(ep, messages, **kw):
+        nonlocal fail_once
+        prompt = messages[-1]["content"]
+        if "one episode of a person's computer activity" in prompt:
+            chunk_ids, result = _research_chunk(prompt)
+            calls.append(chunk_ids)
+            if chunk_ids[0] == ids[2] and fail_once:
+                fail_once = False
+                raise LLMError("second chunk temporarily unavailable")
+            return json.dumps(result)
+        return await real(ep, messages, **kw)
+
+    monkeypatch.setattr(fake, "chat", chat)
+    assert await ProcessPipeline(store).draft_episode(eid) is None
+    if change == "edit":
+        # Editing the *later* chunk must invalidate the earlier checkpoint too.
+        await store.execute("UPDATE observations SET caption='Updated research context' WHERE id=?", (ids[-1],))
+    elif change == "append":
+        oid, _ = await store.add_observation(obs(text="Research topic 5", t=T0 + 50))
+        await store.execute("UPDATE observations SET episode_id=? WHERE id=?", (eid, oid))
+    elif change == "remove":
+        await store.execute("UPDATE observations SET episode_id=NULL WHERE id=?", (ids[-1],))
+    elif change == "chunk_size":
+        monkeypatch.setattr(T, "DRAFT_MAX_OBS", 3)
+    else:
+        monkeypatch.setattr(T, "DRAFT_MAX_EVENTS", T.DRAFT_MAX_EVENTS + 1)
+    calls.clear()
+    assert await ProcessPipeline(store).draft_episode(eid) is not None
+    current_ids = [r["id"] for r in await store.observations_for_episode(eid)]
+    assert calls == [current_ids[i:i + T.DRAFT_MAX_OBS] for i in range(0, len(current_ids), T.DRAFT_MAX_OBS)]
+    assert await store.q("SELECT * FROM episode_draft_chunks") == []
+
+
+async def test_verification_failure_preserves_all_completed_chunk_calls(store, fake, monkeypatch):
+    from discrete.config import T
+    from discrete.llm import LLMError
+
+    monkeypatch.setattr(T, "DRAFT_MAX_OBS", 1)
+    eid, (o1, _) = await _one_episode(store, ["Research topic 1", "Research topic 2"])
+    fake.draft = {"title": "Research", "summary": "Reviewed research.", "claims": [
+        {"kind": "event", "text": "The user reviewed research topic 1",
+         "evidence": [{"observation_id": o1, "quote": "Research topic 1"}]}]}
+    real = fake.chat
+    fail_once = True
+
+    async def chat(ep, messages, **kw):
+        nonlocal fail_once
+        if "Independently verify candidate memories" in messages[-1]["content"] and fail_once:
+            fail_once = False
+            raise LLMError("verifier temporarily unavailable")
+        return await real(ep, messages, **kw)
+
+    monkeypatch.setattr(fake, "chat", chat)
+    assert await ProcessPipeline(store).draft_episode(eid) is None
+    assert fake.calls.count("draft") == 2
+    assert len(await store.q("SELECT * FROM episode_draft_chunks")) == 2
+    assert (await ProcessPipeline(store).draft_episode(eid)).added == 1
+    assert fake.calls.count("draft") == 2
+    assert await store.q("SELECT * FROM episode_draft_chunks") == []
+
+
 async def test_evidence_records_where_the_quote_was_found(store, fake):
     eid, (o1, o2) = await _one_episode(store, ["Exported dooran-final.svg for the client", "Viewing a moodboard"],
                                        caption="The user looks at a design")
