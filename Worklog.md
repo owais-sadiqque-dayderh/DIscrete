@@ -524,6 +524,12 @@ This audit shows where each proposed feature starts from. Code paths are relativ
     within noise.
   - Follow-ups: validation against the real Keychain / a locked session; Touch ID via a signed helper; a key
     recovery story.
+- **AX node walk improved** (commit after `f00ef97`, `docs/ax_nodewalk_report.md`), measured live on 8 Arc pages:
+  - median read **209 → 34 ms**; deadline hits **28/56 → 0/56**;
+  - visible-content coverage held or improved everywhere (Python tutorial **2.7% → 96.4%**: it used to time out);
+  - Hacker News duplicate lines 18.1% → 0% at the same 98.4% coverage;
+  - tables emitted as ` | ` rows.
+  - Affects live capture only: replays reuse stored text, so the bench scores won't show it.
 - **Re-run plan when muse is healthy:** a new frozen worktree at the final commit (retry policy + review fixes).
   Re-create `branch-v2` with the fixed `redraft.py`, then score everything in parallel, with fewer concurrent jobs
   (≤4) to avoid adding load.
