@@ -212,6 +212,8 @@ class HistoryMixin(StoreBase):
                 if ev["undone_by"] is not None:
                     raise RevertConflict(f"event {event_id} was already reverted by event {ev['undone_by']}")
                 data = json.loads(ev["data"] or "{}")
+                if data.get("erased"):
+                    raise RevertConflict(f"event {event_id} was erased with the memory it changed")
                 if ev["op"] == "redo":
                     raise RevertConflict(f"#{event_id} re-applied #{data.get('reapplies')}; revert that event instead")
                 changes = json.loads(ev["changes"])

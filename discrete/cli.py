@@ -401,7 +401,24 @@ async def cmd_forget(args) -> int:
             _err(str(exc).strip("'\""))
             return 1
         _print(_event_line(await store.get_event(eid)))
-        _print(f"undo with: discrete revert {eid}")
+        _print(f"undo with: discrete revert {eid}  (the content is retired, not erased; see `discrete erase`)")
+        await _refresh_export(store)
+    return 0
+
+
+async def cmd_erase(args) -> int:
+    if not args.yes:
+        _err("erase is permanent and cannot be undone; repeat with --yes to confirm")
+        return 1
+    async with _session() as store:
+        try:
+            n = await store.erase_claim(args.claim_id)
+        except KeyError as exc:
+            _err(str(exc).strip("'\""))
+            return 1
+        _print(f"erased {n} version(s) of memory #{args.claim_id} (text, evidence quotes, search and change-log content)")
+        _print("not erased: source observations and screenshots, episode summaries, and earlier commits of a "
+               "git-tracked export; delete those separately")
         await _refresh_export(store)
     return 0
 
@@ -652,7 +669,13 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--force", action="store_true", help="even if later changes touched the same memories")
     pr.set_defaults(func=cmd_revert)
 
-    pf = sub.add_parser("forget", help="forget a memory and never re-learn it")
+    pe = sub.add_parser("erase", help="permanently remove a memory's derived content (not undoable)")
+    pe.add_argument("claim_id", type=int)
+    pe.add_argument("--yes", action="store_true", help="confirm the permanent removal")
+    pe.set_defaults(func=cmd_erase)
+
+    pf = sub.add_parser("forget", help="stop using a memory and never re-learn it (reversible; content is kept, "
+                                       "use `erase` to remove it)")
     pf.add_argument("claim_id", type=int)
     pf.add_argument("--reason", default="")
     pf.set_defaults(func=cmd_forget)

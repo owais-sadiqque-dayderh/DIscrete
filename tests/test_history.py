@@ -286,3 +286,22 @@ async def test_forget_clears_entity_page_quoting_it_and_marks_it_for_rebuild(sto
     assert page["summary"] == ""
     assert [r["id"] for r in await store.entities_needing_pages(10)] == [eid]
     assert not await store.q("SELECT 1 FROM entities_fts WHERE entities_fts MATCH 'notes'")
+
+
+async def test_erase_removes_content_everywhere_and_blocks_relearning(store):
+    cid = await _claim(store, "The user keeps zebrafish secretly", n=3)
+    other = await _claim(store, "The user likes tea", n=4)
+    await store.save_profile({"written_at": 1, "sections": [{"heading": "h", "points": [
+        {"text": "They keep zebrafish.", "claims": [cid]}, {"text": "They like tea.", "claims": [other]}]}]}, run_id="r")
+    await store.forget_claim(cid)
+    assert await store.erase_claim(cid) == 1
+    blob = ""
+    for table in ("claims", "evidence", "memory_events", "suppressions", "meta", "links"):
+        blob += "".join(str(tuple(r)) for r in await store.q(f"SELECT * FROM {table}"))
+    assert "zebrafish" not in blob and "tea" in blob
+    assert not await store.q("SELECT 1 FROM claims_fts WHERE claims_fts MATCH 'zebrafish'")
+    assert await store.suppressed("preference", "The user keeps zebrafish secretly")
+    event = (await store.recent_events(op="forget"))[0]
+    with pytest.raises(RevertConflict):
+        await store.revert_event(event["id"])
+    assert [p["text"] for s in (await store.get_profile())["sections"] for p in s["points"]] == ["They like tea."]
