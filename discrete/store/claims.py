@@ -156,7 +156,13 @@ class ClaimsMixin(HistoryMixin):
         self._recompute_confidence(conn, claim_id)
 
     def _invalidate_claim(self, conn, claim_id: int, *, by_id: int, at: float) -> dict | None:
+        target = conn.execute("SELECT occurred_to FROM claims WHERE id=?", (claim_id,)).fetchone()
+        incoming = conn.execute("SELECT occurred_to FROM claims WHERE id=?", (by_id,)).fetchone()
+        if target is None or incoming is None or max(at, incoming[0]) < target[0]:
+            return None  # arrival order cannot turn older evidence into a newer truth
         change = self._set_state(conn, claim_id, only_if_live=True, status="invalidated", valid_to=at)
+        if change is None:
+            return None
         conn.execute("UPDATE claims SET invalidates_id=? WHERE id=?", (claim_id, by_id))
         return change
 

@@ -196,3 +196,27 @@ async def test_a_forgotten_memory_leaves_the_profile_at_once(store):
     await store.forget_claim(a)
     profile = await store.get_profile()
     assert [s["heading"] for s in profile["sections"]] == ["Tools"]
+
+
+async def test_older_evidence_cannot_invalidate_newer_claim(store):
+    old = await store.create_claim(ClaimDraft(kind="fact", text="The user used the old editor", occurred_from=10, occurred_to=20))
+    new = await store.create_claim(ClaimDraft(kind="fact", text="The user uses the new editor", occurred_from=30, occurred_to=40))
+
+    def invalidate():
+        with store._tx() as conn:
+            return store._invalidate_claim(conn, new, by_id=old, at=10)
+
+    assert await store._call(invalidate) is None
+    assert (await store.get_claim(new))["status"] == "live"
+    assert (await store.get_claim(new))["invalidates_id"] is None
+
+
+async def test_checked_verdict_expires_when_claim_revision_changes(store):
+    a = await _claim(store, "The user prefers tea", n=1)
+    b = await _claim(store, "The user prefers coffee", n=2)
+    await store.mark_pair_checked(a, b, "compatible", "different settings")
+    assert (a, b) in await store.checked_pairs()
+    await store.execute("UPDATE claims SET occurred_to=occurred_to+1, updated_at=updated_at+1 WHERE id=?", (a,))
+    assert (a, b) not in await store.checked_pairs()
+    await store.mark_pair_checked(a, b, "nonsense", "invalid model output")
+    assert (a, b) not in await store.checked_pairs()

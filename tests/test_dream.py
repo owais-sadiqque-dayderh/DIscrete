@@ -269,3 +269,13 @@ async def test_confirm_refuses_withdrawn_support(store):
     more = await _memory(store, "The user checked football scores on FotMob", day=3, episode=99)
     await store.forget_claim(more)
     assert not await store.confirm_pattern(p, [more], reason="test", run_id="r")
+
+
+async def test_conflicts_include_high_similarity_and_old_beliefs(store, fake, monkeypatch):
+    monkeypatch.setattr(T, "CONFLICT_SIM", -1.0)
+    a = await _memory(store, "The user uses the old editor", day=T.DREAM_WINDOW_DAYS + 10, episode=90, kind="fact")
+    b = await _memory(store, "The user uses the new editor", day=0, episode=91, kind="fact")
+    await store.save_embeddings([("claim", a, [1.0, 0.0], "a"), ("claim", b, [1.0, 0.0], "b")])
+    fake.conflicts = {"pairs": [{"index": 0, "verdict": "conflict", "reason": "one primary editor"}]}
+    assert (await dr._conflicts(store, "r"))["resolved"] == 1
+    assert (await store.get_claim(a))["status"] == "invalidated"

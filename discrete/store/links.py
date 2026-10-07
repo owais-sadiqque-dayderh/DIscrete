@@ -55,13 +55,44 @@ class LinksMixin(ClaimsMixin):
             f"AND src_kind='observation' AND relation IN ('led_to', 'step') "
             f"ORDER BY relation='led_to' DESC, confidence DESC", (dst_kind, *ids))
 
-    async def checked_pairs(self) -> set[tuple[int, int]]:
-        """Claim pairs the contradiction sweep already judged (asked once)."""
-        rows = await self.q("SELECT src_id, dst_id FROM links WHERE relation='checked' AND src_kind='claim'")
-        return {(min(a, b), max(a, b)) for a, b in rows}
+    @staticmethod
+    def _pair_revision(row) -> dict:
+        return {k: row[k] for k in ("id", "updated_at", "text", "context", "status", "flag", "modality",
+                                    "occurred_from", "occurred_to", "confidence", "derived_from")}
 
-    async def mark_pair_checked(self, a: int, b: int, verdict: str, reason: str) -> None:
+    async def checked_pairs(self) -> set[tuple[int, int]]:
+        """Only validated verdicts for the current revisions suppress another sweep."""
+        out = set()
+        for link in await self.q("SELECT src_id, dst_id, evidence FROM links WHERE relation='checked' "
+                                 "AND src_kind='claim' AND status='live'"):
+            rows = await self.get_claims([link["src_id"], link["dst_id"]])
+            current = [self._pair_revision(r) for r in sorted(rows, key=lambda r: r["id"])]
+            try:
+                saved = json.loads(link["evidence"] or "{}")
+            except (ValueError, TypeError):
+                continue
+            if isinstance(saved, dict) and saved.get("revisions") == current and len(current) == 2:
+                out.add((min(link["src_id"], link["dst_id"]), max(link["src_id"], link["dst_id"])))
+        return out
+
+    async def mark_pair_checked(self, a: int, b: int, verdict: str, reason: str, *,
+                                revisions: list[dict] | None = None) -> bool:
+        if verdict not in {"compatible", "conflict"}:
+            return False
         lo, hi = min(a, b), max(a, b)
-        await self.execute(
-            "INSERT OR IGNORE INTO links(src_kind, src_id, dst_kind, dst_id, relation, reason, status, created_at) "
-            "VALUES ('claim', ?, 'claim', ?, 'checked', ?, 'live', ?)", (lo, hi, f"{verdict}: {reason}", now()))
+
+        def _run():
+            with self._tx() as conn:
+                rows = conn.execute("SELECT * FROM claims WHERE id IN (?,?) ORDER BY id", (lo, hi)).fetchall()
+                current = [self._pair_revision(r) for r in rows]
+                if len(current) != 2 or (revisions is not None and current != revisions):
+                    return False
+                conn.execute(
+                    "INSERT INTO links(src_kind, src_id, dst_kind, dst_id, relation, reason, evidence, status, created_at) "
+                    "VALUES ('claim', ?, 'claim', ?, 'checked', ?, ?, 'live', ?) "
+                    "ON CONFLICT(src_kind,src_id,dst_kind,dst_id,relation) DO UPDATE SET "
+                    "reason=excluded.reason,evidence=excluded.evidence,status='live',created_at=excluded.created_at",
+                    (lo, hi, f"{verdict}: {reason}", json.dumps({"revisions": current}), now()))
+                return True
+
+        return await self._call(_run)

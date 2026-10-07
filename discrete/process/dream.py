@@ -369,9 +369,13 @@ def winner(a, b) -> tuple | None:
 
 
 async def _conflicts(store: Store, run_id: str) -> dict:
-    rows = [r for r in await store.claims_for_dream(now() - T.DREAM_WINDOW_DAYS * 86400,
-                                                    limit=T.DREAM_MAX_MEMORIES)
-            if r["kind"] in ("fact", "preference", "pattern")]
+    # Split the bounded sweep between recently changed and old beliefs.
+    half = max(1, T.DREAM_MAX_MEMORIES // 2)
+    recent = await store.q("SELECT * FROM claims WHERE status='live' AND kind IN ('fact','preference','pattern') "
+                           "ORDER BY updated_at DESC LIMIT ?", (half,))
+    old = await store.q("SELECT * FROM claims WHERE status='live' AND kind IN ('fact','preference','pattern') "
+                        "ORDER BY updated_at ASC LIMIT ?", (half,))
+    rows = list({r["id"]: r for r in [*recent, *old]}.values())
     vecs = await store.vectors("claim", [r["id"] for r in rows])
     checked = await store.checked_pairs()
     pairs = []
@@ -383,14 +387,16 @@ async def _conflicts(store: Store, run_id: str) -> dict:
             if key in checked:
                 continue
             sim = float(vecs[a["id"]] @ vecs[b["id"]])
-            if T.CONFLICT_SIM <= sim < T.CONSOLIDATE_SIM:  # closer pairs are merged by consolidation
+            if sim >= T.CONFLICT_SIM:
                 pairs.append((sim, a, b))
     pairs = sorted(pairs, key=lambda x: -x[0])[: T.DREAM_MAX_PAIRS]
     report = {"pairs": len(pairs), "resolved": 0, "contested": 0}
     ep = dream_endpoint()
     if not pairs or not ep.configured:
         return report
-    payload = {"pairs": [{"index": i, "a": a["text"], "b": b["text"]} for i, (_, a, b) in enumerate(pairs)]}
+    payload = {"pairs": [{"index": i, "a": {k: a[k] for k in ("text", "context", "modality", "occurred_from", "occurred_to")},
+                         "b": {k: b[k] for k in ("text", "context", "modality", "occurred_from", "occurred_to")}}
+                         for i, (_, a, b) in enumerate(pairs)]}
     data = await complete_obj(ep, [{"role": "user", "content": CONFLICT_PROMPT.format(
         payload=json.dumps(payload, ensure_ascii=False))}], max_tokens=100 + 50 * len(pairs))
     verdicts = {d.get("index"): d for d in data.get("pairs") or [] if isinstance(d, dict)}
@@ -398,7 +404,10 @@ async def _conflicts(store: Store, run_id: str) -> dict:
         d = verdicts.get(i)
         if d is None:
             continue  # unanswered: asked again next run
-        await store.mark_pair_checked(a["id"], b["id"], str(d.get("verdict")), str(d.get("reason") or "")[:200])
+        revisions = [store._pair_revision(r) for r in sorted((a, b), key=lambda r: r["id"])]
+        if not await store.mark_pair_checked(a["id"], b["id"], str(d.get("verdict")),
+                                             str(d.get("reason") or "")[:200], revisions=revisions):
+            continue
         if d.get("verdict") != "conflict":
             continue
         decided = winner(a, b)
