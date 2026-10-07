@@ -1000,3 +1000,56 @@ Sources: Cognition "agent memory repo" (cognition.com/agent-memory-repo), Hindsi
 - **Next:** merge the 15 reports into `final_review_2026-10-07/FINAL_REPORT.md`, ranked: ship-blockers (P0),
   must-fix-soon (P1), method verdicts (KEEP/TUNE/REPLACE), and an improvement backlog with effort and impact. Then
   the user decides what to change.
+
+### 2026-10-07 — Final review recovered by Codex (report only)
+- Verified all 15 app-owned task statuses: capture optimisation/security completed; nine other Codex A/C reviews
+  were still running; all five Claude method-comparison B reviews failed with an API rate-limit error.
+- Preserved the ten original Codex tasks. Relaunched only the five failed B reviews through T3 `delegate_task`,
+  provider `codex`, model `gpt-6.1-sol`, explicit `reasoningEffort=medium`, async. No further nested delegation.
+  Recovery request IDs: `final-review-<component>-b-methods-codex-recovery-r1`.
+- Recovered each original task brief and progress notes from its child thread. Replacement reviewers must
+  independently verify any unfinished findings, recover useful activity/scratch research, and cite primary sources.
+- Durable original/replacement task IDs: `../final_review_2026-10-07/TASK_MANIFEST.json`.
+- First report: `../final_review_2026-10-07/c1-capture-a-optsec.md`; flags before-frame inspection and truncated/OCR
+  privacy checks as potential release blockers. Consolidated severity adjudication is pending all reports.
+- Scope remains report-only: no implementation, paid model calls, live-copy/Keychain access, commits or pushes.
+  The orchestrator writes review artifacts and this worklog only. Async completions wake this thread; next step
+  is read terminal results, inspect/adjudicate all 15 reports against source, and write `FINAL_REPORT.md`.
+
+### 2026-10-08 — Review recovery round 2 (Codex only; report only)
+- Acknowledged all five first Codex B recovery results: each failed with a Codex usage-limit error. Their substantial
+  report drafts survived; terminal notifications must not be mistaken for successful review completion.
+- All ten original Codex A/C reviews completed. Source adjudication is recorded in
+  `../final_review_2026-10-07/ADJUDICATION_NOTES.md`. Platform review reports 724 offline tests passing in isolation;
+  component runs overlap this suite and must not be summed. Native focus, installed distribution, long-horizon
+  evolution and live capture SLOs remain unvalidated.
+- Relaunched only the five B method reviews for draft validation/completion using Codex `gpt-6.1-sol`, explicit
+  medium reasoning, no nested delegation. No Claude tasks started. Round IDs and states are recorded in
+  `../final_review_2026-10-07/RECOVERY_R2.json`.
+- Reviewers must retain the original brief, inspect sibling findings/adjudications, verify primary-source and
+  code evidence, and finish KEEP/TUNE/REPLACE recommendations without repeating completed work unnecessarily.
+- Product source remains unchanged. Final synthesis awaits these validations; no production-readiness claim yet.
+
+### 2026-10-08 — Final end-to-end pre-production report completed (report only)
+- All five round-2 Codex B validators completed successfully, preserving and verifying their saved drafts. All
+  fifteen review assignments now have completed Codex reports across capture, formation, evolution, retrieval
+  and platform. No further Claude agents were used. Terminal results were acknowledged via task_status.
+- Consolidated report: `../final_review_2026-10-07/FINAL_REPORT.md`; all fifteen detailed reports are linked there.
+  Includes ranked/deduplicated findings, source evidence, KEEP/TUNE/REPLACE recommendations, effort/impact,
+  proposed work order, production acceptance gates, evaluation limitations and recovery provenance.
+- **Verdict: HOLD general production release.** Three distinct P0s: cached before-frame privacy bypass,
+  after-image inspection based on lossy/failure-hiding extraction, and Bubble vision upload before redaction.
+  Setup diagnostics add a P1 image-egress bypass to the same containment package. These are code-path risks;
+  actual credential transmission was not tested.
+- Additional reproduced priorities: old/new conflict chronology, occurrence/action identity, suppression and
+  dependency propagation, recurrence loss through evidence caps, stale embeddings, verifier timeout grounding,
+  list fallback, unsupervised ingestion, repeated cancellation/COMMIT safety, configuration and migration races.
+- Keep the architecture and cryptographic/storage foundations. Replace incorrect gate/state/dependency semantics;
+  tune evidence windows, temporal routing, maintenance and indexing. No evidence establishes a globally best
+  framework/model or justifies a wholesale migration. Compare targeted variants under matched source budgets.
+- Historical live1006 gain (0.534→0.767) and g46 tie (0.902 vs 0.912) remain useful regression evidence, not a
+  release certificate. Reviewer-reported 724 isolated offline tests subsume overlapping component runs. Native
+  focus, installed artifact, sustained-history load and multi-week feedback/evolution remain unvalidated.
+- Root source checks and qualifications recorded in ADJUDICATION_NOTES.md; task recovery states in
+  TASK_MANIFEST.json and RECOVERY_R2.json. Product source unchanged; no paid calls, commits, pushes or deployment.
+  Next implementation choices belong to the user's decision after reviewing the report.
