@@ -446,6 +446,25 @@ This audit shows where each proposed feature starts from. Code paths are relativ
   - Codex is making every background model call share one retry policy (`…exp-discrete-dream-retry-1`).
 - **Independent review** of `a73e1d1` + `ecc870e` by Codex gpt-6-sol, xhigh, report only:
   `…exp-discrete-review-r2`.
+- **Retry policy (Codex), my review caught a regression:**
+  - The shared retry budget was also applied as a hard per-attempt timeout. With Bubble's 8 s budget, muse's ~9.5 s
+    first-chunk p50 would have cancelled about half of Bubble answers. Long background drafts would also have been
+    cut at 90 s.
+  - Sent back (`…exp-discrete-dream-retry-2`): each attempt keeps the transport timeout; the budget only gates
+    starting another retry.
+- **Review r2 results:** 9 findings, all reproduced (`/tmp/discrete_review_repro.py`):
+  1. **High:** redraft deletes user forget/correct directives, so a forgotten memory could be re-learned.
+  2. **Medium:** live drafting can close a just-split episode before the merge sees its successor.
+  3. **Medium:** `_split` anchors the new episode to the last moved row's app instead of the first.
+  4. **Medium:** delayed embeddings can't reunite an established task group.
+  5. **Medium:** the checkpoint hash includes volatile columns (`dup_count`, `updated_at`).
+  6. **Medium:** the evidence invariant passes a claim with one real and one fabricated quote.
+  7. **Medium:** redraft keeps draft-derived entity candidates.
+  8. **Low:** existing hits consume the sibling-expansion limit.
+  9. **Low:** task backfill holds one write transaction over thousands of episodes (5.4 s at 2k).
+  - **Effect on the running eval:** #1 doesn't apply (the bench dbs have no user directives). #7 may slightly bias
+    entity promotion in the `-v2` dbs; noted for interpreting `g46-branch-v2` / `live-branch-v2`.
+  - All 9 are being fixed by Codex with regression tests (`…exp-discrete-review-r2-fix-1`).
 
 ---
 
