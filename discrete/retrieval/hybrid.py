@@ -55,7 +55,7 @@ async def materialize(store: Store, kind: str, ids: list[int], *, terms: list[st
             name = r["page_title"] or r["window_title"]
             title = f"{r['app']} — {name}".strip(" —") or r["caption"][:80]
             screen, spans = source_windows(r["screen_text"] or "", terms or [])
-            body = "\n".join(p for p in (tk.truncate(r["caption"], 120), screen) if p)
+            body = "\n".join(p for p in (tk.truncate(r["caption"], 400), screen) if p)
             out[r["id"]] = Hit("observation", r["id"], title[:120], body, occurred_at=r["started_at"],
                                occurred_to=r["ended_at"], untrusted=True, url=r["url"] or "",
                                is_listing=bool(r["is_listing"]), navigated_from=r["navigated_from"], source_spans=spans)

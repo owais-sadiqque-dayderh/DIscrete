@@ -29,3 +29,11 @@ async def test_short_interval_expands_summary_into_details(store):
     result = RetrievalResult(plan.raw, plan)
     await _exhaustive(store, plan, result)
     assert any(h.ref_kind == 'observation' and '740' in h.body for h in result.hits)
+
+
+async def test_caption_survives_query_windows(store):
+    caption = 'A chart comparing synthetic budgets across three teams, ' * 4
+    oid, _ = await store.add_observation(ObservationDraft(app='Notes', window_title='Lab', caption=caption.strip(),
+                                                          screen_text='Budget table'))
+    hit = (await materialize(store, 'observation', [oid], terms=['budget']))[oid]
+    assert caption.strip() in hit.body
