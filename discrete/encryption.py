@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Protocol
 
-from .config import db_path, encrypt_at_rest
+from .config import encrypt_at_rest
 
 SQLITE_HEADER = b"SQLite format 3\x00"
 FRAME_MAGIC = b"DISCRETE-FRAME\x01"
@@ -262,6 +262,7 @@ def open_database(path: str, *, read_only: bool = False) -> Any:
         class LeasedConnection(driver.Connection):
             _lease: Any = None
             _discrete_encrypted = bool(state)
+            _discrete_encryption_state = state
             _discrete_operational_error = driver.OperationalError
 
             def close(self) -> None:
@@ -325,16 +326,21 @@ def open_frame(path: str | Path) -> Any:
     return Image.open(io.BytesIO(read_frame(path)))
 
 
-def write_frame(path: Path, image: Any, *, quality: int) -> None:
-    target = db_path().expanduser().resolve()
-    with store_lock(target):
-        _assert_ready(target)
-        state = read_state(target)
-        if encrypt_at_rest() and state is None:
-            raise EncryptionError("Open/create the encrypted store before saving frames, or run `discrete encrypt`.")
-        data: BinaryIO = io.BytesIO()
-        image.save(data, "JPEG", quality=quality)
-        payload = data.getvalue()
-        if state:
-            payload = encrypt_frame(payload, state.key_id)
-        atomic_write(path, payload)
+_UNKNOWN_STATE = object()
+
+
+def write_frame(path: Path, image: Any, *, quality: int,
+                encryption_state: EncryptionState | None | object = _UNKNOWN_STATE) -> None:
+    """The open owning store supplies its state; explicit None means plaintext.
+
+    The store's connection lease prevents conversion/rotation while capturing.
+    Consulting the global DB path here could silently downgrade a custom store.
+    """
+    if encryption_state is not None and not isinstance(encryption_state, EncryptionState):
+        raise EncryptionError("Frame encryption requires the owning store's encryption state.")
+    data: BinaryIO = io.BytesIO()
+    image.save(data, "JPEG", quality=quality)
+    payload = data.getvalue()
+    if encryption_state is not None:
+        payload = encrypt_frame(payload, encryption_state.key_id)
+    atomic_write(path, payload)

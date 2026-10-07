@@ -128,7 +128,7 @@ async def build_plan(text: str) -> QueryPlan:
     return plan
 
 
-def fallback_plan(text: str) -> QueryPlan:
+def fallback_plan(text: str, *, reference_at: float | None = None) -> QueryPlan:
     ents = list(dict.fromkeys(m.group(0) for m in _IDENT.finditer(text)))
     files = list(dict.fromkeys(m.group(0) for m in _FILE.finditer(text)))
     terms = tk.content_tokens(text)
@@ -140,7 +140,7 @@ def fallback_plan(text: str) -> QueryPlan:
         intent = "edit"
     elif "?" not in text and len(text.split()) > 12 and not (set(tk.tokens(text)[:2]) & tk.INTERROGATIVES):
         intent = "continuation"
-    interval = parse_interval(text)
+    interval = parse_interval(text, reference_at)
     kind = ""
     if intent in ("recall", "continuation") and is_why(text):
         intent = "why"
@@ -220,6 +220,10 @@ def parse_interval(text: str, ref: float | None = None) -> tuple[float, float] |
     # must not silently become today's date (or discard yesterday's captures).
     without_clock = re.sub(r"\b\d{1,2}:\d{2}\s*(?:am|pm)?\b", "", text, flags=re.I)
     if is_why(text) and re.search(r"\b\d{1,2}:\d{2}\b", text) and not _TEMPORAL_CUE.search(without_clock):
+        return None
+    # No parser result can survive the cue filter without a cue in the input.
+    # Avoid language/date detection work on ordinary effect titles.
+    if not _TEMPORAL_CUE.search(text):
         return None
     try:
         found = search_dates(text, settings={"PREFER_DATES_FROM": "past", "RELATIVE_BASE": local.replace(tzinfo=None)})

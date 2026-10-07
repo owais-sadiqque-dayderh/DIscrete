@@ -33,29 +33,38 @@ class ProvenanceMixin(StoreBase):
                             "ORDER BY s.started_at, s.id", (start, end))
         return [_moment(r) for r in rows]
 
-    async def effect_moments(self, terms: list[str], *, observation_ids=(), interval=None, limit=300):
+    async def effect_moments(self, terms: list[str], *, observation_ids=(), interval=None, limit=300,
+                              before: float | None = None):
         """Indexed search followed by exact visit/time filtering in the resolver."""
         from .. import textkit as tk
 
         ids = set(observation_ids)
         if terms:
             fts = " OR ".join('"' + t.replace('"', '""') + '"' for t in terms)
-            rows = await self.q("SELECT rowid FROM observations_fts WHERE observations_fts MATCH ? "
-                                "ORDER BY bm25(observations_fts) LIMIT ?", (fts, limit))
+            cutoff = " AND o.started_at<=?" if before is not None else ""
+            args = (fts, before, limit) if before is not None else (fts, limit)
+            rows = await self.q("SELECT f.rowid FROM observations_fts f JOIN observations o ON o.id=f.rowid "
+                                "WHERE observations_fts MATCH ? AND o.origin='user'" + cutoff +
+                                " ORDER BY bm25(observations_fts),o.started_at DESC,o.id DESC LIMIT ?", args)
             ids.update(r[0] for r in rows)
             # Structured page fields are not in the legacy FTS index.
             for t in terms[:6]:
                 if len(t) >= 3:
                     needle = "%" + tk.norm_key(t).replace("%", r"\%").replace("_", r"\_") + "%"
+                    cutoff = " AND started_at<=?" if before is not None else ""
+                    args = (needle, needle, before, limit) if before is not None else (needle, needle, limit)
                     rows = await self.q("SELECT id FROM observations WHERE origin='user' AND "
-                                        "(page_title LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\') LIMIT ?",
-                                        (needle, needle, limit))
+                                        "(page_title LIKE ? ESCAPE '\\' OR url LIKE ? ESCAPE '\\')" + cutoff +
+                                        " ORDER BY started_at DESC,id DESC LIMIT ?", args)
                     ids.update(r[0] for r in rows)
         if not ids:
             return []
         ph = ",".join("?" for _ in ids)
         sql = _SELECT + f" WHERE o.origin='user' AND o.id IN ({ph})"
         args = list(ids)
+        if before is not None:
+            sql += " AND s.started_at<=?"
+            args.append(before)
         if interval:
             sql += " AND s.started_at>=? AND s.started_at<?"
             args += list(interval)
@@ -63,13 +72,16 @@ class ProvenanceMixin(StoreBase):
         return [_moment(r) for r in rows]
 
     async def pending_provenance(self, rules_key: str, *, limit: int, window_s: float):
-        rows = await self.q(_SELECT + " LEFT JOIN provenance_inputs p ON p.sighting_id=s.id "
-                            "WHERE o.origin='user' AND o.enrich_state!='pending' AND "
-                            "(p.sighting_id IS NULL OR p.updated_at<o.updated_at OR p.rules_key!=? OR EXISTS "
-                            "(SELECT 1 FROM sightings n JOIN observations c ON c.id=n.obs_id "
-                            "WHERE n.started_at>=s.started_at-? AND n.started_at<=s.started_at "
-                            "AND c.updated_at>p.updated_at)) "
-                            "ORDER BY s.started_at, s.id LIMIT ?", (rules_key, window_s, limit))
+        # Window freshness avoids a correlated rescan for every checkpoint. Include
+        # pending sources: a later enrichment must invalidate an empty destination.
+        rows = await self.q("WITH visits AS (" + _SELECT +
+                            " WHERE o.origin='user'), freshness AS (SELECT visits.*, "
+                            "MAX(updated_at) OVER (ORDER BY at RANGE BETWEEN ? PRECEDING AND CURRENT ROW) AS latest "
+                            "FROM visits) SELECT f.* FROM freshness f "
+                            "LEFT JOIN provenance_inputs p ON p.sighting_id=f.sighting_id "
+                            "WHERE f.enrich_state!='pending' AND (p.sighting_id IS NULL OR "
+                            "p.updated_at<f.latest OR p.rules_key!=?) ORDER BY f.at,f.sighting_id LIMIT ?",
+                            (window_s, rules_key, limit))
         return [_moment(r) for r in rows]
 
     async def provenance_edges(self, start: float, end: float, *, rules_key: str | None = None) -> list[ProvenanceEdge]:
@@ -86,35 +98,53 @@ class ProvenanceMixin(StoreBase):
         rows = await self.q(sql, args)
         return [ProvenanceEdge(**dict(r)) for r in rows]
 
+    async def provenance_checkpoints(self, start: float, end: float, rules_key: str) -> dict[int, float]:
+        if not await self.has_provenance():
+            return {}
+        rows = await self.q("SELECT p.sighting_id,p.updated_at FROM provenance_inputs p "
+                            "JOIN sightings s ON s.id=p.sighting_id WHERE s.started_at>=? AND s.started_at<=? "
+                            "AND p.rules_key=?", (start, end, rules_key))
+        return {r["sighting_id"]: r["updated_at"] for r in rows}
+
     async def save_provenance(self, moment: AttentionMoment, edges: list[ProvenanceEdge], rules_key: str,
                               *, checkpoint_at: float | None = None) -> int:
+        return await self.save_provenance_batch([(moment, edges, checkpoint_at if checkpoint_at is not None else now())],
+                                                rules_key)
+
+    async def save_provenance_batch(self, batches, rules_key: str) -> int:
+        """One snapshot read and transaction per batch, preserving endpoint checks."""
+        from ..process.provenance import valid_edge
+
         def write():
             with self._tx() as conn:
-                # Don't checkpoint a snapshot changed while inference was in flight.
-                current = conn.execute("SELECT updated_at, origin FROM observations WHERE id=?",
-                                       (moment.observation_id,)).fetchone()
-                if current is None or current["updated_at"] != moment.updated_at or current["origin"] != "user":
-                    return 0
-                for edge in edges:
-                    if edge.target != moment.sighting_id:
+                ids = {m.sighting_id for m, _, _ in batches}
+                ids.update(e.source for _, edges, _ in batches for e in edges)
+                by_id = {}
+                # SQLite builds may have a small parameter limit.
+                ordered_ids = sorted(ids)
+                for offset in range(0, len(ordered_ids), 500):
+                    chunk = ordered_ids[offset:offset + 500]
+                    rows = conn.execute(_SELECT + " WHERE o.origin='user' AND s.id IN (" +
+                                        ",".join("?" for _ in chunk) + ")", chunk).fetchall()
+                    by_id.update((r["sighting_id"], _moment(r)) for r in rows)
+                made = 0
+                for moment, edges, checkpoint in batches:
+                    current = by_id.get(moment.sighting_id)
+                    if current is None or current.updated_at != moment.updated_at:
+                        continue
+                    if any(edge.target != moment.sighting_id for edge in edges):
                         raise ValueError("edge target must be the checkpointed visit")
-                    row = conn.execute(_SELECT + " WHERE s.id=? AND o.origin='user'", (edge.source,)).fetchone()
-                    if row is None:
-                        return 0
-                    source = _moment(row)
-                    if not (edge.source_quote and edge.source_quote in source.fields.get(edge.source_field, "")
-                            and edge.target_quote and edge.target_quote in moment.fields.get(edge.target_field, "")
-                            and (source.at, source.sighting_id) < (moment.at, moment.sighting_id)
-                            and abs(edge.gap_s - (moment.at - source.at)) < 0.001):
-                        return 0  # a changed source will be reconsidered next time
-                conn.execute("DELETE FROM attention_provenance WHERE target=?", (moment.sighting_id,))
-                for edge in edges:
-                    d = asdict(edge)
-                    conn.execute(f"INSERT INTO attention_provenance({','.join(d)}) VALUES ({','.join('?' * len(d))})",
-                                 tuple(d.values()))
-                conn.execute("INSERT OR REPLACE INTO provenance_inputs VALUES (?,?,?)",
-                             (moment.sighting_id, checkpoint_at if checkpoint_at is not None else now(), rules_key))
-                return len(edges)
+                    if any(not valid_edge(edge, by_id) for edge in edges):
+                        continue  # source changed while inference was in flight
+                    conn.execute("DELETE FROM attention_provenance WHERE target=?", (moment.sighting_id,))
+                    for edge in edges:
+                        d = asdict(edge)
+                        conn.execute(f"INSERT INTO attention_provenance({','.join(d)}) VALUES ({','.join('?' * len(d))})",
+                                     tuple(d.values()))
+                    conn.execute("INSERT OR REPLACE INTO provenance_inputs VALUES (?,?,?)",
+                                 (moment.sighting_id, checkpoint, rules_key))
+                    made += len(edges)
+                return made
         return await self._call(write)
 
     async def reset_provenance(self) -> None:

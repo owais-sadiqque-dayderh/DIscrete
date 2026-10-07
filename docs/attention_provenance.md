@@ -30,11 +30,28 @@ Migration 13 adds `attention_provenance` and `provenance_inputs`. Edges referenc
 kind, confidence, gap, and a literal quote plus field name from each end. Kinds are
 `navigated_from`, `navigation`, `search`, `clipboard`, `message_share`,
 `media_mention`, `typed_navigation`, `app_switch`, `state_selection`, and
-`state_context`. Generic same-site transitions have lower confidence than quoted
-links. A clipboard count does not establish its contents: a payload must occur
+`state_context`, and `same_site_context`. Bare succession on a host supplies only
+the nearest contextual predecessor, with confidence 0.30, below the causal walk
+threshold. Navigation requires a captured link/page label, referrer URL, or
+interaction signal. A model's `navigated_from` assertion alone receives 0.35;
+corroboration by source-screen evidence, a referring URL or a payload-matched
+interaction is required
+to raise it to 0.78. Model caption/referrer evidence is capped at 0.78, even when
+corroborated. A clipboard count does not establish its contents: a payload must occur
 in the destination's input/content, rather than a browser sidebar.
 
+All persisted model strings, including caption, title, referrer and entities, are
+redacted before truncation and storage, including page-field backfills. Inference
+scrubs its inputs and rejects any edge whose quote still contains a detectable
+secret or is no longer a literal endpoint substring. This guard also applies to
+legacy rows and stored edges. Debug rendering and writer context scrub titles and
+other metadata as well.
+
 Drafting and maintenance build missing/changed destinations in bounded batches.
+Each pass reads one shared snapshot and extracts terms, intents and URL indexes
+once. Per-destination candidates and term frequencies use sliding temporal windows;
+batch boundaries do not change inference. Writes/checkpoints share a transaction
+per batch. An explicit backfill covers all ready destinations in one pass.
 Changed source observations invalidate existing edges and make nearby destinations
 eligible again, including destinations with no previous edges. Backfill is
 restartable and model-free:
@@ -49,8 +66,24 @@ does not silently become today's date. Visits are filtered by their own sighting
 times; a deduplicated observation's widened interval cannot anchor a return visit.
 Legacy sightings do not store their own session ID; a return visit's session is
 left unknown rather than borrowing the observation's first session.
+Matching effects are grouped into sittings: consecutive matches more than
+`DISCRETE_WHY_SITTING_GAP_S` apart (default 3 hours) start a new sitting. Select the
+most recent sitting before the question time (`resolve_why(..., reference_at=...)`,
+defaulting to now), then its first matching arrival. Later returns in the same
+sitting have derivative causes and must not displace that arrival. This cutoff
+is applied before the candidate/visit pool limits, so later visits cannot crowd
+out a historical question's matches. Relevance ties in the candidate pool prefer
+recent observations. With no time context, multiple separated plausible sittings
+return an explicit ambiguity listing their first arrival times. "Again", "the last
+time", "most recently" and "this time" select the latest matching arrival instead.
+Equally ranked visits at an indistinguishable time also return an explicit ambiguity
+with candidate dates/times and sighting IDs. The writer asks which visit, with no
+causal chain asserted. Explicit intervals and clock anchors remain authoritative.
 It follows high-confidence incoming edges with depth and elapsed-time limits,
-revalidating both quotes and visit order. A message, post or typed intent ends the
+revalidating both quotes and visit order. Fresh empty checkpoints also count as
+processed: only missing/stale destinations reached by the chosen backward walk
+are inferred, with shared extracted features and no query-time writes.
+A message, post or typed intent ends the
 walk; an actual share can lead backward from a post to a DM. Multiple copied
 references are retained independently. Unsupported chain records, unavailable
 verification or a verification timeout cannot become an answerable chain. Without

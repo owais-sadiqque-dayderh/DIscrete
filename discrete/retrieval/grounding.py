@@ -15,6 +15,8 @@ class GroundingDecision:
 
 
 def evaluate(result: RetrievalResult) -> GroundingDecision:
+    if result.why_chain and result.why_chain.candidates:
+        return GroundingDecision("ambiguous", 0, 0)
     if result.page_answer and result.plan.page_operation:
         return GroundingDecision("pages", len(result.hits), 0)
     intent = result.plan.intent

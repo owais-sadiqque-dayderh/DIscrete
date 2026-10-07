@@ -59,6 +59,15 @@ Legacy JPEG/PNG reads remain supported. Frames have owner-only permissions and
 are written by durable same-directory replacement. A damaged/wrong-key envelope
 does not fall back to plaintext decoding.
 
+Frame writes use the encryption state/key of the owning open store. The runtime
+passes that state explicitly through `ScreenObserver`; a custom `Store.open(path)`
+keeps its frames encrypted even when the global database path differs or the
+opt-in flag is subsequently disabled. `write_frame(..., encryption_state=...)`
+requires an explicit state (explicit `None` means a verified plaintext owner).
+An absent/unknown owner or unavailable key fails before writing any frame;
+the writer never consults the global `db_path()` to choose encryption. The open
+store's lease prevents conversion or key rotation while it owns capture writes.
+
 Native Keychain API/accessibility references: [PyObjC Security binding](https://pyobjc.readthedocs.io/en/latest/apinotes/Security.html),
 [Apple item accessibility](https://developer.apple.com/documentation/security/ksecattraccessiblewhenunlockedthisdeviceonly),
 [Apple query API](https://developer.apple.com/documentation/security/secitemcopymatching(_:_:)).

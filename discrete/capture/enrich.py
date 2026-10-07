@@ -13,6 +13,7 @@ import asyncio
 import dataclasses
 import io
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,9 +30,19 @@ from ..perf import PERF, since_ms
 from ..store import Store
 from .frames import downscale
 from .prompts import CAPTURE_PROMPT
-from .redact import redact
+from .redact import redact, redact_url
 
 log = logging.getLogger("discrete.capture.enrich")
+
+
+def model_text(value: object) -> str:
+    """Scrub every persisted model string before truncation or provenance reads."""
+    text = str(value or "").strip()
+    if T.REDACT_SECRETS:
+        text = redact(text).text
+        # A model may return a URL/referrer in any text field.
+        text = re.sub(r"https?://[^\s<>\"']+", lambda m: redact_url(m[0]).text, text)
+    return text
 
 
 # The caption's answer budget; a reasoning model's thinking needs CAPTION_LM_EXTRA_TOKENS on top.
@@ -175,10 +186,7 @@ class Enricher:
             self.stats["degraded"] += 1
             await self.store.enrichment_failed(oid)
             return
-        caption = str(data.get("caption") or "").strip()
-        if T.REDACT_SECRETS:
-            # The model saw the frame: a key it read off the screen must not be stored.
-            caption = redact(caption).text
+        caption = model_text(data.get("caption"))
         if not data.get("useful", True) or (len(job.screen_text) < 40 and len(caption) < 5):
             self.stats["dropped_useless"] += 1
             await self.store.discard_observation(oid)
@@ -186,10 +194,10 @@ class Enricher:
         self.stats["captured"] += 1
         await self.store.enrich_observation(
             oid, caption=caption,
-            entities=[str(e).strip() for e in (data.get("entities") or []) if str(e).strip()],
-            page_title=tk.truncate(str(data.get("page_title") or "").strip(), 200),
+            entities=[text for e in (data.get("entities") or []) if (text := model_text(e))],
+            page_title=tk.truncate(model_text(data.get("page_title")), 200),
             is_listing=data.get("is_listing") is True,
-            navigated_from=tk.truncate(str(data.get("navigated_from") or "").strip(), 200),
+            navigated_from=tk.truncate(model_text(data.get("navigated_from")), 200),
         )
 
     async def vlm(self, job: EnrichJob) -> dict | None:
@@ -259,9 +267,9 @@ async def backfill_page_fields(store: Store, *, limit: int = 500) -> dict[str, i
             return
         await store.enrich_observation(
             r["id"], caption=r["caption"], entities=tk.parse_json_list(r["entities"]),
-            page_title=tk.truncate(str(data.get("page_title") or "").strip(), 200),
+            page_title=tk.truncate(model_text(data.get("page_title")), 200),
             is_listing=data.get("is_listing") is True,
-            navigated_from=tk.truncate(str(data.get("navigated_from") or "").strip(), 200),
+            navigated_from=tk.truncate(model_text(data.get("navigated_from")), 200),
         )
         out["filled"] += 1
 

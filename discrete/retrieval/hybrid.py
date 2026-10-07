@@ -252,6 +252,11 @@ async def expand_why(store: Store, result: RetrievalResult) -> None:
     the caption often misses it: a browser's menu bar inside a video), the page it was
     reached from, and the moment or two just before."""
     chain = await resolve_why(store, result.query, plan=result.plan, hits=result.hits)
+    if chain.candidates:
+        result.why_chain = chain
+        result.hits = []
+        result.digest = ""
+        return
     if chain.effect is not None:
         result.why_chain = chain
     if chain.edges:

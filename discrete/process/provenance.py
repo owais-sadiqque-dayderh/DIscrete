@@ -8,10 +8,13 @@ evidence and receive lower confidence than verbatim URL/text matches.
 from __future__ import annotations
 
 import re
-from collections import Counter
+from bisect import bisect_left, bisect_right
+from collections import defaultdict, deque
+from dataclasses import dataclass, replace
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .. import textkit as tk
+from ..capture.redact import redact, redact_url
 from ..config import T
 from ..models import AttentionMoment, ProvenanceEdge
 from ..store import Store
@@ -27,6 +30,7 @@ _MEDIA = re.compile(r"\b(?:video|demo|caption|embedded|image|photo|screenshot|me
 _COPY = re.compile(r"\b(?:copied|copy|clipboard|paste[ds]?)\b", re.I)
 _TYPED = re.compile(r"\b(?:typ(?:ed|ing|es)|enter(?:ed|ing|s)|search(?:ed|ing|es)? for|query)\b", re.I)
 _ERROR = re.compile(r"\b(?:still in use|profile.{0,25}(?:locked|in use)|already running|close the browser|close .{0,30}first)\b", re.I)
+_NAVIGATION = re.compile(r"\b(?:click(?:ed|ing)?|follow(?:ed|ing)?|open(?:ed|ing)?)\b", re.I)
 _URL = re.compile(r"(?:https?://|\bwww\.)[^\s<>\"']+|\b[a-z0-9][a-z0-9-]*\.(?:[a-z]{2,})(?:/[^\s<>\"']*)?", re.I)
 
 
@@ -57,7 +61,9 @@ def find_quote(moment: AttentionMoment, value: str, *, fields=None) -> tuple[str
     for field in fields or moment.fields:
         text = moment.fields.get(field, "")
         if m := pattern.search(text):
-            return field, text[max(0, m.start() - 90):min(len(text), m.end() + 130)]
+            quote = text[max(0, m.start() - 90):min(len(text), m.end() + 130)]
+            if safe_text(quote) == quote:
+                return field, quote
     return None
 
 
@@ -71,7 +77,9 @@ def url_quote(moment: AttentionMoment, url: str) -> tuple[str, str] | None:
         text = moment.fields.get(field, "")
         for match in _URL.finditer(text):
             if _url_key(match[0]) == wanted:
-                return field, text[max(0, match.start() - 90):min(len(text), match.end() + 130)]
+                quote = text[max(0, match.start() - 90):min(len(text), match.end() + 130)]
+                if safe_text(quote) == quote:
+                    return field, quote
     return None
 
 
@@ -105,6 +113,16 @@ def is_origin(moment: AttentionMoment) -> bool:
                                             moment.fields.get("screen_text", ""), re.I | re.M))))
 
 
+def safe_text(text: str) -> str:
+    """Always scrub graph evidence, including legacy rows and flag-off captures."""
+    text = redact(text).text
+    return re.sub(r"https?://[^\s<>\"']+", lambda m: redact_url(m[0]).text, text)
+
+
+def safe_moment(moment: AttentionMoment) -> AttentionMoment:
+    return replace(moment, fields={k: safe_text(v) for k, v in moment.fields.items()})
+
+
 def valid_edge(edge: ProvenanceEdge, by_id: dict[int, AttentionMoment]) -> bool:
     a, b = by_id.get(edge.source), by_id.get(edge.target)
     return bool(a and b and edge.source != edge.target and (a.at, a.sighting_id) < (b.at, b.sighting_id)
@@ -112,24 +130,159 @@ def valid_edge(edge: ProvenanceEdge, by_id: dict[int, AttentionMoment]) -> bool:
                 and 0 <= b.at - a.at <= max(0, T.PROVENANCE_WINDOW_S)
                 and abs(edge.gap_s - (b.at - a.at)) < 0.001
                 and 0 <= edge.confidence <= 1
-                and edge.source_quote and edge.source_quote in a.fields.get(edge.source_field, "")
+                and edge.source_quote and safe_text(edge.source_quote) == edge.source_quote
+                and safe_text(edge.target_quote) == edge.target_quote
+                and edge.source_quote in a.fields.get(edge.source_field, "")
                 and edge.target_quote and edge.target_quote in b.fields.get(edge.target_field, ""))
 
 
-def infer_edges(moments: list[AttentionMoment], *, target_id: int | None = None) -> list[ProvenanceEdge]:
-    """Bounded temporal neighborhood; no edge from temporal adjacency alone."""
-    ordered = sorted(moments, key=lambda m: (m.at, m.sighting_id))
-    df = Counter(t for m in ordered for t in distinctive(m.text))
-    edges = []
-    for i, b in enumerate(ordered):
-        if target_id is not None and b.sighting_id != target_id:
-            continue
+@dataclass
+class MomentFeatures:
+    moment: AttentionMoment
+    full_terms: set[str]
+    body_terms: set[str]
+    context_terms: set[str]
+    caption_terms: set[str]
+    identity_terms: set[str]
+    labels: set[str]
+    intent: tuple[str, tuple[str, str]] | None
+    intent_terms: set[str]
+    intent_distinctive: set[str]
+    destination_terms: set[str]
+    url_key: str
+    host: str
+    shared: bool
+    copied: bool
+    updated_window: float = 0.0
+
+
+def window_freshness(moments: list[AttentionMoment]) -> dict[int, float]:
+    """Maximum source update per temporal window, including equal-time siblings."""
+    maxima = deque()
+    result = {}
+    right = 0
+    for moment in moments:
+        while right < len(moments) and moments[right].at <= moment.at:
+            while maxima and moments[maxima[-1]].updated_at <= moments[right].updated_at:
+                maxima.pop()
+            maxima.append(right)
+            right += 1
+        while maxima and moments[maxima[0]].at < moment.at - max(0, T.PROVENANCE_WINDOW_S):
+            maxima.popleft()
+        result[moment.sighting_id] = moments[maxima[0]].updated_at
+    return result
+
+
+class EdgeInference:
+    """Extract once; indexed candidate joins within each destination's sliding window.
+
+    URL/title/subject indexes avoid comparing every pair of unrelated visits, even
+    when thousands of captures fall inside the same temporal window. Term document
+    frequencies are window-local, so batch boundaries cannot change confidence.
+    """
+
+    def __init__(self, moments: list[AttentionMoment]):
+        self.ordered = sorted((safe_moment(m) for m in moments), key=lambda m: (m.at, m.sighting_id))
+        self.raw_by_id = {m.sighting_id: m for m in moments}
+        self.by_id = {m.sighting_id: m for m in self.ordered}
+        self.positions = {m.sighting_id: i for i, m in enumerate(self.ordered)}
+        self.times = [m.at for m in self.ordered]
+        self.features = []
+        self.terms = defaultdict(list)
+        self.identities = defaultdict(list)
+        self.searches = defaultdict(list)
+        self.links = defaultdict(list)
+        self.path_labels = defaultdict(list)
+        self.copies = defaultdict(list)
+        self.hosts = defaultdict(list)
+        self.apps = defaultdict(list)
+        self.imports = defaultdict(list)
+        freshness = window_freshness(self.ordered)
+        for i, m in enumerate(self.ordered):
+            f = m.fields
+            body = f.get("screen_text", "") + " " + f.get("caption", "")
+            identity = m.title + " " + f.get("window_title", "") + " " + f.get("url", "")
+            intent = search_intent(m)
+            copied = bool(m.clipboard or re.search(r"\b(?:copied|copies|copying|pasted)\b", f.get("caption", ""), re.I)
+                          or re.search(r"\bCopied (?:Current URL|to clipboard)\b", f.get("screen_text", ""), re.I))
+            feature = MomentFeatures(m, distinctive(m.text), distinctive(body),
+                                     distinctive(m.title + " " + f.get("caption", "")), distinctive(f.get("caption", "")),
+                                     lexical_terms(identity), distinctive(m.title + " " + f.get("window_title", "")),
+                                     intent, lexical_terms(intent[0]) if intent else set(),
+                                     distinctive(intent[0]) if intent else set(),
+                                     distinctive(intent[0] if intent else m.title), _url_key(f.get("url", "")),
+                                     urlsplit(f.get("url", "")).hostname or "", shared_source(m), copied)
+            feature.updated_window = freshness[m.sighting_id]
+            self.features.append(feature)
+            for term in feature.full_terms:
+                self.terms[term].append(i)
+            for term in distinctive(identity):
+                self.identities[term].append(i)
+            for term in feature.intent_terms:
+                self.searches[term].append(i)
+            for match in _URL.finditer(body):
+                self.links[_url_key(match[0])].append(i)
+            if copied:
+                for term in distinctive(f.get("url", "") + " " + f.get("caption", "")):
+                    self.copies[term].append(i)
+            if feature.host:
+                self.hosts[feature.host].append(i)
+                for term in set(tk.tokens(f.get("screen_text", ""))):
+                    self.path_labels[(feature.host, term)].append(i)
+            self.apps[m.app].append(i)
+            if re.search(r"\bimport", m.text, re.I):
+                self.imports[m.app].append(i)
+
+    def _candidates(self, i: int, low: int) -> list[int]:
+        b, fb = self.ordered[i], self.features[i]
+        candidates = set()
+
+        def collect(index, terms):
+            for term in terms:
+                postings = index.get(term, [])
+                candidates.update(postings[bisect_left(postings, low):bisect_left(postings, i)])
+
+        collect(self.terms, fb.labels | fb.destination_terms | (fb.caption_terms if fb.intent and b.keys else set()))
+        collect(self.identities, distinctive(b.fields.get("navigated_from", "")))
+        collect(self.searches, fb.identity_terms)
+        collect(self.copies, fb.full_terms)
+        collect(self.links, [fb.url_key] if fb.url_key else [])
+        # A visible same-site path label can precede intervening unrelated pages.
+        label = unquote(urlsplit(b.fields.get("url", "")).path.rstrip("/").rsplit("/", 1)[-1]).replace("-", " ")
+        if len(label) >= 4 and not label.isdigit() and label.casefold() not in ("home", "index", "profile"):
+            collect(self.path_labels, [(fb.host, t) for t in tk.tokens(label)])
+        # Bare host succession contributes only the nearest contextual predecessor.
+        host = self.hosts.get(fb.host, [])
+        previous = bisect_left(host, i) - 1
+        if previous >= 0 and host[previous] >= low:
+            candidates.add(host[previous])
+        if _ERROR.search(b.text):
+            collect(self.imports, [b.app])
+            for visits in self.apps.values():
+                previous = bisect_left(visits, i) - 1
+                if previous >= 0 and visits[previous] >= low:
+                    candidates.add(visits[previous])
+        return sorted(candidates, reverse=True)
+
+    def edges_for(self, target_id: int) -> list[ProvenanceEdge]:
+        i = self.positions[target_id]
+        ordered = self.ordered
+        b, fb = ordered[i], self.features[i]
+        low = bisect_left(self.times, b.at - max(0, T.PROVENANCE_WINDOW_S))
+        upper = bisect_right(self.times, b.at)
+        # Includes equal-time siblings just as an independently loaded window does.
+        class Frequency:
+            def __getitem__(_, term):
+                postings = self.terms.get(term, [])
+                return bisect_left(postings, upper) - bisect_left(postings, low)
+
+        df = Frequency()
+        window_n = upper - low
         parents = []
-        intent_b = search_intent(b)
-        for a in reversed(ordered[:i]):
+        intent_b = fb.intent
+        for j in self._candidates(i, low):
+            a, fa = ordered[j], self.features[j]
             gap = b.at - a.at
-            if gap > max(0, T.PROVENANCE_WINDOW_S):
-                break
             if a.observation_id == b.observation_id or (a.session_id and b.session_id and a.session_id != b.session_id):
                 continue
             same_page = ((a.fields.get("url") and _url_key(a.fields["url"]) == _url_key(b.fields.get("url", ""))) or
@@ -139,24 +292,35 @@ def infer_edges(moments: list[AttentionMoment], *, target_id: int | None = None)
             def add(kind, confidence, qa, qb, proposed=proposed, a=a, b=b, gap=gap):
                 if qa and qb:
                     # Caption/referrer assertions are stored evidence, not browser telemetry.
-                    if "caption" in (qa[0], qb[0]):
+                    if {"caption", "navigated_from"} & {qa[0], qb[0]}:
                         confidence = min(confidence, 0.78)
+                    if safe_text(qa[1]) != qa[1] or safe_text(qb[1]) != qb[1]:
+                        return
                     proposed.append(ProvenanceEdge(a.sighting_id, b.sighting_id, kind, confidence,
                                                   *qa, *qb, gap))
 
-            # Explicit referrer name/URL, checked against a real earlier page.
+            # A model referrer must match an earlier page and be corroborated.
             came = b.fields.get("navigated_from", "")
             if came and not same_page:
                 for field in ("url", "page_title", "window_title"):
                     value = a.fields.get(field, "")
                     if distinctive(value) and (tk.norm_key(value) in tk.norm_key(came) or
                                                tk.norm_key(came) in tk.norm_key(value)):
-                        add("navigated_from", 0.88, (field, value), ("navigated_from", came))
+                        # Counts alone cannot identify a navigation's payload.
+                        interaction = bool((a.clicks or b.clicks) and _NAVIGATION.search(
+                            a.fields.get("caption", "")) and find_quote(
+                                a, b.fields.get("url", "") or b.title, fields=("caption",)))
+                        corroborated = bool(interaction or url_quote(a, b.fields.get("url", "")) or
+                                            find_quote(a, b.title, fields=("screen_text",)) or
+                                            any(_url_key(ref) == fa.url_key for key, refs in
+                                                parse_qs(urlsplit(b.fields.get("url", "")).query).items()
+                                                if key in ("ref", "referrer", "from") for ref in refs))
+                        add("navigated_from", 0.78 if corroborated else 0.35,
+                            (field, value), ("navigated_from", came))
                         break
 
             # A copy must have a payload match; the clipboard counter alone is insufficient.
-            if a.clipboard or re.search(r"\b(?:copied|copies|copying|pasted)\b", a.fields.get("caption", ""), re.I) or (
-                re.search(r"\bCopied (?:Current URL|to clipboard)\b", a.fields.get("screen_text", ""), re.I)):
+            if fa.copied:
                 values = [a.fields.get("url", "")]
                 copied = re.search(r"\bcopied\s+[\"“']([^\"”']+)[\"”']", a.fields.get("caption", ""), re.I)
                 if copied:
@@ -188,41 +352,38 @@ def infer_edges(moments: list[AttentionMoment], *, target_id: int | None = None)
                           find_quote(a, value, fields=("screen_text", "caption")))
                     qb = find_quote(b, value)
                     if qa and qb:
-                        add("search" if search_intent(a) else "message_share" if shared_source(a) else "navigation",
+                        add("search" if fa.intent else "message_share" if fa.shared else "navigation",
                             0.9, qa, qb)
                         break
 
-                # Successive pages on the same site supply a weaker visit transition
-                # when no clicked link/referrer was captured. Quotes are the real URLs.
+                # Bare host succession is contextual; a visible path label can
+                # independently establish navigation. Both endpoints stay quoted.
                 ua, ub = a.fields.get("url", ""), b.fields.get("url", "")
-                if ua and ub and gap <= 90 and urlsplit(ua).hostname == urlsplit(ub).hostname and (
-                    urlsplit(ua).hostname and _url_key(ua) != _url_key(ub) and not search_intent(a)):
-                    add("navigation", 0.64, ("url", ua), ("url", ub))
+                if ua and ub and gap <= 90 and fa.host == fb.host and (
+                    fa.host and fa.url_key != fb.url_key and not fa.intent):
+                    add("same_site_context", 0.3, ("url", ua), ("url", ub))
                     label = unquote(urlsplit(ub).path.rstrip("/").rsplit("/", 1)[-1]).replace("-", " ")
                     if len(label) >= 4 and not label.isdigit() and label.casefold() not in ("home", "index", "profile"):
                         add("navigation", 0.87, find_quote(a, label, fields=("screen_text",)), ("url", ub))
 
-            intent_a = search_intent(a)
+            intent_a = fa.intent
             if intent_a and not same_page:
-                terms = lexical_terms(intent_a[0])
-                matched = terms & lexical_terms(b.title + " " + b.fields.get("window_title", "") + " " +
-                                                b.fields.get("url", ""))
+                terms = fa.intent_terms
+                matched = terms & fb.identity_terms
                 if matched:
                     term = min(matched, key=lambda t: df[t])
                     add("search", 0.86, intent_a[1], find_quote(b, term))
 
             # Product/brand named inside embedded media, then searched; also supports
             # a typed destination with shared subject terms (weaker evidence).
-            destination = intent_b[0] if intent_b else b.title
-            common = distinctive(destination) & distinctive(a.fields.get("screen_text", "") + " " +
-                                                                        a.fields.get("caption", ""))
-            rare = {t for t in common if df[t] <= max(3, len(ordered) * 0.15)}
+            common = fb.destination_terms & fa.body_terms
+            rare = {t for t in common if df[t] <= max(3, window_n * 0.15)}
             if rare:
                 term = min(rare, key=lambda t: (df[t], -len(t), t))
                 qa, qb = find_quote(a, term), find_quote(b, term)
                 if _MEDIA.search(a.fields.get("caption", "")) and intent_b:
                     add("media_mention", 0.76, qa, qb)
-                elif shared_source(a) and not same_page:
+                elif fa.shared and not same_page:
                     add("message_share", 0.72, qa, qb)
                 elif a.app != b.app:
                     add("app_switch", 0.58, qa, qb)
@@ -232,11 +393,10 @@ def infer_edges(moments: list[AttentionMoment], *, target_id: int | None = None)
             # only when the destination's stored caption explicitly shows that topic
             # alongside its typed intent, and it was also present on the source.
             if intent_b and b.keys and not intent_a:
-                context_terms = distinctive(b.fields.get("caption", "")) & distinctive(
-                    a.title + " " + a.fields.get("caption", ""))
-                context_terms -= distinctive(intent_b[0])
-                contextual = {t for t in context_terms if df[t] <= max(3, len(ordered) * 0.15) or len(t) >= 8}
-                if contextual and shared_source(a):
+                context_terms = fb.caption_terms & fa.context_terms
+                context_terms -= fb.intent_distinctive
+                contextual = {t for t in context_terms if df[t] <= max(3, window_n * 0.15) or len(t) >= 8}
+                if contextual and fa.shared:
                     term = min(contextual, key=lambda t: (df[t], -len(t), t))
                     add("typed_navigation", 0.68, find_quote(a, term), find_quote(b, term, fields=("caption",)))
 
@@ -244,9 +404,8 @@ def infer_edges(moments: list[AttentionMoment], *, target_id: int | None = None)
             # running. Require its app to be named by an import/setup screen, or by
             # the dialog itself. Never assert actual background process liveness.
             if _ERROR.search(b.text) and a.app and a.app != b.app:
-                setup = next((m for m in reversed(ordered[:i]) if b.at - m.at <= T.PROVENANCE_WINDOW_S
-                              and m.app == b.app and re.search(r"\bimport", m.text, re.I)
-                              and find_quote(m, a.app)), None)
+                setup = next((ordered[j] for j in reversed(self.imports.get(b.app, []))
+                              if low <= j < i and find_quote(ordered[j], a.app)), None)
                 if find_quote(b, a.app) or setup:
                     add("state_context", 0.6, ("app", a.app), find_quote(b, _ERROR.search(b.text)[0]))
             elif _ERROR.search(b.text) and a.app == b.app and re.search(r"\bimport", a.text, re.I):
@@ -254,26 +413,33 @@ def infer_edges(moments: list[AttentionMoment], *, target_id: int | None = None)
 
             if proposed:
                 best = max(proposed, key=lambda e: e.confidence)
-                if valid_edge(best, {a.sighting_id: a, b.sighting_id: b}):
+                if valid_edge(best, self.raw_by_id):
                     parents.append(best)
         # Preserve alternative origins, especially two copied URLs; at most one
         # parent of each kind/page except clipboard sources with separate payloads.
         parents.sort(key=lambda e: (-e.confidence, e.gap_s, -e.source))
         unique = []
         seen = set()
-        by_id = {m.sighting_id: m for m in ordered}
+        by_id = self.by_id
         for edge in parents:
             source = by_id[edge.source]
             identity = (edge.kind, source.app) if edge.kind == "state_context" else (edge.kind, source.observation_id)
             if identity not in seen:
                 unique.append(edge)
                 seen.add(identity)
-        edges += unique[:max(0, T.PROVENANCE_MAX_PARENTS)]
-    return edges
+        return unique[:max(0, T.PROVENANCE_MAX_PARENTS)]
+
+
+def infer_edges(moments: list[AttentionMoment], *, target_id: int | None = None,
+                target_ids: set[int] | None = None, inference: EdgeInference | None = None) -> list[ProvenanceEdge]:
+    inference = inference or EdgeInference(moments)
+    ids = {target_id} if target_id is not None else target_ids
+    return [edge for m in inference.ordered if ids is None or m.sighting_id in ids
+            for edge in inference.edges_for(m.sighting_id)]
 
 
 def rules_key() -> str:
-    return f"v1:{T.PROVENANCE_WINDOW_S}:{T.PROVENANCE_MAX_PARENTS}"
+    return f"v2:{T.PROVENANCE_WINDOW_S}:{T.PROVENANCE_MAX_PARENTS}"
 
 
 async def build_provenance(store: Store, *, backfill: bool = False) -> int:
@@ -282,15 +448,20 @@ async def build_provenance(store: Store, *, backfill: bool = False) -> int:
         return 0
     if backfill:
         await store.reset_provenance()
+    batch_size = max(1, T.PROVENANCE_BATCH)
+    pending = await store.pending_provenance(rules_key(), limit=-1 if backfill else batch_size,
+                                             window_s=max(0, T.PROVENANCE_WINDOW_S))
+    if not pending:
+        return 0
+    snapshot_at = now()
+    rows = await store.attention_moments(pending[0].at - max(0, T.PROVENANCE_WINDOW_S), pending[-1].at)
+    inference = EdgeInference(rows)
     made = 0
-    while pending := await store.pending_provenance(rules_key(), limit=max(1, T.PROVENANCE_BATCH),
-                                                   window_s=max(0, T.PROVENANCE_WINDOW_S)):
-        for moment in pending:
-            snapshot_at = now()
-            rows = await store.attention_moments(moment.at - T.PROVENANCE_WINDOW_S, moment.at)
-            edges = infer_edges(rows, target_id=moment.sighting_id)
-            checkpoint_at = max([snapshot_at, *(m.updated_at for m in rows)])
-            made += await store.save_provenance(moment, edges, rules_key(), checkpoint_at=checkpoint_at)
-        if not backfill:
-            break
+    for offset in range(0, len(pending), batch_size):
+        batches = []
+        for moment in pending[offset:offset + batch_size]:
+            feature = inference.features[inference.positions[moment.sighting_id]]
+            checkpoint_at = max(snapshot_at, feature.updated_window)
+            batches.append((moment, inference.edges_for(moment.sighting_id), checkpoint_at))
+        made += await store.save_provenance_batch(batches, rules_key())
     return made

@@ -43,6 +43,10 @@ Memory records:
 {instruction}"""
 
 MODE_INSTRUCTIONS = {
+    "ambiguous": (
+        "Several visits match this why question. Ask which visit they mean, listing the candidate dates and times. "
+        "Do not select a visit or assert a causal chain."
+    ),
     "grounded": (
         "The records directly cover this. Write using the most specific facts they give (names, figures, "
         "titles, dates), preferring [screen] excerpts over [claim] headlines. No hedging, no 'records show'."

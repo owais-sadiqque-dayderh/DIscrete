@@ -133,6 +133,41 @@ async def test_clock_anchor_uses_sightings_instead_of_merged_observation_span(st
     assert fallback_plan(f"why did I open Assistant around {clock}?").interval is None
 
 
+async def test_clock_anchor_overrides_repeat_cue_and_first_arrival(store):
+    await obs(store, 0, "Quartz report", url="https://reports.test/quartz")
+    await obs(store, 7200, "Quartz report", url="https://reports.test/quartz")
+    await obs(store, 86400 + 10800, "Quartz report", url="https://reports.test/quartz")
+    clock = datetime.fromtimestamp(T0 + 7200).strftime("%H:%M")
+    chain = await resolve_why(store, f"why did I open Quartz report again around {clock}?")
+    assert chain.effect.at == T0 + 7200
+
+
+@pytest.mark.parametrize("anchor", ["yesterday", datetime.fromtimestamp(T0).strftime("on %Y-%m-%d")])
+async def test_date_anchor_selects_older_sitting_first_arrival(store, anchor):
+    for dt in (20, 40, 86420, 86460):
+        await obs(store, dt, "Quartz report", url="https://reports.test/quartz")
+    chain = await resolve_why(store, f"why did I open Quartz report {anchor}?", reference_at=T0 + 86480)
+    assert chain.effect.at == T0 + 20
+    latest = await resolve_why(store, f"why did I open Quartz report again {anchor}?", reference_at=T0 + 86480)
+    assert latest.effect.at == T0 + 40
+
+
+async def test_download_sitting_starts_at_action_instead_of_product_homepage(store):
+    await obs(store, 0, "Quartz browser", url="https://quartz.test/")
+    arrival = await obs(store, 20, "Thank you for downloading Quartz browser", url="https://quartz.test/download")
+    await obs(store, 40, "Thank you for downloading Quartz browser", url="https://quartz.test/download")
+    chain = await resolve_why(store, "why did I download Quartz browser?")
+    assert chain.effect.at == T0 + 20 and chain.effect.observation_id == arrival
+
+
+async def test_quoted_dialog_return_uses_first_matching_state(store):
+    await obs(store, 0, "Importer", "Import from Cedar", app="Birch")
+    arrival = await obs(store, 20, "Importer", "Import profile still in use", app="Birch")
+    await obs(store, 40, "Birch Import profile still in use", "Import profile still in use", app="Birch")
+    chain = await resolve_why(store, 'why did Birch say "Import profile still in use"?')
+    assert chain.effect.at == T0 + 20 and chain.effect.observation_id == arrival
+
+
 def _node(n, at, title="Quartz", text="Quartz"):
     return AttentionMoment(n, n, at, at + 1, {"screen_text": text, "page_title": title, "app": "Browser"},
                            app="Browser", session_id="s")

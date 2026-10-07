@@ -5,23 +5,28 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 
 from .. import textkit as tk
 from ..config import T
 from ..models import AttentionMoment, Hit, ProvenanceEdge, QueryPlan, WhyChain
 from ..process.provenance import (
+    EdgeInference,
     distinctive,
     find_quote,
     infer_edges,
     is_origin,
     lexical_terms,
     rules_key,
+    safe_moment,
+    safe_text,
     search_intent,
     shared_source,
     valid_edge,
+    window_freshness,
 )
 from ..store import Store
-from ..timeutil import to_local
+from ..timeutil import now, to_local
 from .query import fallback_plan, is_why
 
 _CLOCK = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\s*(am|pm)?\b", re.I)
@@ -29,10 +34,13 @@ _SCAFFOLD = frozenset("why made led prompted caused did download downloaded brow
                       "reading read start started browsing end ended page profile account around tried try "
                       "data when say import computer get got".split())
 _ACTION = re.compile(r"\b(download|install|send|sent|buy|bought|create|delete|choose|chose)\w*\b", re.I)
+_LATEST = re.compile(r"\b(?:again|(?:the\s+)?last\s+time|most\s+recently|this\s+time)\b", re.I)
+_DATE_ANCHOR = re.compile(r"\b(?:today|yesterday|tonight)\b|\b\d{4}-\d{1,2}-\d{1,2}\b", re.I)
 
 
 def effect_terms(question: str) -> list[str]:
-    text = _CLOCK.sub("", question)
+    # Visit selectors are time context, not part of the page's subject identity.
+    text = _DATE_ANCHOR.sub("", _LATEST.sub("", _CLOCK.sub("", question)))
     return sorted(distinctive(text) - _SCAFFOLD)
 
 
@@ -48,10 +56,17 @@ def _clock_distance(moment: AttentionMoment, question: str) -> float | None:
     return min(difference, 86400 - difference)
 
 
-async def locate_effect(store: Store, question: str, plan: QueryPlan, hits: list[Hit]) -> AttentionMoment | None:
+@dataclass
+class EffectSelection:
+    effect: AttentionMoment | None = None
+    candidates: list[AttentionMoment] | None = None
+
+
+async def locate_effect(store: Store, question: str, plan: QueryPlan, hits: list[Hit], *,
+                        reference_at: float | None = None) -> EffectSelection:
     terms = effect_terms(question)
     if not terms:
-        return None
+        return EffectSelection()
     anchors = []
     action = _ACTION.search(question)
     for h in hits:
@@ -70,9 +85,14 @@ async def locate_effect(store: Store, question: str, plan: QueryPlan, hits: list
             if claim["action"] and action[0].lower()[:4] == claim["action"].lower()[:4]:
                 action_anchors.update(e["observation_id"] for e in await store.evidence_for_claim(claim["id"]))
         anchors += list(action_anchors)
-    moments = await store.effect_moments(terms, observation_ids=anchors, interval=plan.interval, limit=T.WHY_EFFECT_POOL)
+    has_clock = bool(_CLOCK.search(question))
+    time_context = reference_at is not None or plan.interval is not None or has_clock
+    latest = bool(_LATEST.search(question))
+    reference_at = reference_at if reference_at is not None else now()
+    moments = await store.effect_moments(terms, observation_ids=anchors, interval=plan.interval,
+                                         limit=T.WHY_EFFECT_POOL, before=reference_at)
     if not moments:
-        return None
+        return EffectSelection()
     df, n = await store.df_lookup(terms)
     weights = {t: tk.bm25_idf(df.get(t, 0), n) + 1 for t in terms}
     quoted = re.findall(r'["“]([^"”]{4,200})["”]', question)
@@ -81,7 +101,10 @@ async def locate_effect(store: Store, question: str, plan: QueryPlan, hits: list
     ranked = []
     wants_profile = not quoted and bool(re.search(r"\bprofiles?\b", question, re.I))
     wants_search = bool(re.search(r"\bsearch(?:ed|ing)?\b", question, re.I))
-    for moment in moments:
+    for raw in moments:
+        moment = safe_moment(raw)
+        if moment.at > reference_at:
+            continue
         distance = _clock_distance(moment, question)
         if distance is not None and distance > max(0, T.WHY_TIME_TOLERANCE_S):
             continue
@@ -121,20 +144,46 @@ async def locate_effect(store: Store, question: str, plan: QueryPlan, hits: list
                                    moment.fields.get("caption", ""), re.I) else 0
         if distance is not None:
             score += 4 * (1 - distance / max(1, T.WHY_TIME_TOLERANCE_S))
-        ranked.append((score, -moment.at, moment))
+        ranked.append((score, moment.at, raw))
     ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    if not action and not quoted and not _CLOCK.search(question) and ranked:
-        # Navigation/attention begins at the first relevant visit, provided all
-        # requested subject words are represented. Later headings can be richer.
+    complete = []
+    if not action and not quoted and not has_clock and ranked:
+        # Complete subject identity takes precedence over incidental body matches;
+        # a return's extra screen text must not displace the initial arrival.
         complete = [r for r in ranked if query_words <= lexical_terms(r[2].text) and (
             re.search(r"\bstart(?:ed)?\b", question, re.I) or query_words <= lexical_terms(
                 r[2].title + " " + r[2].fields.get("window_title", "") + " " + r[2].fields.get("url", "")))]
         if complete:
-            return min(complete, key=lambda r: r[2].at)[2]
-    return ranked[0][2] if ranked else None
+            ranked = complete
+    if not ranked:
+        return EffectSelection()
+    if not complete and not quoted:
+        # Preserve action citations and clock/typed-intent ranking:
+        # arriving at a product homepage is not completing its download.
+        best_score = max(r[0] for r in ranked)
+        ranked = [r for r in ranked if abs(r[0] - best_score) < 0.001]
+    sittings = []
+    for row in sorted(ranked, key=lambda r: r[1]):
+        # Legacy return sightings have no reliable session ID. Consecutive effect
+        # matches define a sitting; the causal edge window is too short for this.
+        if not sittings or row[1] - sittings[-1][-1][1] > max(0, T.WHY_SITTING_GAP_S):
+            sittings.append([])
+        sittings[-1].append(row)
+    if len(sittings) > 1 and not time_context and not latest:
+        # Recency alone cannot disambiguate separate days of the same activity.
+        return EffectSelection(candidates=[sitting[0][2] for sitting in sittings])
+    sitting = sittings[-1]
+    arrival_at = sitting[-1][1] if latest else sitting[0][1]
+    ranked = sorted((r for r in sitting if r[1] == arrival_at), key=lambda r: r[0], reverse=True)
+    best = ranked[0]
+    tied = [r[2] for r in ranked if abs(r[0] - best[0]) < 0.001 and abs(r[1] - best[1]) < 0.001]
+    if len({m.observation_id for m in tied}) > 1:
+        return EffectSelection(candidates=tied)
+    return EffectSelection(effect=best[2])
 
 
-def walk_back(effect: AttentionMoment, moments: list[AttentionMoment], edges: list[ProvenanceEdge]) -> WhyChain:
+def walk_back(effect: AttentionMoment, moments: list[AttentionMoment], edges: list[ProvenanceEdge], *,
+              infer_missing=None) -> WhyChain:
     """Prefer high confidence; stop at a real origin, reject cycles/future/stale quotes.
 
     Usually a single path; multiple clipboard sources are retained because a typed
@@ -152,6 +201,10 @@ def walk_back(effect: AttentionMoment, moments: list[AttentionMoment], edges: li
     def walk(node: AttentionMoment, depth: int):
         if depth >= max(0, T.WHY_CHAIN_DEPTH) or (node is not effect and is_origin(node)):
             return
+        if infer_missing is not None:
+            for edge in infer_missing(node.sighting_id):
+                if valid_edge(edge, by_id) and by_id[edge.source].at >= start and edge.confidence >= T.WHY_CHAIN_MIN_CONFIDENCE:
+                    incoming[edge.target].append(edge)
         parents = sorted(incoming[node.sighting_id], key=lambda e: (-e.confidence, e.gap_s, -e.source))
         # A post/media is an origin unless another message actually shares it.
         # A same-site visit transition alone must not carry unrelated earlier work
@@ -184,27 +237,48 @@ def walk_back(effect: AttentionMoment, moments: list[AttentionMoment], edges: li
     return WhyChain(effect, kept, ordered_edges, reason="observed provenance" if selected else "why not known")
 
 
-async def resolve_why(store: Store, question: str, *, plan: QueryPlan | None = None, hits=()) -> WhyChain:
+async def resolve_why(store: Store, question: str, *, plan: QueryPlan | None = None, hits=(),
+                      reference_at: float | None = None) -> WhyChain:
     """Read-only, no embeddings/planner/verifier/writer calls. Old stores work too."""
-    plan = plan or fallback_plan(question)
+    plan = plan or fallback_plan(question, reference_at=reference_at)
     if not T.PROVENANCE or not is_why(question, plan):
         return WhyChain(reason="not a why question")
-    effect = await locate_effect(store, question, plan, list(hits))
+    match = await locate_effect(store, question, plan, list(hits), reference_at=reference_at)
+    if match.candidates:
+        return WhyChain(candidates=match.candidates, reason="ambiguous effect; ask which visit")
+    effect = match.effect
     if effect is None:
         return WhyChain()
     start = effect.at - max(0, T.WHY_CHAIN_WINDOW_S)
-    moments = await store.attention_moments(start, effect.at)
+    # Include the first walked destination's full per-edge window for checkpoint
+    # freshness and window-local frequencies, even outside the chain's time bound.
+    moments = await store.attention_moments(start - max(0, T.PROVENANCE_WINDOW_S), effect.at)
     stored = await store.provenance_edges(start, effect.at, rules_key=rules_key())
     # Fill missing/stale destinations without writes. This makes migration/backfill
     # optional for a read-only diagnosis and handles captures waiting for maintenance.
     by_id = {m.sighting_id: m for m in moments}
     edges = [e for e in stored if valid_edge(e, by_id)]
-    have = {e.target for e in edges}
-    for moment in moments:
-        if moment.sighting_id not in have:
-            neighborhood = [m for m in moments if moment.at - T.PROVENANCE_WINDOW_S <= m.at <= moment.at]
-            edges += infer_edges(neighborhood, target_id=moment.sighting_id)
-    chain = walk_back(effect, moments, edges)
+    checkpoints = await store.provenance_checkpoints(start, effect.at, rules_key())
+    freshness = window_freshness(moments)
+    inference = None
+    checked = set()
+
+    def missing(target_id):
+        nonlocal inference
+        if target_id in checked:
+            return []
+        checked.add(target_id)
+        if checkpoints.get(target_id, float("-inf")) >= freshness[target_id]:
+            return []  # an empty, fresh checkpoint also proves inference ran
+        if inference is None:
+            inference = EdgeInference(moments)
+        # Remove stale stored parents before inferring this destination.
+        return infer_edges(moments, target_id=target_id, inference=inference)
+
+    # Only fresh persisted destinations are eligible; stale ones are inferred
+    # lazily by the same walk that chooses the chain's actual parents.
+    edges = [e for e in edges if checkpoints.get(e.target, float("-inf")) >= freshness[e.target]]
+    chain = walk_back(effect, moments, edges, infer_missing=missing)
     # Existing independently verified action trails complement the visit graph.
     claim_ids = [h.ref_id for h in hits if h.ref_kind == "claim" and h.action]
     if not claim_ids:
@@ -243,14 +317,18 @@ def chain_hits(chain: WhyChain) -> list[Hit]:
             via += "; effect"
         if context:
             via += "; " + "; ".join(context)
-        out.append(Hit("observation", moment.observation_id, f"{moment.app} — {moment.title}",
+        out.append(Hit("observation", moment.observation_id, safe_text(f"{moment.app} — {moment.title}"),
                        "\n".join(dict.fromkeys(quotes)), occurred_at=moment.at, occurred_to=moment.ended_at,
-                       url=moment.fields.get("url", ""), untrusted=True, via=via, confidence=chain.confidence))
+                       url=safe_text(moment.fields.get("url", "")), untrusted=True, via=safe_text(via), confidence=chain.confidence))
     return out
 
 
 def render_chain(chain: WhyChain, *, details: bool = True) -> str:
     if chain.effect is None:
+        if chain.candidates:
+            visits = "; ".join(f"{to_local(m.at):%Y-%m-%d %H:%M:%S} (sighting {m.sighting_id}, {safe_text(m.title)})"
+                               for m in chain.candidates)
+            return f"{chain.reason}: {visits}. Which visit did you mean?"
         return chain.reason
     by_id = {m.sighting_id: m for m in chain.moments}
     lines = [f"{chain.reason}; confidence={chain.confidence:.2f}",
@@ -266,4 +344,4 @@ def render_chain(chain: WhyChain, *, details: bool = True) -> str:
                       f"  target [{edge.target_field}]: {edge.target_quote}"]
     for trail in chain.trails:
         lines.append(f"verified action trail: obs {trail['src_id']} {trail['relation']} claim {trail['dst_id']}: {trail['reason']}")
-    return "\n".join(lines)
+    return safe_text("\n".join(lines))

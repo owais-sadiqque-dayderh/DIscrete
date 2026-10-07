@@ -23,9 +23,10 @@ from PIL import Image
 from .. import textkit as tk
 from ..aio import spawn
 from ..config import T, caption_endpoint, frames_dir
-from ..encryption import write_frame
+from ..encryption import EncryptionError, write_frame
 from ..models import ObservationDraft
 from ..perf import PERF, since_ms
+from ..store import Store
 from . import accessibility as ax
 from . import ocr
 from .browser import browser_url
@@ -53,8 +54,9 @@ def _novel_lines(ocr_text: str, ax_text: str) -> list[str]:
 
 
 class ScreenObserver:
-    def __init__(self, *, queue: asyncio.Queue, session: SessionTracker | None = None):
+    def __init__(self, *, queue: asyncio.Queue, session: SessionTracker | None = None, store: Store | None = None):
         self.queue = queue
+        self.store = store
         self.session = session or SessionTracker()
         self.dir = frames_dir()
         self.ep = caption_endpoint()
@@ -152,6 +154,8 @@ class ScreenObserver:
                 self._rotate()
         if self._pending is None:
             before = self._latest
+            if before is not None and denied(before[1].app, before[1].bundle_id, before[1].url):
+                before = None
             if cur is not None and before is not None and before[1].key != cur.key:
                 before = None  # the cached frame shows the page we just left, not this one
             self._pending = {
@@ -183,8 +187,16 @@ class ScreenObserver:
         while True:
             try:
                 ctx = await asyncio.to_thread(ax.window_context)
-                img = await asyncio.to_thread(self.grabber.grab, ctx.bounds, max_width=T.FRAME_MAX_WIDTH, window_id=ctx.window_id)
-                if img is not None:
+                url = ctx.url or await asyncio.to_thread(browser_url, ctx.app)
+                ctx = dataclasses.replace(ctx, url=url)
+                if denied(ctx.app, ctx.bundle_id, url):
+                    self._latest = None
+                    self._recent.clear()
+                    img = None
+                else:
+                    img = await asyncio.to_thread(self.grabber.grab, ctx.bounds,
+                                                  max_width=T.FRAME_MAX_WIDTH, window_id=ctx.window_id)
+                if img is not None and not denied(ctx.app, ctx.bundle_id, ctx.url):
                     # Only the newest frame keeps its native-resolution copy for OCR (a 5K
                     # window is ~44 MB): an older one, used by a rotated capture, is OCR'd at
                     # storage resolution.
@@ -202,8 +214,10 @@ class ScreenObserver:
     def _save(self, img: Image.Image | None, tag: str) -> str:
         if img is None:
             return ""
+        if self.store is None:
+            raise EncryptionError("Frame saving requires an open owning store.")
         path = self.dir / f"{int(time.time() * 1000)}_{tag}.jpg"
-        write_frame(path, img, quality=T.FRAME_JPEG_QUALITY)
+        write_frame(path, img, quality=T.FRAME_JPEG_QUALITY, encryption_state=self.store.frame_encryption)
         return str(path)
 
     # ----------------------------------------------------------------- flush
@@ -220,7 +234,8 @@ class ScreenObserver:
         if not pending:
             return
         ctx: ax.WindowContext = pending["before_ctx"]
-        own = next((img for img, c in reversed(self._recent) if c.key == ctx.key), None)
+        own = next((img for img, c in reversed(self._recent)
+                    if c.key == ctx.key and not denied(c.app, c.bundle_id, c.url)), None)
         after = own if own is not None else pending["before_img"]
         if after is None:
             self.stats["dropped_failed"] += 1  # degraded: no frame, but still segment the boundary
@@ -255,6 +270,11 @@ class ScreenObserver:
             # Before any text is read or any frame saved: a denied window leaves nothing.
             self.stats["denied"] += 1
             return
+        # Before frames belong to their frozen contexts, not the new destination.
+        # Unknown context is unsafe too (including direct/internal capture callers).
+        before_ctx = pending.get("before_ctx")
+        if before is not None and (before_ctx is None or denied(before_ctx.app, before_ctx.bundle_id, before_ctx.url)):
+            before = None
         if T.REDACT_SECRETS:  # title and URL now; the text once it is read
             meta = redact_capture(ctx.window_title, url, "", memory=self._secrets)
             ctx, url, meta_secret = dataclasses.replace(ctx, window_title=meta.title), meta.url, meta.drop_frame

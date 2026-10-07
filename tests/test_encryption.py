@@ -190,7 +190,7 @@ def test_frame_write_read_tamper_retention_and_plaintext_compatibility(tmp_path,
     monkeypatch.setenv("DISCRETE_DB", str(path))
     monkeypatch.setenv("DISCRETE_DATA_DIR", str(tmp_path))
     migration.migrate_encryption(path, root, operation="encrypt")
-    enc.write_frame(frame, Image.new("RGB", (32, 24), "blue"), quality=65)
+    enc.write_frame(frame, Image.new("RGB", (32, 24), "blue"), quality=65, encryption_state=enc.read_state(path))
     with enc.open_frame(frame) as image:
         assert image.size == (32, 24) and image.getpixel((0, 0))[2] > 240
     payload = frame.read_bytes()
@@ -298,7 +298,7 @@ async def test_pending_caption_reads_encrypted_frame_in_memory(tmp_path, keys, m
     root = tmp_path / "frames"
     root.mkdir()
     frame = root / "pending.jpg"
-    enc.write_frame(frame, Image.new("RGB", (32, 24), "red"), quality=65)
+    enc.write_frame(frame, Image.new("RGB", (32, 24), "red"), quality=65, encryption_state=store.frame_encryption)
     oid, _ = await store.add_observation(ObservationDraft(app="Code", screen_text="reading notes", session_id="test",
                                                         frame_path=str(frame), enrich_state="pending"))
     enricher = Enricher(store)

@@ -505,6 +505,7 @@ class T:
     WHY_CHAIN_MIN_CONFIDENCE = _typed("WHY_CHAIN_MIN_CONFIDENCE", 0.55)
     WHY_EFFECT_POOL = _typed("WHY_EFFECT_POOL", 300)
     WHY_TIME_TOLERANCE_S = _typed("WHY_TIME_TOLERANCE_S", 180.0)
+    WHY_SITTING_GAP_S = _typed("WHY_SITTING_GAP_S", 10800.0)
     # Enumeration ("list all …") bypasses TOP_K/MMR: it returns every distinct page.
     ENUMERATE_MAX = _typed("ENUMERATE_MAX", 200)
     ENUMERATE_POOL = _typed("ENUMERATE_POOL", 400)

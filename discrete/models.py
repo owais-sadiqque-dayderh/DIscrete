@@ -207,6 +207,7 @@ class WhyChain:
     edges: list[ProvenanceEdge] = field(default_factory=list)
     trails: list[dict] = field(default_factory=list)
     reason: str = "effect not found"
+    candidates: list[AttentionMoment] = field(default_factory=list)
 
     @property
     def confidence(self) -> float:

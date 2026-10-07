@@ -57,7 +57,7 @@ class Runtime:
         # Set when a row is stored or a caption finishes: segmentation may advance.
         self._wake = asyncio.Event()
         self.session = SessionTracker()
-        self.observer = ScreenObserver(queue=self.queue, session=self.session)
+        self.observer = ScreenObserver(queue=self.queue, session=self.session, store=store)
         self.enricher = Enricher(store, on_done=self._wake.set)
         self.episodes = EpisodeTracker(store)
         self.pipeline = ProcessPipeline(store)

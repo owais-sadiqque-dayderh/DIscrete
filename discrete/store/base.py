@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 
 from ..config import db_path, embedding_endpoint
+from ..encryption import EncryptionError, EncryptionState
 from ..timeutil import now
 from .db import connect
 
@@ -49,7 +50,18 @@ class StoreBase:
         except BaseException:
             conn.close()
             raise
-        return cls(conn, rconn)
+        store = cls(conn, rconn)
+        if path == ":memory:":
+            store._frame_encryption = None
+        else:
+            store._frame_encryption = conn._discrete_encryption_state
+        return store
+
+    @property
+    def frame_encryption(self) -> EncryptionState | None:
+        if not hasattr(self, "_frame_encryption"):
+            raise EncryptionError("Frame encryption requires an open owning store.")
+        return self._frame_encryption
 
     async def close(self) -> None:
         async with self._lock:

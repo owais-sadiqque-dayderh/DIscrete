@@ -104,6 +104,10 @@ def format_enumerate_answer(result: RetrievalResult) -> str:
 def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> str:
     """Evidence pack for the writer: typed, time-stamped, id-tagged, budgeted."""
     max_chars = max_chars or T.BUBBLE_CONTEXT_CHARS
+    if result.why_chain and result.why_chain.candidates:
+        from ..retrieval.why import render_chain
+
+        return render_chain(result.why_chain)
     if result.plan.intent == "enumerate":
         # One compact line per page, time-ordered, so the whole trail fits (planS3 §17).
         if not result.hits:
