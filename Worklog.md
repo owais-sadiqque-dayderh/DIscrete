@@ -432,6 +432,20 @@ This audit shows where each proposed feature starts from. Code paths are relativ
 - **Integration task** (Codex, `…exp-discrete-integrate-r1`): remove #11 cleanly from shared files; `n/a` for
   missing telemetry; `redraft.py` clears tasks and respects merged-episode tombstones; whole-suite interaction
   fixes. Next: an independent Codex review of the combined diff, then commits.
+- **Integrated and committed** `ecc870e` (#8 + #12; #11 removed, report kept): 328 tests, ruff clean.
+  - `check` reports `n/a` when telemetry is missing.
+  - `redraft.py` clears tasks and keeps merged-episode tombstones.
+  - `.env.example` documents all seven #8 settings.
+- **Evaluation made parallel** (user asked why commands take so long). The time is OpenRouter calls: ~16 s per
+  answer plus a judge call, ~30 s per drafted episode, minutes per dream.
+  - The chain ran one job after another. `bench/private/eval_parallel.sh` (frozen worktree) runs all seven jobs at
+    once: g46-branch, -geminiverify, base+branchretrieval, live-base, live-branch, and the two v2 jobs that wait for
+    their re-drafts.
+- **Bug found:** the dream on `g46/branch-dream.db` lost its profile to an HTTP 503 (`service_overloaded`), so
+  g46-branch is scored **without a profile** (affects its 3 profile questions).
+  - Codex is making every background model call share one retry policy (`…exp-discrete-dream-retry-1`).
+- **Independent review** of `a73e1d1` + `ecc870e` by Codex gpt-6-sol, xhigh, report only:
+  `…exp-discrete-review-r2`.
 
 ---
 
