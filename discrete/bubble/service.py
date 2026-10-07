@@ -7,25 +7,22 @@ registered as agent output, so DIscrete never models its own answers.
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import time
 
 from ..aio import spawn
 from ..capture import accessibility as ax
-from ..capture.frames import FrameGrabber
 from ..capture.privacy import denied
 from ..capture.redact import redact
 from ..capture.suppress import hold, note_agent_output, release
-from ..config import T, bubble_vision_endpoint
-from ..llm import EXPECTED_ERRORS, NotConfigured, complete_json, embed, image_part, interactive
+from ..config import T
+from ..llm import EXPECTED_ERRORS, NotConfigured, embed, interactive
 from ..perf import PERF, since_ms
 from ..retrieval.gaps import maybe_record_gap
 from ..store import Store
 from .engine import BubbleEngine, EmptyField, field_query
 from .keys import HotkeyTap, type_text
 from .overlay_client import Overlay
-from .prompts import FIELD_READ_PROMPT
 
 log = logging.getLogger("discrete.bubble")
 
@@ -116,35 +113,11 @@ class BubbleService:
                 return
 
     async def _read_field(self, snap: ax.FocusSnapshot) -> tuple[str, str]:
-        """(text up to the caret, field description): AX first, vision second."""
+        """(text up to the caret, field description): AX only; unapproved pixels never leave the device."""
         if snap.has_text:
             return snap.text_to_caret, snap.description or snap.role or "text field"
-        ep = bubble_vision_endpoint()
-        if not ep.configured or not snap.window_bounds:
-            return "", ""
-        self.overlay.status("Reading the screen")
-
-        def shoot() -> bytes:
-            g = FrameGrabber()
-            try:
-                img = g.grab(snap.window_bounds, max_width=1280, window_id=snap.window_id)
-            finally:
-                g.close()
-            if img is None:
-                return b""
-            buf = io.BytesIO()
-            img.save(buf, "JPEG", quality=75)
-            return buf.getvalue()
-
-        jpeg = await asyncio.to_thread(shoot)
-        if not jpeg:
-            return "", ""
-        with interactive():
-            data = await complete_json(ep, [{"role": "user", "content": [
-                image_part(jpeg, detail="high"), {"type": "text", "text": FIELD_READ_PROMPT}]}], max_tokens=800)
-        if not isinstance(data, dict):
-            return "", ""
-        return str(data.get("current_text") or ""), str(data.get("field_description") or "")
+        # Vision is disabled until each outgoing image has local privacy approval.
+        return "", ""
 
     async def _run(self, snap: ax.FocusSnapshot) -> None:
         self.stats["triggers"] += 1
