@@ -205,3 +205,25 @@ async def test_a_crashing_step_neither_stops_the_others_nor_reruns_every_minute(
     assert float(await store.get_meta("last_dream", "0")) > 0
     assert ids
 
+
+async def test_quote_sample_does_not_erase_support_membership(store, fake, monkeypatch):
+    monkeypatch.setattr(T, "EVIDENCE_MAX_SUPPORTS", 1)
+    ids = await _football(store)
+    fake.dream = {"patterns": [_pattern(ids)], "audit": []}
+    await run_dream(store)
+    [p] = await store.live_claims(kind="pattern")
+    st = (await store.strengths([p["id"]]))[p["id"]]
+    assert (st.episodes, st.days) == (3, 3)
+    assert len(await store.evidence_for_claim(p["id"])) == 1
+
+
+async def test_one_reinforced_claim_can_supply_separate_occasions(store, fake):
+    ids = await _football(store)
+    [merged] = await store.consolidate_cluster(await store.get_claims(ids), [{
+        "text": "The user checks football scores on FotMob", "input_ids": ids}])
+    fake.dream = {"patterns": [_pattern([merged], "The user regularly checks football scores", "habit")], "audit": []}
+    # Three distinct evidence days, but frequency language requires still more days.
+    report = await run_dream(store)
+    assert report["patterns"]["rejected"] == {"frequency_overclaim": 1}
+    fake.dream = {"patterns": [_pattern([merged], category="habit")], "audit": []}
+    assert (await run_dream(store))["patterns"]["added"] == 1

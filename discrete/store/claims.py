@@ -60,7 +60,7 @@ class ClaimsMixin(HistoryMixin):
         )
 
     def _cap_evidence(self, conn, claim_id: int) -> None:
-        """planS2 §9: ≤ EVIDENCE_MAX_SUPPORTS supports; cooccurs dropped once ≥3 supports."""
+        """Keep full support membership; only model-facing quote samples are capped."""
         sup = conn.execute(
             "SELECT observation_id, created_at FROM evidence WHERE claim_id=? AND relation='supports' "
             "ORDER BY created_at DESC",
@@ -68,9 +68,6 @@ class ClaimsMixin(HistoryMixin):
         ).fetchall()
         if len(sup) >= 3:
             conn.execute("DELETE FROM evidence WHERE claim_id=? AND relation='cooccurs'", (claim_id,))
-        if len(sup) > T.EVIDENCE_MAX_SUPPORTS:
-            for r in sup[T.EVIDENCE_MAX_SUPPORTS:]:
-                conn.execute("DELETE FROM evidence WHERE claim_id=? AND observation_id=?", (claim_id, r[0]))
 
     def _insert_claim(self, conn, draft: ClaimDraft, *, lineage_id: str, version: int,
                       refines_id: int | None = None, invalidates_id: int | None = None,
@@ -180,7 +177,8 @@ class ClaimsMixin(HistoryMixin):
 
     async def evidence_for_claim(self, claim_id: int) -> list[sqlite3.Row]:
         return await self.q(
-            "SELECT * FROM evidence WHERE claim_id=? ORDER BY relation='supports' DESC, created_at", (claim_id,)
+            "SELECT * FROM evidence WHERE claim_id=? ORDER BY relation='supports' DESC, created_at DESC LIMIT ?",
+            (claim_id, T.EVIDENCE_MAX_SUPPORTS)
         )
 
     async def consolidate_cluster(self, cluster: list[sqlite3.Row], outputs: list[dict], *,

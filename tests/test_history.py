@@ -124,7 +124,7 @@ async def test_draft_decisions_are_logged_and_reinforcement_is_undoable(store):
     assert (await store.get_claim(cid))["confidence"] == pytest.approx(before)
 
 
-async def test_reverting_a_reinforce_restores_evidence_the_cap_evicted(store, monkeypatch):
+async def test_reverting_a_reinforce_preserves_full_support_membership(store, monkeypatch):
     """Review #3: the cap's evicted rows were lost for good on revert."""
     from discrete.config import T
 
@@ -141,7 +141,8 @@ async def test_reverting_a_reinforce_restores_evidence_the_cap_evicted(store, mo
             return store._log_event(conn, "reinforce", "draft", claim_id=cid, changes=[change])
 
     eid = await store._call(_go)
-    assert [r["observation_id"] for r in await store.evidence_for_claim(cid)] == [new]  # old one evicted
+    assert [r["observation_id"] for r in await store.evidence_for_claim(cid)] == [new]  # quote sample
+    assert {r[0] for r in await store.q("SELECT observation_id FROM evidence WHERE claim_id=?", (cid,))} == {*old, new}
     await store.revert_event(eid)
     assert [r["observation_id"] for r in await store.evidence_for_claim(cid)] == old
 

@@ -87,6 +87,17 @@ class BeliefsMixin(LinksMixin):
                 out.setdefault(cid, set()).add(ep)
         return out
 
+    async def support_times(self, claim_ids: Sequence[int]) -> dict[int, list[float]]:
+        """Full supporting occurrence times, independent of the quote sample."""
+        if not claim_ids:
+            return {}
+        out: dict[int, list[float]] = {}
+        for cid, at in await self.q(
+                f"SELECT e.claim_id, o.started_at FROM evidence e JOIN observations o ON o.id=e.observation_id "
+                f"WHERE e.relation='supports' AND e.claim_id IN ({_ph(claim_ids)})", list(claim_ids)):
+            out.setdefault(cid, []).append(at)
+        return out
+
     # ------------------------------------------------------------------ patterns
 
     async def add_pattern(self, text: str, category: str, support: Sequence[int], *, reason: str,

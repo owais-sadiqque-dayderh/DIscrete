@@ -197,7 +197,7 @@ def _render(rows, episodes: dict[int, set[int]]) -> str:
 
 
 def check_pattern(item: dict, by_id: dict, episodes: dict[int, set[int]], *,
-                  pattern_ids: set[int]) -> tuple[dict | None, str]:
+                  pattern_ids: set[int], times: dict[int, list[float]] | None = None) -> tuple[dict | None, str]:
     """Code-side gate for one proposed pattern; returns (pattern, "") or (None, why)."""
     text = str(item.get("text") or "").strip()
     category = str(item.get("category") or "").lower()
@@ -214,12 +214,13 @@ def check_pattern(item: dict, by_id: dict, episodes: dict[int, set[int]], *,
     if any(i in pattern_ids for i in support):
         return None, "rests_on_pattern"  # inductions rest on drafted memories only
     eps = set().union(*(episodes.get(i, set()) for i in support))
-    days = {day_key(by_id[i]["occurred_from"]) for i in support}
+    moments = [t for i in support for t in ((times or {}).get(i) or [by_id[i]["occurred_from"]])]
+    days = {day_key(t) for t in moments}
     if len(eps) < T.DREAM_MIN_EPISODES:
         return None, "too_few_episodes"
     if category in _DAY_CATEGORIES and len(days) < T.DREAM_MIN_DAYS:
         return None, "too_few_days"
-    if occasions([by_id[i]["occurred_from"] for i in support]) < T.DREAM_MIN_OCCASIONS:
+    if occasions(moments) < T.DREAM_MIN_OCCASIONS:
         return None, "single_occasion"
     if _FREQUENCY.search(text) and len(days) < T.DREAM_FREQUENCY_DAYS:
         return None, "frequency_overclaim"
@@ -285,10 +286,11 @@ async def _patterns(store: Store, run_id: str) -> dict:
                 report["retired"] += 1
         else:
             patterns.append(p)
-    if len(memories) < T.DREAM_MIN_EPISODES:
+    if not memories:
         return report | {"skipped": "too few memories"}
     by_id = {r["id"]: r for r in rows}
     episodes = await store.episodes_of_claims(list(by_id))
+    times = await store.support_times(list(by_id))
     prompt = DREAM_PROMPT.format(
         memories=_render(memories, episodes), attention=await attention_context(store),
         patterns="\n".join(f"[{p['id']}] ({p['context'] or 'pattern'}) {p['text']}" for p in patterns) or "(none)",
@@ -304,7 +306,7 @@ async def _patterns(store: Store, run_id: str) -> dict:
         if not isinstance(item, dict):
             continue
         report["proposed"] += 1
-        pat, why = check_pattern(item, by_id, episodes, pattern_ids=pattern_ids)
+        pat, why = check_pattern(item, by_id, episodes, pattern_ids=pattern_ids, times=times)
         if pat is None:
             reject(why)
             continue
