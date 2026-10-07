@@ -71,13 +71,13 @@ class CorrectionsMixin(ClaimsMixin):
                            for r in rows if r["status"] == "live"]
                 self._log_event(conn, "erase", "user", changes=changes, reason="erased")
                 hashes = {r["id"]: "h:" + hashlib.sha256(tk.norm_key(r["text"]).encode()).hexdigest() for r in rows}
+                # No vector either: embeddings can be partly inverted to text. The cost is that only
+                # the exact wording stays suppressed; a paraphrase from the kept observations can return.
                 for r in rows:
-                    vec = conn.execute("SELECT vector FROM embeddings WHERE ref_kind='claim' AND ref_id=?",
-                                       (r["id"],)).fetchone()
                     conn.execute("DELETE FROM suppressions WHERE claim_id=?", (r["id"],))
                     conn.execute("INSERT INTO suppressions(kind, text, norm_key, vector, claim_id, event_id, created_at)"
-                                 " VALUES (?,?,?,?,?,NULL,?)",
-                                 (r["kind"], "", hashes[r["id"]], vec[0] if vec else None, r["id"], ts))
+                                 " VALUES (?,?,?,NULL,?,NULL,?)",
+                                 (r["kind"], "", hashes[r["id"]], r["id"], ts))
                 # Events (and their redo payloads) that carried the content lose it; they can no longer be reverted.
                 events = [e[0] for e in conn.execute(
                     f"SELECT DISTINCT event_id FROM memory_event_refs WHERE claim_id IN ({_ph(ids)})", ids)]

@@ -301,6 +301,8 @@ async def test_erase_removes_content_everywhere_and_blocks_relearning(store):
     assert "zebrafish" not in blob and "tea" in blob
     assert not await store.q("SELECT 1 FROM claims_fts WHERE claims_fts MATCH 'zebrafish'")
     assert await store.suppressed("preference", "The user keeps zebrafish secretly")
+    assert [r[0] for r in await store.q("SELECT vector FROM suppressions WHERE claim_id=?", (cid,))] == [None]
+    assert not await store.q("SELECT 1 FROM embeddings WHERE ref_kind='claim' AND ref_id=?", (cid,))
     event = (await store.recent_events(op="forget"))[0]
     with pytest.raises(RevertConflict):
         await store.revert_event(event["id"])
