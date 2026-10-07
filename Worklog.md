@@ -1101,3 +1101,22 @@ user's running app in `exp_discrete` is untouched. Brief: `../hardening_2026-10-
   W4: dream-test fix, ME-07, PR-07, ME-05 store side committed + in-progress claims/history; W5: PR-03, QA-01, QA-02
   committed + untracked tests). Relaunched as round 2 on claudeAgent_kaustubh: W5 Opus medium, W2 and W4 Sonnet 5.5
   medium (to spare that account's 5h limit). IDs in TASKS.json. If kaustubh runs out too, resume on Codex after 05:53.
+- 02:5x IST: **W2 runtime done** (kaustubh Sonnet): RT-01 a4c4a31, RT-02 6827360, RT-03 6510695, RT-04 8e41876, cost
+  telemetry 042c803, EV-01 1053f56; 761 pass / 2 fail (date-dependent dream test owned by W4; pre-existing 0.3 s timing
+  assert in test_provenance_review). Report `../hardening_2026-10-08/W2-runtime.md`. My review notes for integration:
+  (a) jarvis no longer warns when the *other* checkout is running on the same Option+Tab hotkey — add a warning (no kill);
+  (b) the new `instance stop` uses a data-dir lease the currently running old daemon doesn't hold → the user must stop
+  the running app with the OLD jarvis-exp before switching, or add a legacy-pidfile fallback; (c) strict config may
+  reject a value in the user's .env — validate the real .env (without printing values) before handing over.
+- ~03:00 IST: **W4 evolution done** (kaustubh Sonnet): ME-06 0e7122d, ME-11 463266b, dream watermark db5abc6, ME-09
+  partial 58f9435 (entity pages cleared/rebuilt on withdrawal; digest/profile prose verification not done), PR-08
+  3b5d3d8 + d940abf (`forget` wording honest; new `discrete erase ID --yes` purges claim text/quotes/links/FTS/embeddings/
+  history payloads/profile snapshots; source observations, screenshots, summaries and export git history NOT erased).
+  The dream-test change is test-only (two sittings straddle midnight before local dawn). Report `W4-evolution.md`.
+- **Integration (`feat/production-hardening`, worktree `../exp_discrete_hardening`):** merged W2 and W4 (one trivial
+  conflict in tests/test_bubble.py). 779 pass, 1 fail = pre-existing timing assert
+  (`test_dense_provenance_backfill_and_why_have_bounded_cost`, 0.3 s budget; slower under 5 concurrent agents).
+  Ruff clean. The user's real exp .env passes the new strict config (checked without printing values).
+  My follow-up dcef089 in jarvis: stop also kills a lease-less daemon started by an older jarvis (matched by this
+  checkout's exact binary path — verified it matches the running exp daemon, not other checkouts); start refuses while
+  such a daemon runs and warns (never kills) when another checkout holds Option+Tab.
