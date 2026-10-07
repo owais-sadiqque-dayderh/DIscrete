@@ -202,7 +202,8 @@ async def test_a_crashing_step_neither_stops_the_others_nor_reruns_every_minute(
     fake.profile = {"sections": []}
     report = await run_dream(store)
     assert "error" in report["patterns"] and "stale" in report and "error" not in report["stale"]
-    assert float(await store.get_meta("last_dream", "0")) > 0
+    assert float(await store.get_meta("last_dream", "0")) == 0  # a failed run keeps its episodes pending
+    assert float(await store.get_meta("last_dream_attempt", "0")) > 0  # but is not retried every minute
     assert ids
 
 
@@ -294,3 +295,15 @@ async def test_merge_remaps_equivalent_pattern_and_profile_support(store):
     await store.revert_event(event["id"])
     assert set(json.loads((await store.get_claim(p))["derived_from"])) == set(ids)
     assert (await store.get_profile())["sections"][0]["points"][0]["claims"] == [ids[0]]
+
+
+async def test_failed_dream_keeps_episodes_pending_but_waits_an_interval(store, fake, monkeypatch):
+    monkeypatch.setattr(T, "DREAM_INTERVAL_MIN", 60.0)
+    monkeypatch.setattr(T, "DREAM_MIN_NEW_EPISODES", 1)
+    await _memory(store, "a", day=0, episode=60)
+    assert await dr.due(store)
+    fake.dream = ["not", "an", "object"]
+    await run_dream(store)
+    assert not await dr.due(store)  # waits the interval
+    await store.set_meta("last_dream_attempt", str(now() - 3700))
+    assert await dr.due(store)  # then the same episodes are tried again

@@ -426,7 +426,8 @@ async def test_real_profile_recovers_and_exhausted_dream_step_does_not_block_oth
     assert all("error" not in report[step] for step in ("conflicts", "stale", "profile"))
     assert profile_calls == 2 and pattern_calls == T.LLM_PROVIDER_RETRIES + 1
     assert report["profile"]["points"] == 1
-    assert float(await store.get_meta("last_dream", "0")) > 0
+    assert float(await store.get_meta("last_dream", "0")) == 0
+    assert float(await store.get_meta("last_dream_attempt", "0")) > 0
 
 
 async def test_sdk_hidden_retries_are_disabled():

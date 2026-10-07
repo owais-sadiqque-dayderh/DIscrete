@@ -124,7 +124,8 @@ async def due(store: Store) -> bool:
     if T.DREAM_INTERVAL_MIN <= 0:
         return False
     last = float(await store.get_meta("last_dream", "0") or 0)
-    if now() - last < T.DREAM_INTERVAL_MIN * 60:
+    tried = float(await store.get_meta("last_dream_attempt", "0") or 0)
+    if now() - max(last, tried) < T.DREAM_INTERVAL_MIN * 60:
         return False
     return await store.new_episodes_since(last) >= T.DREAM_MIN_NEW_EPISODES
 
@@ -146,8 +147,11 @@ async def run_dream(store: Store) -> dict:
                     log.exception("dream step %s crashed", name)
                     report[name] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
     finally:
-        # Even a failed dream waits a full interval: a crash must not re-run paid steps every minute.
-        await store.set_meta("last_dream", str(now()))
+        # Even a failed dream waits a full interval (a crash must not re-run paid steps every minute),
+        # but only a clean run moves the watermark, so its unprocessed episodes are dreamed next time.
+        await store.set_meta("last_dream_attempt", str(now()))
+        if not any(isinstance(r, dict) and "error" in r for r in report.values()):
+            await store.set_meta("last_dream", str(now()))
     if (out := memory_export_dir()) is not None:
         # The Markdown mirror follows each dream, so its git log is the history of beliefs.
         from ..export import export_markdown
