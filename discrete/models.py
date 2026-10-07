@@ -104,6 +104,8 @@ class QueryPlan:
     # Guarded deterministic activity aggregates using the page store.
     page_operation: str = ""
     page_search: str = ""
+    # Completion questions need an explicit evidence check before naming an action.
+    premise_check: bool = False
 
 
 @dataclass

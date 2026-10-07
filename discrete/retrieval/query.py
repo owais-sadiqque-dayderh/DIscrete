@@ -46,6 +46,19 @@ _ABOUT_USER = re.compile(
 _TIME_SPENT = re.compile(r"\b(?:how much time|how long (?:did|do|have) i (?:spend|spent|been)|most (?:of my )?time|"
                          r"time spent|spend(?:ing)? (?:my |the most )?time|spent (?:the )?most)\b", re.I)
 _EDIT_VERBS = ("fix", "rewrite", "complete", "summarize", "translate", "format", "rephrase", "shorten")
+# Match the user's completion question, not an action mentioned later in a recall question.
+_COMPLETED_ACTION = (
+    r"(?:book(?:ed)?|order(?:ed)?|buy|bought|pay|paid|send|sent|submit(?:ted)?|"
+    r"switch(?:ed)?|install(?:ed)?|subscribe(?:d)?|reply|replied|purchase(?:d)?)"
+)
+_PREMISE_CLOSED = re.compile(
+    r"^\s*(?:did|have|had)\s+i\s+(?:(?:actually|really)\s+)?" + _COMPLETED_ACTION + r"\b", re.I)
+_PREMISE_ACTUAL = re.compile(
+    r"\b(?:did|have|had)\s+i\s+(?:actually|really)\s+" + _COMPLETED_ACTION + r"\b", re.I)
+_PREMISE_CHOICE = re.compile(
+    r"^\s*(?:which|what)\b[^?]*\b(?:did|have|had)\s+i\s+" + _COMPLETED_ACTION
+    + r"\b[^?]*\bor\b", re.I)
+_PREMISE_TEMPORAL = re.compile(r"^\s*(?:when\b|what time\b|how (?:long|recently)\b)", re.I)
 # The request's own scaffolding. Searching for "list" or "opened" matches any row that
 # says so (a todo list), not the pages being asked about (insights.md §7.36).
 _ENUM_SCAFFOLD = frozenset(
@@ -60,6 +73,13 @@ def strip_scaffold(text: str) -> str:
 
 def is_why(text: str, plan: QueryPlan | None = None) -> bool:
     return bool((plan and plan.intent == "why") or _WHY.search(text))
+
+
+def is_premise_question(text: str) -> bool:
+    """Completion checks (including either/or choices), excluding temporal recall."""
+    if _PREMISE_TEMPORAL.search(text) or is_why(text):
+        return False
+    return bool(_PREMISE_CLOSED.search(text) or _PREMISE_ACTUAL.search(text) or _PREMISE_CHOICE.search(text))
 
 
 KIND_VOCAB = {
@@ -203,7 +223,8 @@ def fallback_plan(text: str, *, reference_at: float | None = None, relative_even
                      interval=interval, entity_kind_filter=kind, needs_store=intent != "edit",
                      about_user=intent not in ("edit", "continuation") and bool(_ABOUT_USER.search(text)),
                      time_spent=intent not in ("edit", "continuation") and bool(_TIME_SPENT.search(text)),
-                     page_operation=operation, page_search=page_search)
+                     page_operation=operation, page_search=page_search,
+                     premise_check=intent not in ("edit", "continuation") and is_premise_question(text))
     if isinstance(plan, EventQueryPlan):
         plan.anchor = anchor
     return plan

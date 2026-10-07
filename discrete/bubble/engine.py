@@ -29,7 +29,7 @@ from ..retrieval.grounding import GroundingDecision, evaluate
 from ..retrieval.hybrid import retrieve
 from ..store import Store
 from ..timeutil import now, to_local
-from .prompts import MODE_INSTRUCTIONS, WRITER_SYSTEM, WRITER_USER
+from .prompts import MODE_INSTRUCTIONS, PREMISE_INSTRUCTION, WRITER_SYSTEM, WRITER_USER
 
 _PARA = re.compile(r"\n\s*\n")
 _SENT_START = re.compile(r"(?<=[.!?])\s+")
@@ -205,6 +205,8 @@ class BubbleEngine:
 
     def messages(self, p: Prepared) -> list[dict]:
         instruction = MODE_INSTRUCTIONS.get(p.mode, MODE_INSTRUCTIONS["grounded"])
+        if p.result.plan.premise_check:
+            instruction += "\n" + PREMISE_INSTRUCTION
         records = "(not needed)" if p.mode == "edit" else render_records(p.result)
         return [
             {"role": "system", "content": WRITER_SYSTEM.format(user_name=self.user_name)},

@@ -35,7 +35,12 @@ directly supported negative answer. Exclude merely related topics or numbers.
 Preserve actor, negation, dates, scope and uncertainty. A calculation does not
 establish what its numbers represent. Reading a product page does not establish
 ownership, purchase, use or preference. An instruction to act does not establish
-completion. Third-party statements and test personas are not facts about the
+completion. A button label, checkout, form or comparison supports viewed/selected,
+not booked, ordered, bought, paid, sent, submitted, switched, installed, subscribed
+or replied. Require completion evidence: confirmation, receipt, success message,
+sent status, order placed, thank-you page, changed config or command output.
+An offer to explain or compare does not support the explanation or comparison.
+Third-party statements and test personas are not facts about the
 account owner. For lists, include every matching item. For personal preferences,
 require an attributable statement or a supported preference claim. If no record
 answers the question, return an empty list. Never use outside knowledge.
