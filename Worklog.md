@@ -950,3 +950,9 @@ Sources: Cognition "agent memory repo" (cognition.com/agent-memory-repo), Hindsi
 - temporal-anchor-r1 still running (it edits discrete/retrieval/*; don't commit those files until it reports).
 - bca21cf: event-anchored temporal (Codex temporal-anchor-r1 + my guard). Model-free anchors on live1006: "stopped DIscrete with jarvis stop" -> Terminal #203 22:37:17, next Finder .cache -> frames -> DB Browser (matches golden note); "finished Helium setup" -> "Ready to browse?" 22:24:33, next GitHub (matches). My guard: no anchor for clock/date phrases ("after midnight on October 1" stays an interval) or when the subject isn't the user ("what did Yacine reply after I sent the PDF" stays recall/refusal). 691 tests.
 - Next: when round 3 finishes, run round 4 @ bca21cf (all fixes) on live-branch, live-branch-v2, g46-branch-v2 (+ g46-base+branchretrieval) and rejudge; then the final brief.
+
+### ~15:15 IST — round 3 results (0b7cac2) + final plan
+- live-branch-r3-rj 0.667 (why **6/6**, unanswerable 3/5); live-branch-v2-r3-rj **0.724** (why 5/6, profile 3/3, unanswerable 4/4); g46-branch-v2-r3-rj 0.870 (vs 0.911 r1; per-question diff = writer variance: 2 losses, 1 gain).
+- Writer over-claims completion ("You booked with Etihad" from a "Book with Etihad" button; "did I switch to A or B" not answered) -> Codex completion-evidence-r1 (prompt rule + premise-question flag + verifier rule).
+- Variance: single runs of 30-46 questions swing ±1-2 questions. The final round repeats runs: `../exp_discrete_eval/bench/private/eval_final.sh` (live main x2, live branch-v2 x2, live branch old-drafts, g46 main, g46 branch; same harness; main via --code ../exp_discrete_main). Check out the final commit in exp_discrete_eval first.
+- OpenRouter credit at 15:12: **$4.99** remaining (core key). Final round est. $1.5-2.
