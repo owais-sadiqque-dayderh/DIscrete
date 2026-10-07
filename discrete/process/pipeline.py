@@ -250,18 +250,22 @@ class ProcessPipeline:
         return out
 
     async def _action_write(self, cd: ClaimDraft) -> ClaimWrite:
-        """An action already remembered (the same verb on the same thing, close in time:
-        a download page and then the file in Finder, or two episodes cut from one task)
-        reinforces the earlier claim instead of adding a duplicate. Other events are new."""
-        if not cd.action:
+        """Reinforce only an identical proposition citing the same occurrence.
+
+        Until actions have structured argument/confirmation IDs, similarity cannot
+        establish identity: a different recipient or a repeated send is a new event.
+        """
+        if not cd.action or not cd.evidence:
             return ClaimWrite(cd)
-        mine = _thing_tokens(cd.text)
+        own = {e["observation_id"] for e in cd.evidence}
         for row in await self.store.q(
                 "SELECT id, text FROM claims WHERE status='live' AND kind='event' AND action=? "
                 "AND occurred_from BETWEEN ? AND ?",
                 (cd.action, cd.occurred_from - T.ACTION_DEDUP_WINDOW_S, cd.occurred_to + T.ACTION_DEDUP_WINDOW_S)):
-            theirs = _thing_tokens(row["text"])
-            if mine and theirs and len(mine & theirs) / len(mine | theirs) >= T.ACTION_DEDUP_JACCARD:
+            if tk.norm_key(cd.text) != tk.norm_key(row["text"]):
+                continue
+            evidence = await self.store.evidence_for_claim(row["id"])
+            if own & {e["observation_id"] for e in evidence}:
                 return ClaimWrite(cd, operation="reinforced", target_id=row["id"])
         return ClaimWrite(cd)
 
