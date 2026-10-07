@@ -286,6 +286,9 @@ class T:
     VLM_MAX_WIDTH = _typed("VLM_MAX_WIDTH", 1024)
     VLM_IMAGE_DETAIL = _typed("VLM_IMAGE_DETAIL", "low")
     SELF_APPS = [s.lower() for s in _typed("SELF_APPS", [])]
+    # Never watched at all: nothing stored, Bubble off there (capture/privacy.py).
+    DENIED_APPS = _typed("DENIED_APPS", [])
+    DENIED_SITES = _typed("DENIED_SITES", [])
     SELF_WINDOW_PATTERNS = [s.lower() for s in _typed("SELF_WINDOW_PATTERNS", ["bin/discrete", "discrete run"])]
     CANVAS_APPS = [s.lower() for s in _typed(
         "CANVAS_APPS",
@@ -320,7 +323,14 @@ class T:
     OUTBOX_MAX_ATTEMPTS = _typed("OUTBOX_MAX_ATTEMPTS", 5)
     CANDIDATE_LIMIT = _typed("CANDIDATE_LIMIT", 8)
     RRF_K = _typed("RRF_K", 60.0)
-    CONSOLIDATION_INTERVAL_S = _typed("CONSOLIDATION_INTERVAL_S", 3600.0)
+    # In minutes when CONSOLIDATION_INTERVAL_MIN is set (it wins); the maintenance loop
+    # checks once a minute, so that is the finest step that means anything.
+    CONSOLIDATION_INTERVAL_MIN = _typed("CONSOLIDATION_INTERVAL_MIN", 0.0)
+    CONSOLIDATION_INTERVAL_S = (
+        CONSOLIDATION_INTERVAL_MIN * 60.0
+        if CONSOLIDATION_INTERVAL_MIN > 0
+        else _typed("CONSOLIDATION_INTERVAL_S", 3600.0)
+    )
     CONSOLIDATE_SIM = _typed("CONSOLIDATE_SIM", 0.82)
     CONSOLIDATE_MAX_CLUSTER = _typed("CONSOLIDATE_MAX_CLUSTER", 8)
     LINEAGE_MAX_VERSIONS = _typed("LINEAGE_MAX_VERSIONS", 12)

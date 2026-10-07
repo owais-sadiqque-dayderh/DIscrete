@@ -14,6 +14,7 @@ import time
 from ..aio import spawn
 from ..capture import accessibility as ax
 from ..capture.frames import FrameGrabber
+from ..capture.privacy import denied
 from ..capture.suppress import hold, note_agent_output, release
 from ..config import T, bubble_vision_endpoint
 from ..llm import EXPECTED_ERRORS, NotConfigured, complete_json, embed, image_part
@@ -150,6 +151,10 @@ class BubbleService:
         self.overlay.show(snap.caret)
         typed = ""
         try:
+            if denied(snap.app, url=snap.url):
+                # DENIED_APPS / DENIED_SITES: the field is not read, nor is the screen.
+                self.overlay.message("Bubble is off here", tone="warn")
+                return
             with PERF.timer("bubble.field_read"):
                 text, desc = await self._read_field(snap)
             if not field_query(text):

@@ -29,6 +29,7 @@ from . import ocr
 from .browser import browser_url
 from .enrich import Capture, EnrichJob
 from .frames import FrameGrabber, is_blank
+from .privacy import denied
 from .session import SessionTracker
 from .suppress import classify_origin, is_suppressed
 
@@ -75,7 +76,7 @@ class ScreenObserver:
         self._warned_blank = False
         self.away = False
         self.stats = {k: 0 for k in ("captured", "light", "frame_dup", "dropped_failed", "degraded",
-                                     "suppressed", "aborted_drift", "self")}
+                                     "suppressed", "aborted_drift", "self", "denied")}
 
     # ------------------------------------------------------------ lifecycle
 
@@ -240,6 +241,10 @@ class ScreenObserver:
         # The tab URL comes from the web view (window_context); AppleScript is a slow fallback.
         t0 = time.perf_counter()
         url = ctx.url or ("" if stale else await asyncio.to_thread(browser_url, ctx.app))
+        if denied(ctx.app, ctx.bundle_id, url):
+            # Before any text is read or any frame saved: a denied window leaves nothing.
+            self.stats["denied"] += 1
+            return
         counts: dict[str, Any] = pending["counts"]
         started, ended = pending["started"], time.time()
         phash = str(imagehash.phash(after)) if after is not None else ""
