@@ -6,6 +6,7 @@ import asyncio
 import threading
 
 import pytest
+from PIL import Image
 
 from discrete import llm
 from discrete.capture.enrich import Enricher
@@ -156,7 +157,7 @@ def test_ocr_reads_document_even_when_ax_chrome_exceeds_threshold(tmp_path, monk
     monkeypatch.setattr(ax, "read_screen_text", lambda *args, **kw: "Window chrome " * 30)
     monkeypatch.setattr(ocr, "ocr_image", lambda image: "Scanned document content")
     observer = ScreenObserver(queue=asyncio.Queue())
-    text, source = observer._screen_text(ax.WindowContext(), None)
+    text, source = observer._screen_text(ax.WindowContext(), Image.new("RGB", (64, 64), "white"))
     assert text.startswith("Scanned document content") and source == "ax+ocr"
     observer.grabber.close()
 

@@ -53,6 +53,18 @@ def _novel_lines(ocr_text: str, ax_text: str) -> list[str]:
     return out
 
 
+@dataclasses.dataclass
+class ScreenText:
+    text: str
+    source: str
+    privacy_text: str
+    pixels_read: bool
+
+    def __iter__(self):
+        # Keep the existing text/source interface for local readers.
+        return iter((self.text, self.source))
+
+
 class ScreenObserver:
     def __init__(self, *, queue: asyncio.Queue, session: SessionTracker | None = None, store: Store | None = None):
         self.queue = queue
@@ -284,6 +296,7 @@ class ScreenObserver:
         started, ended = pending["started"], time.time()
         phash = str(imagehash.phash(after)) if after is not None else ""
         sig = (ctx.app, ctx.window_title, url)
+
         prev = self._last_kept.get(sig)
         if phash and prev and imagehash.hex_to_hash(phash) - imagehash.hex_to_hash(prev) <= T.FRAME_PHASH_MAX_DIST:
             self.stats["frame_dup"] += 1
@@ -296,14 +309,17 @@ class ScreenObserver:
         self._remember(sig, phash)
 
         t_text = time.perf_counter()
-        screen_text, text_source = await asyncio.to_thread(self._screen_text, ctx, after, stale)
+        extracted = await asyncio.to_thread(self._screen_text, ctx, after, stale)
+        screen_text, text_source = extracted
         PERF.sample("capture.text", since_ms(t_text), n=len(screen_text))
         if len(screen_text) >= T.SCREEN_TEXT_MAX_CHARS - 1:
             PERF.count("health.capture_screen_text_cap_hits")
-        drop = meta_secret
+        drop = meta_secret or (isinstance(extracted, ScreenText) and not extracted.pixels_read)
         if T.REDACT_SECRETS:
-            r = redact_capture("", "", screen_text, text_source, memory=self._secrets)
-            screen_text, drop = r.text, drop or r.drop_frame
+            privacy_text = extracted.privacy_text if isinstance(extracted, ScreenText) else screen_text
+            r = redact_capture("", "", privacy_text, text_source, memory=self._secrets)
+            drop = drop or r.drop_frame
+            screen_text = redact_capture("", "", screen_text, text_source, memory=self._secrets).text
         if drop:
             # A credential was on screen and text redaction cannot clean a frame: keep
             # none, caption from the text alone. (Catch-all hits such as document ids
@@ -358,12 +374,12 @@ class ScreenObserver:
         while len(self._last_kept) > T.LAST_KEPT_MAX:
             self._last_kept.popitem(last=False)
 
-    def _screen_text(self, ctx: ax.WindowContext, after, stale: bool = False) -> tuple[str, str]:
+    def _screen_text(self, ctx: ax.WindowContext, after, stale: bool = False) -> ScreenText:
         # For a stale (rotated) capture the live AX tree is the *new* window, so the
         # only faithful text for the old article is OCR of its captured frame.
         text = "" if stale else ax.read_screen_text(
             ctx.pid, max_nodes=T.AX_WALK_MAX_NODES, timeout_ms=T.AX_WALK_TIMEOUT_MS,
-            max_chars=T.SCREEN_TEXT_MAX_CHARS, viewport=ctx.bounds)
+            max_chars=None, viewport=ctx.bounds)
         if stale:
             PERF.count("health.capture_ax_empty.stale")
         # A long AX tree can still be only chrome while the document is a scanned page
@@ -372,11 +388,20 @@ class ScreenObserver:
         # they go first so a long chrome tree cannot truncate them away; on an ordinary
         # page that is a few lines, and the exact AX text follows.
         native = after.info.get("_ocr_native", after) if after is not None else None
-        ocr_lines = _novel_lines(ocr.ocr_image(native), text)
-        if not ocr_lines:
-            return tk.truncate(text, T.SCREEN_TEXT_MAX_CHARS), "ax" if text else ""
+        try:
+            raw_ocr = ocr.ocr_image(native) if native is not None else ""
+            pixels_read = native is not None
+        except Exception:
+            raw_ocr, pixels_read = "", False
+        privacy_text = "\n".join(filter(None, (raw_ocr, text)))
+        ocr_lines = _novel_lines(raw_ocr, text)
         merged = "\n".join(ocr_lines + ([text] if text else []))
-        return tk.truncate(merged, T.SCREEN_TEXT_MAX_CHARS), "ax+ocr" if text else "ocr"
+        source = "ax+ocr" if text and ocr_lines else "ocr" if ocr_lines else "ax" if text else ""
+        if not getattr(text, "complete", True):
+            source = (source + "+ax_incomplete").lstrip("+")
+        if not pixels_read:
+            source = (source + "+ocr_failed").lstrip("+")
+        return ScreenText(tk.truncate(merged, T.SCREEN_TEXT_MAX_CHARS), source, privacy_text, pixels_read)
 
     # ------------------------------------------------------------- heartbeat
 

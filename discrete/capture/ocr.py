@@ -11,6 +11,11 @@ log = logging.getLogger("discrete.capture.ocr")
 _ACCURATE = 0
 
 
+class ExtractionFailed(RuntimeError):
+    """OCR did not complete; this is not an empty successful read."""
+
+
+
 def ocr_image(img) -> str:
     """OCR a PIL image; returns lines in Vision's reading order."""
     if img is None:
@@ -36,7 +41,7 @@ def ocr_jpeg(jpeg: bytes) -> str:
         ok, err = handler.performRequests_error_([req], None)
         if not ok:
             log.debug("OCR failed: %s", err)
-            return ""
+            raise ExtractionFailed("OCR request failed")
         lines: list[str] = []
         for obs in req.results() or []:
             cand = obs.topCandidates_(1)
@@ -45,4 +50,4 @@ def ocr_jpeg(jpeg: bytes) -> str:
         return "\n".join(lines)
     except Exception as exc:
         log.debug("OCR unavailable: %s", exc)
-        return ""
+        raise ExtractionFailed("OCR unavailable") from exc

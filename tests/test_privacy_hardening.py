@@ -20,3 +20,32 @@ async def test_unapproved_cached_before_frame_is_omitted(store, fake, monkeypatc
     await observer._capture(pending, ctx, before, after)
     cap = observer.queue.get_nowait()
     assert cap.job.frames == [after]
+
+
+async def test_full_ocr_is_screened_before_excerpt(store, fake, monkeypatch):
+    from discrete.capture import ocr
+    monkeypatch.setattr(ax, 'read_screen_text', lambda *a, **kw: '')
+    monkeypatch.setattr(ocr, 'ocr_image', lambda image: 'ordinary prose ' * 2000 + '\npassword: synthetic12345')
+    observer = sc.ScreenObserver(queue=asyncio.Queue(), store=store)
+    monkeypatch.setattr(observer, '_save', lambda *a: '')
+    ctx = ax.WindowContext(app='Editor', window_title='Document', pid=7)
+    pending = dict(kind='click', started=time.time(), counts=dict(keys=0, clicks=1, scrolls=0, clipboard=0))
+    await observer._capture(pending, ctx, None, Image.new('RGB', (64, 64), 'white'))
+    cap = observer.queue.get_nowait()
+    assert cap.job.frames == []
+
+
+async def test_failed_ocr_cannot_approve_pixels(store, fake, monkeypatch):
+    from discrete.capture import ocr
+    monkeypatch.setattr(ax, 'read_screen_text', lambda *a, **kw: 'Safe AX text')
+    def fail(image):
+        raise RuntimeError('synthetic extraction failure')
+    monkeypatch.setattr(ocr, 'ocr_image', fail)
+    observer = sc.ScreenObserver(queue=asyncio.Queue(), store=store)
+    monkeypatch.setattr(observer, '_save', lambda *a: '')
+    ctx = ax.WindowContext(app='Editor', window_title='Document', pid=7)
+    pending = dict(kind='click', started=time.time(), counts=dict(keys=0, clicks=1, scrolls=0, clipboard=0))
+    await observer._capture(pending, ctx, None, Image.new('RGB', (64, 64), 'white'))
+    cap = observer.queue.get_nowait()
+    assert cap.job.frames == []
+    assert 'failed' in cap.draft.text_source
