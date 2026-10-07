@@ -378,6 +378,22 @@ This audit shows where each proposed feature starts from. Code paths are relativ
 - **Delegated to Codex** (gpt-6.1-sol, uncommitted until reviewed): review finding #18 (keep successful chunk drafts
   when a later chunk fails, so a retry re-requests only the failed chunks) and a README section for the branch's
   features. taskId `node:delegated-task:command%3Amcp%3Aa31f5b55-8276-48a6-85cd-9a27a9d59a69%3Adelegate-task%3Aexp-discrete-r18-readme-1`.
+- **#18 fixed, README table** (Codex, reviewed; commit `a73e1d1`, 231 tests):
+  - Migration 10 `episode_draft_chunks` checkpoints each successful chunk reply.
+  - The key is a sha256 of the episode's observation rows and the exact prompts, so a data, filter or prompt change
+    invalidates it. My review added `default=str` so a non-JSON column can't crash drafting.
+  - A retry, including after a restart, requests only the missing chunks. A trigger clears the checkpoints when the
+    episode closes, in the same transaction.
+  - README "Memory that learns…" became a feature table, accurate to the code (export git history is opt-in).
+- **`bench/redraft.py`** (new): copies a rebuilt store and clears everything drafting and consolidation produced:
+  claims, evidence, mentions, links, change log, digests, gaps, promoted entities/aliases/edges, their embeddings and
+  outbox rows, draft checkpoints.
+  - It keeps observations, captions, sightings, episode boundaries and entity candidates, and sets episodes back to
+    `ready`.
+  - Then `process --recover --consolidate` rebuilds the memory with the current code; captions are not paid for
+    again.
+- **Re-drafts with the final code** (dedup + #18) launched: `g46/branch-v2.db`, `live1006/branch-v2.db`; logs
+  `*/redraft-v2.log` end in `DONE`. They are scored as `g46-branch-v2` / `live-branch-v2` after the matrix.
 
 ---
 
