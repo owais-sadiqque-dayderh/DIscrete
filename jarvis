@@ -56,6 +56,8 @@ dis() { (cd "$DIS" && "$BIN" "$@"); }
 db() { dis runtime-paths | "$DIS/.venv/bin/python" -c 'import json,sys; print(json.load(sys.stdin)["db"])'; }
 q() { dis read-sql "$1"; }
 running() { dis instance status >/dev/null; }
+# This checkout's daemons, matched by the full path of its own binary.
+legacy_pids() { pgrep -f "^[^ ]*python[^ ]* $BIN run" || true; }
 
 credit() {
   local key; key="$(envval CORE_LM_API_KEY)"
@@ -68,6 +70,9 @@ credit() {
 start() {
   [ -x "$BIN" ] || die "DIscrete is not installed: cd $DIS && uv venv .venv && VIRTUAL_ENV=.venv uv pip install -e '.[dev]'"
   if running; then ok "DIscrete is already running"; return; fi
+  [ -z "$(legacy_pids)" ] || die "an older DIscrete from this checkout is still running without the data-dir lock; run: jarvis stop"
+  local others; others="$(pgrep -f "bin/discrete run" | grep -vxF -f <(legacy_pids; echo none) || true)"
+  [ -z "$others" ] || warn "another DIscrete checkout is running (pid $(echo $others)); both use Option+Tab — stop it from its own checkout"
   (cd "$DIS" && nohup "$BIN" run >>"$LOG" 2>&1 </dev/null &)
   sleep 5
   running || die "DIscrete stopped right away; see: jarvis logs   (or: jarvis setup)"
@@ -76,6 +81,13 @@ start() {
 
 stop() {
   dis instance stop || die "shutdown incomplete; restart aborted"
+  # A daemon started by an older jarvis holds no lease; stop it by this checkout's exact binary path.
+  local pids; pids="$(legacy_pids)"
+  if [ -n "$pids" ]; then
+    kill $pids 2>/dev/null || true
+    for _ in $(seq 20); do [ -z "$(legacy_pids)" ] && break; sleep 0.5; done
+    [ -z "$(legacy_pids)" ] || die "shutdown incomplete (pid $(echo $(legacy_pids))); restart aborted"
+  fi
   ok "DIscrete stopped"
 }
 
