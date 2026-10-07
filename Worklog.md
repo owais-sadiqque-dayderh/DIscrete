@@ -1257,3 +1257,100 @@ per-chunk focus/URL live check remains pending.
 live log since 2026-10-08 04:19:00: **zero ERROR/Traceback lines**. The log shows orderly shutdown messages
 at 04:51:06 and a fresh runtime start at 04:51:36, with no error; this test agent issued no stop/start command.
 No live/private database changes, branch switches, pushes, merges, or PRs by this agent.
+
+
+### 2026-10-08 — regression fixes (Codex)
+
+**Implementation:** `471b44f` on `hardening/fix-regressions`, based on `feat/production-hardening`
+(`247f7ac`). No merge, push, PR, live-code change or daemon stop/restart. The evaluation checkout is detached
+at `471b44f`. The Worklog-only commit is on `hardening/regression-worklog`; the live checkout's HEAD/branch
+is deliberately unchanged (a temporary Git index stages only `Worklog.md`).
+
+**A — root cause and attribution:** the main clock-only failure is a wall-clock-dependent parser bug,
+not a changed W5 planner. `85f0380` introduced the past-date/day-bounds behaviour; `669a298` protected
+clock-only **why** questions but left ordinary recall unprotected. On October 7, “around 22:20” resolved
+to October 6; on October 8 it resolved to October 7 and excluded this database's October 6 episodes.
+The saved live-final-a run is dated October 7 15:35, while hret was run October 8. Old `d8847a5` and
+hardening both reproduce the wrong October 7 interval when run at the same reference date. A bounded
+revision replay of d8847a5, 00ed9af, e74cd13, c8aea27, 8e787a4, 6861a5a, 0a2453c, 4580a35 and 57f980c
+produced the identical bad interval for the clock question, and no interval for the named cross-midnight
+question. There is therefore no defensible single W5 “guilty commit” for the clock exclusion; the original
+old/new comparison also changed the evaluation date. The cross-midnight parser likewise missed the named
+dates, leaving semantic ranking to supply the time evidence. W5's `c8aea27` changes that candidate pool
+(detail expansion and shorter excerpts), and `00ed9af` makes absent support a refusal; the revision replay
+does not isolate a single W5 cause for every semantic-ranking miss.
+
+The fix resolves clock-only recall against the latest **captured** day with nearby user sightings, selects
+the closest visits before applying the candidate cap, and skips planner/embedding calls for this route.
+Explicit “around midnight between September 30 and October 1” gets a window across the shared boundary.
+The verifier now receives readable local start **and end** timestamps, plus instructions to use capture
+boundaries rather than dates quoted inside screen text and to retain the bounded relative navigation
+sequence. Habitual “normally use” questions explicitly include the profile. That avoids relying on a
+preference claim surviving QA-02's expanded candidate competition; the old/new copied-data searches had
+lost the Helium-default evidence and selected Arc-use screens instead. No QA-02 privacy bound was reverted.
+
+**B — decision:** `00ed9af` (QA-01, review R1-08) made timed-out hits ineligible and therefore refused
+non-why answers even with useful hits. Keep their `timed_out` state and `eligible=False`, but use a separate
+`unverified` writer mode with at most TOP_K hits, per-record “not verified” labels, hedged instructions,
+and a deterministic user-facing “Support check timed out; this answer is not verified” prefix. Drop the
+digest; rejected/malformed evidence still cannot enter this fallback. A timed-out relative timeline cannot
+emit an unqualified deterministic page list. This follows W5's distinction between explicit unchecked
+states and verified support, and its existing hedged why fallback, without relabelling timed-out evidence
+as verified or unchecked. It restores coverage without another paid retry or a longer foreground budget;
+verification failures other than timeouts continue to fail closed.
+
+**Validation and method:** only `/tmp/dis-live-fix.db` and `/tmp/dis-g46-fix.db` were used for diagnosis,
+copied from the two branch-v2-r3 inputs. The requested milestone tag is absent in this repository, so the
+throwaway old-code worktree used its specified commit `d8847a5`. Retrieval-only checks compared raw and
+post-verifier packs; a handful of verifier/embedding calls cost approximately $0.02. Regression tests cover
+later wall-clock dates, latest matching user-only days, candidate bursts, explicit cross-midnight dates,
+profile routing, local verifier timestamps, edit routing, timeout state/record exclusion, disclosure and
+hedging, and timed-out relative timelines. Final hardening-worktree checks, using its own .venv and
+PYTHONPATH=$PWD: **941 passed**, `ruff check discrete tests` clean, `git diff --check` clean. No timing-test
+rerun was needed.
+
+**Re-measure:** four parallel nohup jobs on the SAME input databases, names live-fix-a/b and g46-fix-a/b,
+with `--code .`, PYTHONPATH=$PWD and DISCRETE_MEMORY_EXPORT_DIR=off. All returned rc=0 and valid JSON;
+ALL DONE at **05:26:20 IST**. Both requested `bench/run_g46.py --compare` commands completed. The scorer
+manifests confirm that fix and hret have identical content_sha256 and cases_sha256 for each set. The first
+nohup launch ended with its tool shell before producing any scores; after confirming no scorer remained,
+it was relaunched with a waiting supervisor. No completed scoring work was duplicated. Credit was $1.91
+before scoring and $1.38 afterward, so neither g46 repeat was skipped.
+
+Means of two repeats below. Overall and category rates use **all cases**, treating infrastructure errors,
+including timeout refusals, as failures. Scored-only rates are recomputed from unrounded case counts,
+not averaged rounded summary fractions. Latencies average the saved repeat percentiles. `final` is old
+memory-evolution, `hret` is prior hardening retrieval, and `fix` is 471b44f.
+
+| Set | Code | Overall % (all cases) | Scored-only % | Recall % | Enum % | Agg % | Profile % | Temp % | Why % | Unans % | p50/p90 s | Answer $ |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| live1006 | final | 76.7 | 76.7 | 66.7 | 50.0 | 0.0 | 100.0 | 75.0 | 91.7 | 90.0 | 15.6/32.0 | 0.0634 |
+| live1006 | hret | 66.7 | 66.7 | 88.9 | 50.0 | 0.0 | 16.7 | 0.0 | 91.7 | 100.0 | 8.4/13.5 | 0.0735 |
+| live1006 | fix | 83.3 | 83.3 | 88.9 | 50.0 | 0.0 | 83.3 | 75.0 | 91.7 | 100.0 | 8.5/14.8 | 0.0657 |
+| g46 | final | 90.2 | 91.2 | 91.7 | 50.0 | 100.0 | 83.3 | 87.5 | — | 100.0 | 14.7/24.0 | 0.1071 |
+| g46 | hret | 83.7 | 85.6 | 88.3 | 50.0 | 100.0 | 66.7 | 50.0 | — | 100.0 | 7.5/12.5 | 0.1106 |
+| g46 | fix | 91.3 | 91.3 | 93.3 | 75.0 | 75.0 | 66.7 | 100.0 | — | 100.0 | 8.0/13.7 | 0.1061 |
+
+The all-case correct counts (a/b) are live final **24/30, 22/30**, hret **21/30, 19/30**, fix
+**23/30, 27/30**; g46 final **40/46, 43/46**, hret **39/46, 38/46**, fix **41/46, 43/46**.
+Thus fix gains **16.7 pp live / 7.6 pp g46** over hret, and **6.7 pp / 1.1 pp** over old final on
+this all-case metric. G46's previously quoted 91.2%/85.6% are scored-only; with exclusions counted as
+failures they are 90.2%/83.7%. Fix has **zero infrastructure exclusions** in all four repeats.
+
+**Timeout audit:** final-attempt timeout-marked cases a/b: live fix **3/1**, g46 fix **3/4**.
+Correct among these: live **2/3, 1/1**, g46 **3/3, 4/4**. There were **zero answerable timeout refusals**;
+one g46 timeout case correctly refused the unanswerable salary question. The one failed timeout-marked
+case was live-fix-a's jarvis-stop question: its answer was supported, but gave only the closest Finder
+.cache step and missed the expected frames/SQLite strings. Prior g46 hret had one timeout refusal per
+repeat, both excluded by the runner; both are included as failures in the table above.
+
+**Targeted outcomes and limits:** both clock-only live questions and the habitual-browser question pass
+both repeats. G46's cross-midnight, after-midnight and AI-agent-use questions pass both repeats; temporal
+coverage is live **0% → 75%**, g46 **50% → 100%** on the all-case denominator. The relative jarvis-stop
+case passes only fix-b, so its coverage is improved but still variable. Live project wording still misses
+the required “memory” string in fix-a. G46 installation/actor-attribution misses remain variable, and the
+outside-work-interest profile case fails both repeats. This is not a claim that every per-question
+regression is eliminated or that two repeats establish general parity. Returned-evidence supported-rate
+means rise from live hret **88.4% → 98.4%** and g46 hret **94.5% → 97.8%**. The benchmark still measures
+returned-evidence support/string checks, not independent source truth. Answer-cost values exclude judge
+spend and are lower bounds: fix unpriced-call counts a/b are live **3/1**, g46 **3/4**.
