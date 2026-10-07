@@ -47,6 +47,13 @@ def _denied(ctx: ax.WindowContext, url: str | None = None) -> str:
                   window_title=ctx.window_title, window_id=ctx.window_id)
 
 
+def _same_window(a: ax.WindowContext, b: ax.WindowContext) -> bool:
+    """Same page, tolerating a URL known to only one side: frames are cached with the
+    Apple Events tab URL, while a navigation trigger's context has only the AX URL."""
+    return a.pid == b.pid and a.window_title == b.window_title and (
+        not a.url or not b.url or a.url.split("#")[0] == b.url.split("#")[0])
+
+
 def _novel_lines(ocr_text: str, ax_text: str) -> list[str]:
     """OCR lines carrying words the AX text does not already have."""
     known = set(tk.content_tokens(ax_text))
@@ -95,8 +102,10 @@ class ScreenObserver:
         self._last_full_capture = 0.0
         self._last_full_text = ""
         self._warned_blank = False
+        self._capture_proven = False  # a frame with content arrived: the permission works
+        self._blank_windows: set[tuple] = set()
         self.away = False
-        self.stats = {k: 0 for k in ("captured", "light", "frame_dup", "dropped_failed", "degraded",
+        self.stats = {k: 0 for k in ("captured", "light", "frame_dup", "missing_frame", "degraded",
                                      "suppressed", "aborted_drift", "self", "denied", "redacted")}
         # Fragments of recently redacted secrets, so an OCR copy split differently goes too.
         self._secrets = SecretMemory()
@@ -172,7 +181,7 @@ class ScreenObserver:
             before = self._latest
             if before is not None and _denied(before[1]):
                 before = None
-            if cur is not None and before is not None and before[1].key != cur.key:
+            if cur is not None and before is not None and not _same_window(before[1], cur):
                 before = None  # the cached frame shows the page we just left, not this one
             self._pending = {
                 "kind": kind,
@@ -221,12 +230,25 @@ class ScreenObserver:
                         self._latest[0].info.pop("_ocr_native", None)
                     self._latest = (img, ctx)
                     self._recent.append((img, ctx))
-                    if not self._warned_blank and is_blank(img):
-                        self._warned_blank = True
-                        log.warning("near-flat frame — check Screen Recording permission")
+                    self._check_blank(img, ctx)
             except Exception as exc:
                 log.debug("frame loop: %s", exc)
             await asyncio.sleep(T.FRAME_CACHE_S)
+
+    def _check_blank(self, img: Image.Image, ctx: ax.WindowContext) -> None:
+        """Without Screen Recording every window comes back flat; one flat window (a blank
+        tab, a video's black frame) is no evidence. Warn once, only when three different
+        windows were flat before any frame showed content."""
+        if self._capture_proven or self._warned_blank:
+            return
+        if not is_blank(img):
+            self._capture_proven = True
+            return
+        self._blank_windows.add((ctx.pid, ctx.window_id))
+        if len(self._blank_windows) >= 3:
+            self._warned_blank = True
+            log.warning("frames of %d windows are all flat — check Screen Recording permission",
+                        len(self._blank_windows))
 
     def _save(self, img: Image.Image | None, tag: str) -> str:
         if img is None:
@@ -251,11 +273,12 @@ class ScreenObserver:
         if not pending:
             return
         ctx: ax.WindowContext = pending["before_ctx"]
-        own = next((img for img, c in reversed(self._recent)
-                    if c.key == ctx.key and not _denied(c)), None)
-        after = own if own is not None else pending["before_img"]
-        if after is None:
-            self.stats["dropped_failed"] += 1  # degraded: no frame, but still segment the boundary
+        own = next(((img, c) for img, c in reversed(self._recent)
+                    if _same_window(c, ctx) and not _denied(c)), None)
+        if own is not None:
+            after, ctx = own  # the cached context also carries the tab URL
+        else:
+            after = pending["before_img"]  # None when no frame of this page was cached in time
         spawn(self._finalize(pending, ctx, after, stale=True), name="discrete-rotate", owner=self._tasks)
 
     async def _flush(self) -> None:
@@ -299,6 +322,10 @@ class ScreenObserver:
             ctx, url, meta_secret = dataclasses.replace(ctx, window_title=meta.title), meta.url, meta.drop_frame
         else:
             meta_secret = False
+        if after is None:
+            # Usually a page left before a frame of it was cached (FRAME_CACHE_S), or a
+            # window the grabber cannot see; the row is still stored, from metadata.
+            self.stats["missing_frame"] += 1
         counts: dict[str, Any] = pending["counts"]
         started, ended = pending["started"], time.time()
         phash = str(imagehash.phash(after)) if after is not None else ""
