@@ -36,6 +36,10 @@ _DRAFT_ROW_FIELDS = (
 )
 
 
+class DraftDeferred(Exception):
+    """The episode cannot be drafted yet (no model configured); it stays ready."""
+
+
 @dataclass
 class DraftOutcome:
     episode_id: int
@@ -98,10 +102,13 @@ class ProcessPipeline:
     async def draft_episode(self, episode_id: int) -> DraftOutcome | None:
         if not await self.store.begin_draft(episode_id):
             return None  # someone else is drafting it, or it is not ready
+        res = None
         try:
             with PERF.timer("draft.episode", ref_id=episode_id) as t:
                 res = await self._draft(episode_id)
                 t.n = res.added + res.reinforced
+        except DraftDeferred:
+            await self.store.defer_draft(episode_id)
         except (*EXPECTED_ERRORS, DraftConflict) as exc:
             log.warning("episode %s draft failed: %s", episode_id, exc)
             await self.store.draft_failed(episode_id)
@@ -115,6 +122,7 @@ class ProcessPipeline:
             raise
         # Outside the draft lifecycle: even cancellation here must not reopen a
         # committed episode. The maintenance pass resumes unfinished graph work.
+        # A deferred episode still gets its graph: provenance needs no model.
         from .provenance import build_provenance
 
         try:
@@ -135,9 +143,10 @@ class ProcessPipeline:
         apps = sorted({r["app"] for r in rows if r["app"]})
         sites = sorted({r["site"] for r in rows if r["site"]})
         engaged = sum(1 for r in rows if r["keys"] or r["clicks"] or r["clipboard"]) / max(1, len(rows))
-        if not rows or not self.ep.configured:
-            if rows and not self.ep.configured:
-                await self.store.bump_metric("draft_skipped_unconfigured", len(rows))
+        if rows and not self.ep.configured:
+            await self.store.bump_metric("draft_skipped_unconfigured", len(rows))
+            raise DraftDeferred("no insight model configured")
+        if not rows:
             title = " / ".join(apps)[:80] or "(no user activity)"
             await self.store.close_episode(episode_id, title=title, summary="", apps=apps, sites=sites,
                                            engaged_fraction=engaged)
@@ -286,20 +295,25 @@ class ProcessPipeline:
 
     def _draft_prompt(self, rows, chrome: dict[tuple[str, str], set[str]] | None = None,
                       *, record_losses: bool = False) -> str:
-        seen_lines: set[str] = set()
+        # Characters of each line already in the prompt. Only what survives truncation
+        # counts as delivered, so a later copy of the line supplies the cut-off rest.
+        delivered: dict[str, int] = {}
         blocks = []
         for r in rows:
-            kept = []
+            kept: dict[str, str] = {}
             text = tk.without_lines(r["screen_text"] or "", (chrome or {}).get((r["app"], r["site"]), set()))
             for line in text.splitlines():
                 k = tk.norm_key(line)
-                if k and k not in seen_lines:
-                    seen_lines.add(k)
-                    kept.append(line)
-            content = "\n".join(kept)
+                if k and k not in kept and delivered.get(k, 0) < len(line):
+                    kept[k] = line[delivered.get(k, 0):]
+            content = "\n".join(kept.values())
             if record_losses and len(content) > T.DRAFT_TEXT_CHARS_PER_OBS:
                 PERF.count("health.draft_text_truncated")
             excerpt = tk.truncate(content, T.DRAFT_TEXT_CHARS_PER_OBS)
+            room = len(excerpt) - (len(excerpt) < len(content))  # minus the ellipsis
+            for k, part in kept.items():
+                delivered[k] = delivered.get(k, 0) + min(len(part), max(0, room))
+                room -= len(part) + 1
             acted = "acted" if (r["keys"] or r["clicks"] or r["clipboard"]) else "viewed only"
             page = f" page={r['page_title']!r}" if r["page_title"] else ""
             blocks.append(
