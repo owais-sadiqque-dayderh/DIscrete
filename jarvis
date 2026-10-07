@@ -74,7 +74,7 @@ start() {
   [ -z "$(legacy_pids)" ] || die "an older DIscrete from this checkout is still running without the data-dir lock; run: jarvis stop"
   local others; others="$(daemons | awk -v bin="$BIN" '$2 != bin {print $1}')"
   [ -z "$others" ] || warn "another DIscrete checkout is running (pid $(echo $others)); both use Option+Tab — stop it from its own checkout"
-  (cd "$DIS" && nohup "$BIN" run >>"$LOG" 2>&1 </dev/null &)
+  (cd "$DIS" && exec nohup "$BIN" run >>"$LOG" 2>&1 </dev/null) >/dev/null 2>&1 &
   sleep 5
   running || die "DIscrete stopped right away; see: jarvis logs   (or: jarvis setup)"
   ok "DIscrete is watching; Bubble is on Option+Tab"
