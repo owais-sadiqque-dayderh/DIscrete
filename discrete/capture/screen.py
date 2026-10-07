@@ -53,7 +53,8 @@ def _novel_lines(ocr_text: str, ax_text: str) -> list[str]:
     out: list[str] = []
     for line in dict.fromkeys(x.strip() for x in ocr_text.splitlines()):
         toks = set(tk.content_tokens(line))
-        if toks and len(toks - known) / len(toks) >= 0.5:
+        # A changed number is new information even when the words around it are not.
+        if toks and (len(toks - known) / len(toks) >= 0.5 or any(t.isdigit() for t in toks - known)):
             out.append(line)
     return out
 
@@ -91,8 +92,6 @@ class ScreenObserver:
         # next page (insights.md §7.37).
         self._recent: collections.deque = collections.deque(maxlen=6)
         self._last_event_mono = time.monotonic()
-        # (app, title, url) -> phash of the last kept frame; least recently used evicted.
-        self._last_kept: collections.OrderedDict[tuple, str] = collections.OrderedDict()
         self._last_full_capture = 0.0
         self._last_full_text = ""
         self._warned_blank = False
@@ -303,18 +302,6 @@ class ScreenObserver:
         counts: dict[str, Any] = pending["counts"]
         started, ended = pending["started"], time.time()
         phash = str(imagehash.phash(after)) if after is not None else ""
-        sig = (ctx.app, ctx.window_title, url)
-        prev = self._last_kept.get(sig)
-        if phash and prev and imagehash.hex_to_hash(phash) - imagehash.hex_to_hash(prev) <= T.FRAME_PHASH_MAX_DIST:
-            self.stats["frame_dup"] += 1
-            await self.queue.put(Capture(ObservationDraft(
-                source="screen", event_kind=pending["kind"], session_id=self.session.session_id,
-                started_at=started, ended_at=ended, app=ctx.app, bundle_id=ctx.bundle_id,
-                window_title=ctx.window_title, url=url, frame_duplicate=True, **counts,
-            )))
-            return
-        self._remember(sig, phash)
-
         t_text = time.perf_counter()
         extracted = await asyncio.to_thread(self._screen_text, ctx, after, stale)
         screen_text, text_source = extracted
@@ -338,6 +325,25 @@ class ScreenObserver:
         elif after is not None and T.REDACT_SECRETS:
             after.info[APPROVED] = True  # its own full text passed; the before frame is checked at egress
         origin = classify_origin(ctx.app, ctx.window_title, screen_text)
+        # pHash only proposes a duplicate: the text, read every time, must match too, so
+        # an edited number in an unchanged layout is kept. The duplicate's target is the
+        # latest durable row, never an in-memory note of a capture that may not have been
+        # stored, and a row older than HEARTBEAT_MAX_GAP_S is not extended.
+        prev = await self.store.q1(
+            "SELECT frame_phash, screen_text, started_at FROM observations WHERE app=? AND site=? "
+            "AND window_title=? AND url=? AND origin='user' ORDER BY id DESC LIMIT 1",
+            (ctx.app, tk.site_from_url(url), ctx.window_title, url),
+        ) if self.store is not None and phash and origin == "user" else None
+        if (prev and prev["frame_phash"] and ended - prev["started_at"] < T.HEARTBEAT_MAX_GAP_S
+                and imagehash.hex_to_hash(phash) - imagehash.hex_to_hash(prev["frame_phash"]) <= T.FRAME_PHASH_MAX_DIST
+                and tk.content_hash(screen_text) == tk.content_hash(prev["screen_text"] or "")):
+            self.stats["frame_dup"] += 1
+            await self.queue.put(Capture(ObservationDraft(
+                source="screen", event_kind=pending["kind"], session_id=self.session.session_id,
+                started_at=started, ended_at=ended, app=ctx.app, bundle_id=ctx.bundle_id,
+                window_title=ctx.window_title, url=url, frame_duplicate=True, **counts,
+            )))
+            return
         base: dict[str, Any] = dict(
             origin=origin, event_kind=pending["kind"], session_id=self.session.session_id,
             started_at=started, ended_at=ended, app=ctx.app, bundle_id=ctx.bundle_id,
@@ -377,12 +383,6 @@ class ScreenObserver:
         PERF.sample("capture.local", since_ms(t0))  # hash, text, frame save: all work before the queue
         await self.queue.put(Capture(ObservationDraft(
             source="screen", caption=light_caption, frame_path=after_path, enrich_state="pending", **base), job))
-
-    def _remember(self, sig: tuple, phash: str) -> None:
-        self._last_kept[sig] = phash
-        self._last_kept.move_to_end(sig)
-        while len(self._last_kept) > T.LAST_KEPT_MAX:
-            self._last_kept.popitem(last=False)
 
     def _screen_text(self, ctx: ax.WindowContext, after, stale: bool = False) -> ScreenText:
         # For a stale (rotated) capture the live AX tree is the *new* window, so the
