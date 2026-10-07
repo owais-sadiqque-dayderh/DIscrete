@@ -394,6 +394,19 @@ This audit shows where each proposed feature starts from. Code paths are relativ
     again.
 - **Re-drafts with the final code** (dedup + #18) launched: `g46/branch-v2.db`, `live1006/branch-v2.db`; logs
   `*/redraft-v2.log` end in `DONE`. They are scored as `g46-branch-v2` / `live-branch-v2` after the matrix.
+- **Working mode (user, 07:30):** Claude orchestrates; Codex does the engineering (generous limits). Three Codex
+  tasks running in parallel on disjoint files:
+  - audit #8, episodes by task + `tasks` layer (`process/episodes.py`, `store/episodes.py`, m011): taskId `…exp-discrete-audit8-tasks-1`;
+  - audit #12 (a)-(c), invariant checker / `discrete check`, SLOs, silent-loss health counters: `…exp-discrete-audit12-hygiene-1`;
+  - audit #11, reuse captions for an unchanged page (shared live + replay policy): `…exp-discrete-audit11-captions-1`.
+- **Evaluation pinned to a frozen worktree** `exp_hindsight/exp_discrete_eval` (detached at `e57ca8f`; `.venv`,
+  `.env` copy, `bench/private` symlinked). Agents now edit the main checkout, and `run_g46.py --code .` would have
+  scored half-edited code.
+  - The matrix driver loops were stopped. The in-flight g46 dream and g46 re-draft finished on the code they had
+    loaded.
+  - `bench/private/eval_driver.sh` (log `results/driver.log`, ends `ALL DONE`) runs the live re-draft, the matrix
+    and the v2 scores, all from the frozen code.
+  - Score future branch states the same way: a new worktree per evaluated commit.
 
 ---
 
