@@ -494,6 +494,12 @@ This audit shows where each proposed feature starts from. Code paths are relativ
     decides on the default and writes `docs/ax_text_markers_report.md`.
   - **Queued:** encryption at rest (audit #3: store + frames, key in the Keychain). It waits for m012, since both
     touch `store/db.py`.
+- **m012 committed** `8e872a3`: episode draft state (grace timer, boundary lock) lives in `episodes` columns.
+  Legacy meta rows are migrated and deleted.
+- **Encryption at rest delegated** (`…exp-discrete-encrypt-1`, xhigh): store + frames. Codex is to research
+  SQLCipher vs per-file AES-GCM vs column-level, with the key in the Keychain. It is opt-in
+  (`DISCRETE_ENCRYPT_AT_REST`, default off on the branch) with crash-safe `discrete encrypt` / `decrypt`, so the bench
+  dbs stay plaintext.
 - **Re-run plan when muse is healthy:** a new frozen worktree at the final commit (retry policy + review fixes).
   Re-create `branch-v2` with the fixed `redraft.py`, then score everything in parallel, with fewer concurrent jobs
   (≤4) to avoid adding load.
