@@ -972,3 +972,11 @@ Sources: Cognition "agent memory repo" (cognition.com/agent-memory-repo), Hindsi
 - live1006 (the user's real session): main mean 0.534 -> branch mean **0.767** (+0.23); why 3/6 -> 5.5/6; profile 1/3 -> 3/3; temporal 2/4 -> 3/4.
 - g46: branch below main this run. Losses: judge strictness (AMO agent sent PMO.pdf -> "you sent" marked wrong x2; "around ₹54,259"), variance (Mathigon judged supported but marked wrong; HN late-night) and one real bug: two empty writer completions on "What is my annual salary?" -> extractive fallback "From xa11y: xa11y". Fixed in **edb7488** (silence twice -> refusal). g46 repeats running @ edb7488: `bench/private/eval_g46_rep.sh` -> results/g46rep-driver.log (g46-final-a/b, g46-main-g).
 - Credit after final round: $4.10.
+
+### ~16:25 IST — g46 repeats @ edb7488 + FINAL STATE (evaluation complete; awaiting the user's merge decision)
+- g46 @ edb7488: branch 0.889 / 0.935 (mean **0.912**) vs main 0.891 / 0.913 (mean **0.902**): tie. Only consistent loss (main 2/2, branch 0/2): "top story on Hacker News when I opened it late at night": the branch picks the daytime front page (Livenerf, 12:32) instead of the late-night one (Pi.dev / "You Said No MCP", obs 45). That's a "late at night" time-of-day resolution gap.
+- live1006 @ 4cdeaf8: branch mean **0.767** vs main **0.534** (why 5.5/6 vs 3/6, profile 3/3 vs 1/3, temporal 3/4 vs 2/4, supported 0.95 vs 0.81). edb7488 changes only the empty-writer fallback.
+- Latency p50 ≈ equal (14-16 s both); p90 higher on live branch (≈32 s vs 21 s: why questions wait up to 25 s for verification). Writer cost per run equal ($0.06-0.11).
+- Credit left: **$3.64**.
+- Known gaps: time-of-day phrases ("late at night") in recall; detail recall inside posts/images (EmbeddingGemma sizes, Theo's build time: OCR of embedded media); enumerate from listing pages; "normally use" profile wording; muse returns empty completions on unanswerable records (now a refusal); the support verifier is muse per .env (DIscrete's intended VERIFY_LM is gemini-3.8-flash: faster, would cut why p90).
+- Branch: 82+ commits on feat/memory-evolution since 41e2f9f, 724 tests. Not merged/pushed.
