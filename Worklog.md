@@ -1160,3 +1160,21 @@ user's running app in `exp_discrete` is untouched. Brief: `../hardening_2026-10-
   brief saved in `../hardening_2026-10-08/REVIEW_BRIEF.md`. The scheduled run must delete itself (it is weekly).
   **State:** `feat/production-hardening` = all five workers merged + orchestrator fixes, 930 tests pass; not yet reviewed;
   the user's live app still runs the old code from `exp_discrete` — do NOT restart it on the new branch before review.
+
+### 2026-10-08 ~03:30 IST — review r1 done by the orchestrator; Discrete repo tagged (user asked not to wait)
+- Deleted the 06:00 scheduled relaunch (user's request) and reviewed d8847a5..HEAD myself. Report:
+  `../hardening_2026-10-08/REVIEW-r1.md`. Real-data upgrade check on a read-only `.backup` copy of the live exp db
+  (1,266 obs, 364 claims): no migration, `stats`/`check` clean, all invariants pass.
+- Fixed R1-01 in **133e01a**: RT-01 had made a capture that fails 3 ingest attempts fatal for the daemon; now it is
+  dropped and counted, and only `INGEST_MAX_DROPPED_IN_A_ROW` (5) consecutive drops exit. Suite **932 passed**, ruff clean.
+- Open decision R1-04: `erase` keeps the claim's embedding vector in its suppression row (embeddings are partly
+  invertible). Accepted trade-offs R1-05/06; live checks needed for R1-07 (Bubble focus/URL per chunk).
+- **Discrete repo (`COMP_001/Discrete`) now holds the whole history, with milestone tags:**
+  `2026-09-14-plans` (14f2b2f) → `2026-09-18-first-iteration` (6fa975a = origin/main) → `2026-10-01-second-iteration`
+  (ff5a268 = `main`, checked out) → `2026-10-06-exp-baseline` (41e2f9f) → `2026-10-07-memory-evolution` (d8847a5) →
+  `2026-10-08-production-hardening` (133e01a). Branches: `main`, `feat/memory-evolution`, `feat/production-hardening`,
+  `archive/2026-10-01-evening`, `archive/2026-10-06-worktree` (the redundant `exp-baseline-2026-10-06` branch was replaced
+  by its tag). T3's `refs/t3/checkpoints/*` are left alone (T3 uses them for restore).
+- To test the hardening branch live: `jarvis-exp stop` (old code; the new stop also catches it) → in
+  `exp_hindsight/exp_discrete`: `git switch feat/production-hardening` (or run from `../exp_discrete_hardening`) →
+  `jarvis-exp start`. Still pending: live Mac check of Bubble typing/incognito, paid re-eval (needs the user's OK).
