@@ -70,11 +70,25 @@ Phases 18–19).
   - **Before scoring, backfill provenance edges** on every branch db copy:
     `discrete --db X why "x" --backfill` (or check the CLI help). Edges are built after drafting, and the old dbs
     have none.
-- **Muse (`meta/muse-spark-1.3-contributor`) is DOWN at OpenRouter** (Meta-side outage, confirmed by the user;
-  `service_overloaded`, Retry-After 60). A probe (Bash background task in the old session) was retrying every 2 min;
-  re-check with:
-  `curl -s https://openrouter.ai/api/v1/chat/completions -H "Authorization: Bearer $(grep ^CORE_LM_API_KEY .env|cut -d= -f2-)" -H 'Content-Type: application/json' -d '{"model":"meta/muse-spark-1.3-contributor","max_tokens":400,"reasoning":{"effort":"minimal"},"messages":[{"role":"user","content":"Reply with OK"}]}'`
-  Don't run paid evaluations while it is down: answers come back empty.
+- **Muse is back** (12:10 IST; the user okayed `openai/gpt-6-luna` as a fallback if it goes down again; apply
+  the same model to baseline and branch, and note it in the results).
+- **Since the last handoff update:**
+  - pages committed `54e6f0f` (m014, 581 tests).
+  - Review r3 of `669a298` found **7 findings**:
+    - P1: a denied site's cached frame reaches an allowed site's vision job.
+    - P1: model `page_title`/`navigated_from` bypass redaction and reach why quotes.
+    - P1: a custom-path encrypted store gets plaintext frames.
+    - P2: same-host timing becomes a false navigation cause.
+    - P2: a model-supplied referrer is treated as observed.
+    - P2: quadratic provenance cost.
+    - P2: ambiguous why picks the oldest visit.
+  - Codex is fixing all 7: taskId
+    `node:delegated-task:command%3Amcp%3Ad8b8c8e8-cb3d-4b23-a1db-f6827aaed2cd%3Adelegate-task%3Aexp-discrete-review-r3-fix-1`.
+  - **Score the branch only after these fixes:** #4/#5/#7 change why answers.
+- **Eval worktree recreated** at `54e6f0f` (`../exp_discrete_eval`; the symlinks as described below). `live-base`
+  (main code, live session) scoring started 12:12 from there: log `bench/private/results/live-base.log`.
+  - g46-base already exists (0.652).
+  - The branch scores need a NEW worktree at the commit with the r3 fixes.
 - **No branch scores exist yet.** The only valid result is `bench/private/results/g46-base.json` (main code on
   g46/base.db): **0.652 (30/46)**. Everything from the 07:20–08:05 attempt was invalidated by the outage.
 - OpenRouter credit: **$7.32** left ($45 total, $37.68 used). Disk: 12 GiB free.
