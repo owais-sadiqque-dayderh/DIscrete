@@ -482,6 +482,18 @@ This audit shows where each proposed feature starts from. Code paths are relativ
   the old code. One follow-up from my review: the drafting grace timer and redraft's boundary lock were stored as
   unbounded per-episode `meta` rows. Codex is moving them to `episodes` columns (m012), task
   `…exp-discrete-meta-columns-1`.
+- **User (08:20):** muse-spark-1.3 is down on Meta's side at OpenRouter and being fixed. Until it returns, do work
+  that needs no muse calls. Delegated to Codex:
+  - **"Why" for any moment** (`…exp-discrete-why-any-1`, xhigh): a deterministic attention-provenance graph over
+    observations (navigation, search→result, copy→paste/typed, message/share→opened link, brand seen in media→searched,
+    app switch with shared terms), plus a query-time why resolver that walks it back to an origin. It also explains
+    error dialogs from the state at that moment. Real evidence only; the support verifier still applies. The live
+    golden "why" questions stay held out; tests are synthetic, plus a dry run of chain-building on the real dbs.
+  - **Live verification of the Chromium AX text-marker fast path** on this Mac (`…exp-discrete-ax-markers-live-1`):
+    markers on vs off on 6–8 real pages. It measures length, noise and visible share against OCR, plus latency, then
+    decides on the default and writes `docs/ax_text_markers_report.md`.
+  - **Queued:** encryption at rest (audit #3: store + frames, key in the Keychain). It waits for m012, since both
+    touch `store/db.py`.
 - **Re-run plan when muse is healthy:** a new frozen worktree at the final commit (retry policy + review fixes).
   Re-create `branch-v2` with the fixed `redraft.py`, then score everything in parallel, with fewer concurrent jobs
   (≤4) to avoid adding load.
