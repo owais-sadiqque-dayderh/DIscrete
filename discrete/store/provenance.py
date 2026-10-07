@@ -96,7 +96,8 @@ class ProvenanceMixin(StoreBase):
             sql += " AND i.rules_key=?"
             args.append(rules_key)
         rows = await self.q(sql, args)
-        return [ProvenanceEdge(**dict(r)) for r in rows]
+        return [ProvenanceEdge(**(dict(r) | {"term": (r["term"] or "") if "term" in r.keys() else ""}))
+                for r in rows]
 
     async def provenance_checkpoints(self, start: float, end: float, rules_key: str) -> dict[int, float]:
         if not await self.has_provenance():

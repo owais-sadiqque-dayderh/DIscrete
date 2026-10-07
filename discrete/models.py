@@ -198,6 +198,7 @@ class ProvenanceEdge:
     target_field: str
     target_quote: str
     gap_s: float
+    term: str = ""
 
 
 @dataclass

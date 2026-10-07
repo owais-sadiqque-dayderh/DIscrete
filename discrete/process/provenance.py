@@ -130,6 +130,7 @@ def valid_edge(edge: ProvenanceEdge, by_id: dict[int, AttentionMoment]) -> bool:
                 and 0 <= b.at - a.at <= max(0, T.PROVENANCE_WINDOW_S)
                 and abs(edge.gap_s - (b.at - a.at)) < 0.001
                 and 0 <= edge.confidence <= 1
+                and safe_text(edge.term) == edge.term
                 and edge.source_quote and safe_text(edge.source_quote) == edge.source_quote
                 and safe_text(edge.target_quote) == edge.target_quote
                 and edge.source_quote in a.fields.get(edge.source_field, "")
@@ -289,7 +290,7 @@ class EdgeInference:
                          (a.app == b.app and tk.norm_key(a.title) == tk.norm_key(b.title)))
             proposed: list[ProvenanceEdge] = []
 
-            def add(kind, confidence, qa, qb, proposed=proposed, a=a, b=b, gap=gap):
+            def add(kind, confidence, qa, qb, term="", proposed=proposed, a=a, b=b, gap=gap):
                 if qa and qb:
                     # Caption/referrer assertions are stored evidence, not browser telemetry.
                     if {"caption", "navigated_from"} & {qa[0], qb[0]}:
@@ -297,7 +298,7 @@ class EdgeInference:
                     if safe_text(qa[1]) != qa[1] or safe_text(qb[1]) != qb[1]:
                         return
                     proposed.append(ProvenanceEdge(a.sighting_id, b.sighting_id, kind, confidence,
-                                                  *qa, *qb, gap))
+                                                  *qa, *qb, gap, safe_text(term)))
 
             # A model referrer must match an earlier page and be corroborated.
             came = b.fields.get("navigated_from", "")
@@ -316,7 +317,7 @@ class EdgeInference:
                                                 parse_qs(urlsplit(b.fields.get("url", "")).query).items()
                                                 if key in ("ref", "referrer", "from") for ref in refs))
                         add("navigated_from", 0.78 if corroborated else 0.35,
-                            (field, value), ("navigated_from", came))
+                            (field, value), ("navigated_from", came), value)
                         break
 
             # A copy must have a payload match; the clipboard counter alone is insufficient.
@@ -339,7 +340,7 @@ class EdgeInference:
                             if qb is None and re.search(r"\b(?:what is|explain|all about)\b", b.text, re.I):
                                 qb = find_quote(b, value, fields=("screen_text",))
                         if value and qb:
-                            add("clipboard", 0.96, find_quote(a, value), qb)
+                            add("clipboard", 0.96, find_quote(a, value), qb, value)
                             break
 
             # A real link or distinctive page label present on the source screen.
@@ -353,7 +354,7 @@ class EdgeInference:
                     qb = find_quote(b, value)
                     if qa and qb:
                         add("search" if fa.intent else "message_share" if fa.shared else "navigation",
-                            0.9, qa, qb)
+                            0.9, qa, qb, value)
                         break
 
                 # Bare host succession is contextual; a visible path label can
@@ -361,10 +362,10 @@ class EdgeInference:
                 ua, ub = a.fields.get("url", ""), b.fields.get("url", "")
                 if ua and ub and gap <= 90 and fa.host == fb.host and (
                     fa.host and fa.url_key != fb.url_key and not fa.intent):
-                    add("same_site_context", 0.3, ("url", ua), ("url", ub))
+                    add("same_site_context", 0.3, ("url", ua), ("url", ub), fa.host)
                     label = unquote(urlsplit(ub).path.rstrip("/").rsplit("/", 1)[-1]).replace("-", " ")
                     if len(label) >= 4 and not label.isdigit() and label.casefold() not in ("home", "index", "profile"):
-                        add("navigation", 0.87, find_quote(a, label, fields=("screen_text",)), ("url", ub))
+                        add("navigation", 0.87, find_quote(a, label, fields=("screen_text",)), ("url", ub), label)
 
             intent_a = fa.intent
             if intent_a and not same_page:
@@ -372,7 +373,7 @@ class EdgeInference:
                 matched = terms & fb.identity_terms
                 if matched:
                     term = min(matched, key=lambda t: df[t])
-                    add("search", 0.86, intent_a[1], find_quote(b, term))
+                    add("search", 0.86, intent_a[1], find_quote(b, term), term)
 
             # Product/brand named inside embedded media, then searched; also supports
             # a typed destination with shared subject terms (weaker evidence).
@@ -382,11 +383,11 @@ class EdgeInference:
                 term = min(rare, key=lambda t: (df[t], -len(t), t))
                 qa, qb = find_quote(a, term), find_quote(b, term)
                 if _MEDIA.search(a.fields.get("caption", "")) and intent_b:
-                    add("media_mention", 0.76, qa, qb)
+                    add("media_mention", 0.76, qa, qb, term)
                 elif fa.shared and not same_page:
-                    add("message_share", 0.72, qa, qb)
+                    add("message_share", 0.72, qa, qb, term)
                 elif a.app != b.app:
-                    add("app_switch", 0.58, qa, qb)
+                    add("app_switch", 0.58, qa, qb, term)
 
             # An omnibox entry can have a different name from the motivating post
             # (a model announcement → a model registry). Preserve the current topic
@@ -398,7 +399,7 @@ class EdgeInference:
                 contextual = {t for t in context_terms if df[t] <= max(3, window_n * 0.15) or len(t) >= 8}
                 if contextual and fa.shared:
                     term = min(contextual, key=lambda t: (df[t], -len(t), t))
-                    add("typed_navigation", 0.68, find_quote(a, term), find_quote(b, term, fields=("caption",)))
+                    add("typed_navigation", 0.68, find_quote(a, term), find_quote(b, term, fields=("caption",)), term)
 
             # State explanation: recent foreground evidence is only *possibly* still
             # running. Require its app to be named by an import/setup screen, or by
@@ -407,9 +408,9 @@ class EdgeInference:
                 setup = next((ordered[j] for j in reversed(self.imports.get(b.app, []))
                               if low <= j < i and find_quote(ordered[j], a.app)), None)
                 if find_quote(b, a.app) or setup:
-                    add("state_context", 0.6, ("app", a.app), find_quote(b, _ERROR.search(b.text)[0]))
+                    add("state_context", 0.6, ("app", a.app), find_quote(b, _ERROR.search(b.text)[0]), a.app)
             elif _ERROR.search(b.text) and a.app == b.app and re.search(r"\bimport", a.text, re.I):
-                add("state_selection", 0.7, find_quote(a, "import"), find_quote(b, _ERROR.search(b.text)[0]))
+                add("state_selection", 0.7, find_quote(a, "import"), find_quote(b, _ERROR.search(b.text)[0]), "import")
 
             if proposed:
                 best = max(proposed, key=lambda e: e.confidence)
@@ -439,7 +440,7 @@ def infer_edges(moments: list[AttentionMoment], *, target_id: int | None = None,
 
 
 def rules_key() -> str:
-    return f"v2:{T.PROVENANCE_WINDOW_S}:{T.PROVENANCE_MAX_PARENTS}"
+    return f"v3:{T.PROVENANCE_WINDOW_S}:{T.PROVENANCE_MAX_PARENTS}"
 
 
 async def build_provenance(store: Store, *, backfill: bool = False) -> int:

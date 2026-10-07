@@ -541,6 +541,11 @@ def m014_pages(conn: sqlite3.Connection) -> None:
     END""")
 
 
+def m015_provenance_term(conn: sqlite3.Connection) -> None:
+    """The visible term or value that links two attention moments."""
+    _add_column(conn, "attention_provenance", "term", "TEXT")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_base,
     m002_draft_attempts_and_digest_counts,
@@ -556,6 +561,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m012_episode_draft_state,
     m013_attention_provenance,
     m014_pages,
+    m015_provenance_term,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

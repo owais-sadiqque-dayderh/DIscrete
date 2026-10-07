@@ -14,7 +14,7 @@ from discrete.process.provenance import build_provenance, infer_edges, valid_edg
 from discrete.retrieval.grounding import evaluate
 from discrete.retrieval.hybrid import expand_why
 from discrete.retrieval.query import fallback_plan
-from discrete.retrieval.support import verify_support
+from discrete.retrieval.support import _PROMPT, _record, verify_support
 from discrete.retrieval.why import chain_hits, render_chain, resolve_why, walk_back
 from discrete.store import Store
 
@@ -62,6 +62,11 @@ async def test_edge_kinds_have_real_quotes(store, kind, source, target):
     assert all(e.gap_s == 20 and valid_edge(e, {m.sighting_id: m for m in moments}) for e in edges)
     assert await build_provenance(store) == len(edges)
     assert await build_provenance(store) == 0
+    assert await store.provenance_edges(T0, T0 + 25) == edges
+    assert all(e.term for e in edges)
+    if kind in ("search", "media_mention"):
+        assert next(e for e in edges if e.kind == kind).term == "quartz"
+    assert await build_provenance(store, backfill=True) == len(edges)
     assert await store.provenance_edges(T0, T0 + 25) == edges
 
 
@@ -524,3 +529,68 @@ async def test_non_why_timeout_still_removes_provenance_hits(fake, monkeypatch):
     await verify_support(result)
     assert result.hits == [ordinary] and not ordinary.strong
     assert result.why_chain is None
+
+
+async def test_media_chain_records_explain_the_link_to_the_verifier(store):
+    caption = "An X post by Ravi contains an embedded demo video."
+    source = await obs(store, 0, "Ravi's post", "Distant unrelated header\n" + "Before\n" * 40 +
+                       "Quartz\nFile\nEdit\nView", caption=caption)
+    await obs(store, 20, "Quartz - Web Search", url="https://search.test/?q=Quartz", keys=6)
+    await obs(store, 40, "Quartz", url="https://quartz.test/")
+    moments = await store.attention_moments(T0, T0 + 45)
+    chain = walk_back(moments[-1], moments, infer_edges(moments))
+    hit = next(h for h in chain_hits(chain) if h.ref_id == source)
+    record = _record(0, hit)
+    assert caption in record["text"] and "Ravi's post" in record["text"]
+    assert "Distant unrelated header" not in record["text"]
+    assert "> Matched line [screen_text]: **Quartz**" in record["text"]
+    assert "the term 'quartz' appears inside embedded media (video/image)" in record["context"]
+    assert "the next step searched for/opened 'quartz'" in record["context"]
+    search = next(h for h in chain_hits(chain) if "search:" in h.via)
+    assert "searched for 'quartz'" in search.via
+    assert "term='quartz'" in render_chain(chain)
+    effect = next(h for h in chain_hits(chain) if h.ref_id == chain.effect.observation_id)
+    assert "preceded by sighting" in effect.via and "searched for 'quartz'" in effect.via
+
+
+async def test_m015_upgrades_m014_and_reads_legacy_terms(tmp_path):
+    from discrete.store import db
+
+    path = str(tmp_path / "m014.db")
+    conn = sqlite3.connect(path, check_same_thread=False)
+    for migration in db.MIGRATIONS[:14]:
+        migration(conn)
+    conn.execute("PRAGMA user_version=14")
+    conn.execute("INSERT INTO sightings(id,obs_id,started_at,ended_at) VALUES (1,1,?,?),(2,2,?,?)",
+                 (T0, T0 + 1, T0 + 20, T0 + 21))
+    conn.execute("INSERT INTO attention_provenance VALUES (1,2,'navigation',0.9,'screen_text','Quartz',"
+                 "'screen_text','Quartz',20)")
+    conn.commit()
+    conn.row_factory = sqlite3.Row
+    legacy = Store(conn)
+    assert (await legacy.provenance_edges(T0, T0 + 25))[0].term == ""
+    await legacy.close()
+
+    upgraded = await Store.open(path)
+    try:
+        assert (await upgraded.q1("PRAGMA user_version"))[0] == 15
+        column = next(r for r in await upgraded.q("PRAGMA table_info(attention_provenance)") if r["name"] == "term")
+        assert column["notnull"] == 0
+        assert (await upgraded.q1("SELECT term FROM attention_provenance"))[0] is None
+        edge = (await upgraded.provenance_edges(T0, T0 + 25))[0]
+        assert edge.term == ""
+        chain = walk_back(_node(2, T0 + 20), [_node(1, T0), _node(2, T0 + 20)], [edge])
+        assert "--navigation 0.90" in render_chain(chain)
+        assert "navigation → sighting 2" in chain_hits(chain)[0].via
+        await upgraded.execute("UPDATE attention_provenance SET term='Quartz'")
+        assert (await upgraded.provenance_edges(T0, T0 + 25))[0].term == "Quartz"
+    finally:
+        await upgraded.close()
+    again = await Store.open(path)
+    await again.close()
+
+
+def test_why_support_prompt_explains_visible_linking_terms():
+    assert "linking term is visibly present before the next step" in _PROMPT
+    assert "including inside embedded media" in _PROMPT
+    assert "action, not of motive" in _PROMPT

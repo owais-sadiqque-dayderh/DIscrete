@@ -295,6 +295,39 @@ async def resolve_why(store: Store, question: str, *, plan: QueryPlan | None = N
     return chain
 
 
+def _link_description(edge: ProvenanceEdge) -> str:
+    if not edge.term:
+        return edge.kind.replace("_", " ")
+    term = f"'{edge.term}'"
+    descriptions = {
+        "media_mention": f"the term {term} appears inside embedded media (video/image) on this screen, "
+                         f"and the next step searched for/opened {term}",
+        "search": f"searched for {term}, then opened a matching page",
+        "navigation": f"opened the linked page {term}",
+        "navigated_from": f"opened a page from {term}",
+        "message_share": f"{term} was shared in a message or post",
+        "clipboard": f"copied {term}, then used it in the next step",
+        "app_switch": f"{term} was visible before switching apps to the next step",
+        "same_site_context": f"continued browsing the same site {term}",
+        "typed_navigation": f"{term} was visible before typing the next destination",
+        "state_context": f"{term} was recently foregrounded before the import error; may still be running",
+        "state_selection": f"selected {term} before the import error",
+    }
+    return descriptions.get(edge.kind, f"{edge.kind.replace('_', ' ')} involving {term}")
+
+
+def _chain_quote(field: str, quote: str, term: str) -> str:
+    text = f"> [{field}] {quote}"
+    if term:
+        pattern = re.compile(r"\s+".join(re.escape(p) for p in term.split()), re.I)
+        if match := pattern.search(quote):
+            start = quote.rfind("\n", 0, match.start()) + 1
+            end = quote.find("\n", match.end())
+            line = quote[start:end if end >= 0 else len(quote)]
+            text += f"\n> Matched line [{field}]: **{line}**"
+    return text
+
+
 def chain_hits(chain: WhyChain) -> list[Hit]:
     """Compact ordered raw records for the regular support verifier and writer."""
     if chain.effect is None or not chain.edges:
@@ -306,19 +339,25 @@ def chain_hits(chain: WhyChain) -> list[Hit]:
         context = []
         for edge in chain.edges:
             if moment.sighting_id == edge.source:
-                quotes.append(f"> [{edge.source_field}] {edge.source_quote}")
+                quotes.append(_chain_quote(edge.source_field, edge.source_quote, edge.term))
                 target = by_id[edge.target]
-                context.append(f"{edge.kind} → sighting {edge.target} ({target.title[:100]}) at "
+                context.append(f"{edge.kind}: {_link_description(edge)} → sighting {edge.target} ({target.title[:100]}) at "
                                f"{to_local(target.at):%H:%M:%S}; confidence {edge.confidence:.2f}; gap {edge.gap_s:.0f}s")
             if moment.sighting_id == edge.target:
-                quotes.append(f"> [{edge.target_field}] {edge.target_quote}")
+                quotes.append(_chain_quote(edge.target_field, edge.target_quote, edge.term))
+                source = by_id[edge.source]
+                context.append(f"preceded by sighting {edge.source} ({safe_text(source.title)[:100]}): "
+                               f"{edge.kind}: {_link_description(edge)}; confidence {edge.confidence:.2f}; "
+                               f"gap {edge.gap_s:.0f}s")
+        caption = safe_text(moment.fields.get("caption", "") or moment.title)
+        quotes.insert(0, f"Screen: {safe_text(moment.title)[:100]}. Caption: {caption[:300]}")
         via = "attention provenance (inferred, requires support check)"
         if moment.sighting_id == chain.effect.sighting_id:
             via += "; effect"
         if context:
             via += "; " + "; ".join(context)
         out.append(Hit("observation", moment.observation_id, safe_text(f"{moment.app} — {moment.title}"),
-                       "\n".join(dict.fromkeys(quotes)), occurred_at=moment.at, occurred_to=moment.ended_at,
+                       safe_text("\n".join(dict.fromkeys(quotes))), occurred_at=moment.at, occurred_to=moment.ended_at,
                        url=safe_text(moment.fields.get("url", "")), untrusted=True, via=safe_text(via), confidence=chain.confidence))
     return out
 
@@ -338,8 +377,9 @@ def render_chain(chain: WhyChain, *, details: bool = True) -> str:
              f"{to_local(chain.effect.at):%Y-%m-%d %H:%M:%S} {chain.effect.title}"]
     for edge in chain.edges:
         source, target = by_id[edge.source], by_id[edge.target]
+        term = f", term={edge.term!r}" if edge.term else ""
         lines.append(f"{to_local(source.at):%H:%M:%S} obs {source.observation_id} [{source.title}] "
-                     f"--{edge.kind} {edge.confidence:.2f}, {edge.gap_s:.0f}s--> "
+                     f"--{edge.kind}{term} {edge.confidence:.2f}, {edge.gap_s:.0f}s--> "
                      f"{to_local(target.at):%H:%M:%S} obs {target.observation_id} [{target.title}]")
         if details:
             lines += [f"  source [{edge.source_field}]: {edge.source_quote}",
