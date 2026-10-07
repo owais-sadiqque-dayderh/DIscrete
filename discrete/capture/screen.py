@@ -166,7 +166,7 @@ class ScreenObserver:
                 self._rotate()
         if self._pending is None:
             before = self._latest
-            if before is not None and denied(before[1].app, before[1].bundle_id, before[1].url):
+            if before is not None and denied(before[1].app, before[1].bundle_id, before[1].url, window_title=before[1].window_title):
                 before = None
             if cur is not None and before is not None and before[1].key != cur.key:
                 before = None  # the cached frame shows the page we just left, not this one
@@ -201,14 +201,14 @@ class ScreenObserver:
                 ctx = await asyncio.to_thread(ax.window_context)
                 url = ctx.url or await asyncio.to_thread(browser_url, ctx.app)
                 ctx = dataclasses.replace(ctx, url=url)
-                if denied(ctx.app, ctx.bundle_id, url):
+                if not (ctx.app or ctx.bundle_id) or denied(ctx.app, ctx.bundle_id, url, window_title=ctx.window_title):
                     self._latest = None
                     self._recent.clear()
                     img = None
                 else:
                     img = await asyncio.to_thread(self.grabber.grab, ctx.bounds,
                                                   max_width=T.FRAME_MAX_WIDTH, window_id=ctx.window_id)
-                if img is not None and not denied(ctx.app, ctx.bundle_id, ctx.url):
+                if img is not None and not denied(ctx.app, ctx.bundle_id, ctx.url, window_title=ctx.window_title):
                     # Only the newest frame keeps its native-resolution copy for OCR (a 5K
                     # window is ~44 MB): an older one, used by a rotated capture, is OCR'd at
                     # storage resolution.
@@ -247,7 +247,7 @@ class ScreenObserver:
             return
         ctx: ax.WindowContext = pending["before_ctx"]
         own = next((img for img, c in reversed(self._recent)
-                    if c.key == ctx.key and not denied(c.app, c.bundle_id, c.url)), None)
+                    if c.key == ctx.key and not denied(c.app, c.bundle_id, c.url, window_title=c.window_title)), None)
         after = own if own is not None else pending["before_img"]
         if after is None:
             self.stats["dropped_failed"] += 1  # degraded: no frame, but still segment the boundary
@@ -278,14 +278,16 @@ class ScreenObserver:
         # The tab URL comes from the web view (window_context); AppleScript is a slow fallback.
         t0 = time.perf_counter()
         url = ctx.url or ("" if stale else await asyncio.to_thread(browser_url, ctx.app))
-        if denied(ctx.app, ctx.bundle_id, url):
+        if not (ctx.app or ctx.bundle_id) or denied(ctx.app, ctx.bundle_id, url, window_title=ctx.window_title):
             # Before any text is read or any frame saved: a denied window leaves nothing.
             self.stats["denied"] += 1
             return
         # Before frames belong to their frozen contexts, not the new destination.
         # Unknown context is unsafe too (including direct/internal capture callers).
         before_ctx = pending.get("before_ctx")
-        if before is not None and (before_ctx is None or denied(before_ctx.app, before_ctx.bundle_id, before_ctx.url)):
+        if before is not None and (before_ctx is None or denied(
+            before_ctx.app, before_ctx.bundle_id, before_ctx.url, window_title=before_ctx.window_title,
+        )):
             before = None
         if T.REDACT_SECRETS:  # title and URL now; the text once it is read
             meta = redact_capture(ctx.window_title, url, "", memory=self._secrets)

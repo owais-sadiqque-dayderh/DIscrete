@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import sys
 import threading
 import time
@@ -52,7 +53,11 @@ class FrameGrabber:
 
     def grab(self, bounds: tuple[float, float, float, float] | None, *, max_width: int,
              window_id: int = 0) -> Image.Image | None:
-        """Grab the window region (global points); whole main display if no bounds."""
+        """Grab only a valid window region (global points); never expand scope."""
+        if bounds is None or len(bounds) != 4 or not all(math.isfinite(v) for v in bounds):
+            return None
+        if bounds[2] < 40 or bounds[3] < 40:
+            return None
         if self._sck is not None and window_id:
             with self._window_lock:
                 return self._grab_window(window_id, max_width)
@@ -73,7 +78,7 @@ class FrameGrabber:
             if right - left >= 40 and bottom - top >= 40:
                 region = {"left": left, "top": top, "width": right - left, "height": bottom - top}
         if region is None:
-            region = monitors[0]
+            return None
         try:
             shot = sct.grab(region)
         except Exception as exc:

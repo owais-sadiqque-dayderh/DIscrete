@@ -41,21 +41,36 @@ _SITES = tuple(s.lower().removeprefix("www.").strip(".") for s in T.DENIED_SITES
 
 def _host(url: str) -> str:
     try:
-        return (urlsplit(url).hostname or "").lower()
-    except ValueError:
+        return (urlsplit(url).hostname or "").lower().rstrip(".").removeprefix("www.").encode("idna").decode("ascii")
+    except (ValueError, UnicodeError):
         return ""
 
 
-def denied(app: str = "", bundle_id: str = "", url: str = "") -> str:
+def denied(app: str = "", bundle_id: str = "", url: str = "", *, window_title: str = "") -> str:
     """Why this window must not be watched ("app" or "site"), or "" when it may be.
 
     An app matches by its name or bundle id (case-insensitive, whole value). A site
-    matches its host and every subdomain: "google.com" covers mail.google.com, while
+    Unknown browser URLs and recognizable private-window titles are excluded.
+    Title detection covers English incognito/private markers only; it cannot prove
+    that an unmarked window is public. Browser/version validation remains necessary.
+    A site matches its host and every subdomain: "google.com" covers mail.google.com, while
     "mail.google.com" covers only Gmail.
     """
     if (app or "").lower() in _APPS or (bundle_id or "").lower() in _APPS:
         return "app"
+    browser = (app or "").lower() in {
+        "arc", "google chrome", "chrome", "safari", "firefox", "microsoft edge", "brave browser",
+    } or (bundle_id or "").lower() in {
+        "company.thebrowser.browser", "com.google.chrome", "com.apple.safari", "org.mozilla.firefox",
+    }
+    # Simple detectable-title policy, not a claim of universal private-mode detection.
+    if browser and any(marker in window_title.lower() for marker in (
+        "incognito", "private browsing", "private window", "inprivate",
+    )):
+        return "private"
     host = _host(url)
-    if host and any(host == site or host.endswith("." + site) for site in _SITES):
+    if browser and not host:
+        return "unknown_url"
+    if host and any(host == _host("https://" + site) or host.endswith("." + _host("https://" + site)) for site in _SITES):
         return "site"
     return ""
