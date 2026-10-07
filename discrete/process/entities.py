@@ -21,6 +21,7 @@ _FILE = re.compile(r"\b[\w.-]+\.(?:py|js|ts|tsx|md|json|ya?ml|csv|pdf|ai|psd|fig
 _DOMAIN = re.compile(r"\b(?:[\w-]+\.)+(?:com|co|io|org|net|dev|app|ai|design|so|me|xyz)\b", re.I)
 _HANDLE = re.compile(r"(?<!\w)@[A-Za-z][\w.]{2,}")
 _REPO = re.compile(r"\b[A-Za-z][\w.-]+/[A-Za-z][\w.-]+\b")
+_DIGITS = re.compile(r"\d+")
 
 # Document chrome and generic category words are never promoted (planS2 §10.3).
 _CHROME = re.compile(r"^(?:untitled|artboard|new tab|new document|document|page|layer|tab|window)\b[\s\d-]*$", re.I)
@@ -79,13 +80,24 @@ def infer_kind(name: str) -> str:
     return "unknown"
 
 
+def _distinct(a: str, b: str) -> bool:
+    """Names that are never one entity however alike they look: different numbers
+    (Atlas 101 / Atlas 102), or two different identifiers of one shape (acme.com /
+    acme.org, report.py / report.md). A name and an identifier may still meet (Acme /
+    acme.com): that is what the identity key is for."""
+    if _DIGITS.findall(a) != _DIGITS.findall(b):
+        return True
+    kind = infer_kind(a)
+    return kind != "unknown" and kind == infer_kind(b) and tk.norm_key(a) != tk.norm_key(b)
+
+
 async def _adjudicate(a: str, b: str) -> bool:
     ep = insight_endpoint()
     if not ep.configured:
         return False  # no model → no merge; a duplicate is cheaper than a false merge
     try:
         data = await complete_json(ep, [{"role": "user", "content": ADJUDICATE_PROMPT.format(a=a, b=b)}], max_tokens=30)
-        return bool((data or {}).get("same"))
+        return isinstance(data, dict) and data.get("same") is True  # "false" is a truthy string
     except EXPECTED_ERRORS:
         return False
 
@@ -99,12 +111,13 @@ async def resolve_existing(store: Store, name: str, *, use_embeddings: bool = Fa
     if not key:
         return None
     if (eid := await store.find_entity_by_key(key)) is not None:
-        return eid
+        row = await store.get_entity(eid)
+        return None if row and _distinct(name, row["name"]) else eid
     if len(key) >= 5:
         # The alias list is cached by the store until the alias table changes.
         best, best_score = None, 0.0
         for a in await store.all_entity_aliases():
-            if len(a["norm_key"]) < 5:
+            if len(a["norm_key"]) < 5 or _distinct(name, a["alias"]):
                 continue
             s = fuzz.WRatio(key, a["norm_key"]) if abs(len(key) - len(a["norm_key"])) <= 3 else fuzz.ratio(key, a["norm_key"])
             if s > best_score:
@@ -119,7 +132,7 @@ async def resolve_existing(store: Store, name: str, *, use_embeddings: bool = Fa
             return None
         for eid, _sim in await store.dense_search("entity", vec, limit=3, min_sim=T.ENTITY_EMBED_SIM):
             row = await store.get_entity(eid)
-            if row and await _adjudicate(name, row["name"]):
+            if row and not _distinct(name, row["name"]) and await _adjudicate(name, row["name"]):
                 return eid
     return None
 
