@@ -958,3 +958,17 @@ Sources: Cognition "agent memory repo" (cognition.com/agent-memory-repo), Hindsi
 - OpenRouter credit at 15:12: **$4.99** remaining (core key). Final round est. $1.5-2.
 - 4cdeaf8: completion-evidence rule (writer + verifier) and premise-question flag. Live check: airline -> refusal, "switch to A or B" -> refusal, ChatGPT install still answered (dmg dragged to Applications), Mem0 comparison not invented. 724 tests.
 - **FINAL ROUND RUNNING** @ 4cdeaf8 from ../exp_discrete_eval: `bench/private/eval_final.sh` -> results/final-driver.log (ends "ALL DONE"). Results: live-main-a/b, live-final-a/b, live-final-old-drafts, g46-main-f, g46-final. All judged with the block harness (no rejudge needed).
+
+### ~16:00 IST — FINAL ROUND results (4cdeaf8; same block-judge harness for all)
+| run | overall | why | profile | temporal | unans. | recall | supported | p50 / p90 | writer $ |
+|---|---|---|---|---|---|---|---|---|---|
+| live-main-a | 0.517 (29) | 2/6 | 1/3 | 2/4 | 4/5 | 5/8 | 0.86 | 14.6 / 20.7 s | 0.066 |
+| live-main-b | 0.552 (29) | 4/6 | 1/3 | 2/4 | 3/5 | 5/8 | 0.76 | 13.7 / 21.5 s | 0.069 |
+| **live-final-a** (redrafted) | **0.800** | 6/6 | 3/3 | 3/4 | 5/5 | 6/9 | 0.93 | 15.6 / 32.5 s | 0.063 |
+| **live-final-b** (redrafted) | **0.733** | 5/6 | 3/3 | 3/4 | 4/5 | 6/9 | 0.97 | 15.5 / 31.4 s | 0.064 |
+| live-final-old-drafts | 0.767 | 6/6 | 2/3 | 3/4 | 5/5 | 6/9 | 0.90 | 15.1 / 22.8 s | 0.063 |
+| g46-main-f | 0.891 | – | 2/3 | 3/4 | 5/5 | 28/30 | 0.98 | 15.3 / 25.5 s | 0.113 |
+| g46-final | 0.804 | – | 2/3 | 4/4 | 4/5 | 25/30 | 0.87 | 13.8 / 26.2 s | 0.104 |
+- live1006 (the user's real session): main mean 0.534 -> branch mean **0.767** (+0.23); why 3/6 -> 5.5/6; profile 1/3 -> 3/3; temporal 2/4 -> 3/4.
+- g46: branch below main this run. Losses: judge strictness (AMO agent sent PMO.pdf -> "you sent" marked wrong x2; "around ₹54,259"), variance (Mathigon judged supported but marked wrong; HN late-night) and one real bug: two empty writer completions on "What is my annual salary?" -> extractive fallback "From xa11y: xa11y". Fixed in **edb7488** (silence twice -> refusal). g46 repeats running @ edb7488: `bench/private/eval_g46_rep.sh` -> results/g46rep-driver.log (g46-final-a/b, g46-main-g).
+- Credit after final round: $4.10.
