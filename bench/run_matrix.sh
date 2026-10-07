@@ -15,10 +15,26 @@ MAIN=../exp_discrete_main
 
 score() {  # name db cases code
   local name=$1 db=$2 cases=$3 code=$4
-  if [ -z "${FORCE:-}" ] && [ -f "$P/results/$name.json" ]; then echo "= $name (already scored)"; return; fi
+  if [ -z "${FORCE:-}" ] && [ -f "$P/results/$name.json" ]; then
+    check_valid "$name" || return 1
+    echo "= $name (already scored)"; return
+  fi
   echo "= scoring $name"
-  $PY bench/run_g46.py --name "$name" --db "$db" --cases "$cases" --code "$code" > "$P/results/$name.log" 2>&1
+  if ! $PY bench/run_g46.py --name "$name" --db "$db" --cases "$cases" --code "$code" > "$P/results/$name.log" 2>&1; then
+    tail -20 "$P/results/$name.log"
+    echo "ERROR: $name failed or is INVALID; matrix stopped. See $P/results/$name.log" >&2
+    return 1
+  fi
+  check_valid "$name" || return 1
   tail -16 "$P/results/$name.log"
+}
+
+check_valid() {
+  $PY -c 'import json,sys; result=json.load(open(sys.argv[1])); sys.exit(0 if result.get("valid", True) else 1)' \
+    "$P/results/$1.json" || {
+      echo "ERROR: $1 is INVALID (or unreadable); matrix stopped. Check provider health and rerun with FORCE=1." >&2
+      return 1
+    }
 }
 
 dreamed() {  # src -> copy with a dream run on it
