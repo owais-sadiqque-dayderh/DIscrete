@@ -304,7 +304,6 @@ class ScreenObserver:
         started, ended = pending["started"], time.time()
         phash = str(imagehash.phash(after)) if after is not None else ""
         sig = (ctx.app, ctx.window_title, url)
-
         prev = self._last_kept.get(sig)
         if phash and prev and imagehash.hex_to_hash(phash) - imagehash.hex_to_hash(prev) <= T.FRAME_PHASH_MAX_DIST:
             self.stats["frame_dup"] += 1
@@ -322,7 +321,8 @@ class ScreenObserver:
         PERF.sample("capture.text", since_ms(t_text), n=len(screen_text))
         if len(screen_text) >= T.SCREEN_TEXT_MAX_CHARS - 1:
             PERF.count("health.capture_screen_text_cap_hits")
-        drop = meta_secret or (isinstance(extracted, ScreenText) and not extracted.pixels_read)
+        # Pixels whose text could not be read cannot be approved for egress.
+        drop = meta_secret or (after is not None and isinstance(extracted, ScreenText) and not extracted.pixels_read)
         if T.REDACT_SECRETS:
             privacy_text = extracted.privacy_text if isinstance(extracted, ScreenText) else screen_text
             r = redact_capture("", "", privacy_text, text_source, memory=self._secrets)

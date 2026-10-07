@@ -49,3 +49,13 @@ async def test_failed_ocr_cannot_approve_pixels(store, fake, monkeypatch):
     cap = observer.queue.get_nowait()
     assert cap.job.frames == []
     assert 'failed' in cap.draft.text_source
+
+
+async def test_missing_frame_is_not_counted_as_redaction(store, fake, monkeypatch):
+    monkeypatch.setattr(ax, 'read_screen_text', lambda *a, **kw: 'Safe AX text')
+    observer = sc.ScreenObserver(queue=asyncio.Queue(), store=store)
+    ctx = ax.WindowContext(app='Editor', window_title='Document', pid=7)
+    pending = dict(kind='click', started=time.time(), counts=dict(keys=0, clicks=1, scrolls=0, clipboard=0))
+    await observer._capture(pending, ctx, None, None)
+    assert observer.stats['redacted'] == 0
+    assert observer.queue.get_nowait().draft.screen_text == 'Safe AX text'

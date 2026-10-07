@@ -15,7 +15,6 @@ class ExtractionFailed(RuntimeError):
     """OCR did not complete; this is not an empty successful read."""
 
 
-
 def ocr_image(img) -> str:
     """OCR a PIL image; returns lines in Vision's reading order."""
     if img is None:
