@@ -51,6 +51,13 @@ _CHROME_ROLES = frozenset({"AXMenuBar", "AXMenu", "AXToolbar", "AXScrollBar", "A
 _NAV_ROLES = frozenset({"AXLandmarkNavigation"})
 _TEXT_ROLES = frozenset({"AXStaticText", "AXTextArea", "AXTextView", "AXTextField"})
 _MIN_WINDOW_SIDE = 80
+# Unlocated/offscreen text is a small fallback, never an unbounded second walk.
+_MIN_VISIBLE_CHARS = 80
+_MAX_DEFERRED_CHARS = 256
+_MAX_DEFERRED_LINES = 8
+_TABLE_ROLES = frozenset({"AXTable", "AXGrid"})
+_CELL_ROLES = frozenset({"AXCell", "AXGridCell", "AXColumnHeader", "AXRowHeader"})
+_CONTROL_LABEL_ROLES = frozenset({"AXRadioButton", "AXCheckBox"})
 
 
 @dataclass
@@ -255,84 +262,203 @@ def _enable_full_tree(app_el, pid: int) -> None:
             pass
 
 
+def _node_frame(el):
+    """Chromium supplies position/size; some native adapters supply only frame."""
+    p = _point_xy(_ax_value(_ax_get(el, "AXPosition"), kAXValueCGPointType))
+    s = _size_wh(_ax_value(_ax_get(el, "AXSize"), kAXValueCGSizeType))
+    if p is None or s is None:
+        frame = _rect_xywh(_ax_value(_ax_get(el, "AXFrame"), kAXValueCGRectType))
+        if frame is not None:
+            p, s = frame[:2], frame[2:]
+    return p, s
+
+
+def _intersects(point, size, viewport) -> bool:
+    x, y, w, h = viewport
+    # Chromium clamps clipped text to a one-pixel strip at the viewport edge.
+    return (size[0] > 1 and size[1] > 1 and point[0] + size[0] > x
+            and point[0] < x + w and point[1] + size[1] > y and point[1] < y + h)
+
+
+def _deferred_full(values: list[str]) -> bool:
+    return (sum(map(len, values)) >= _MAX_DEFERRED_CHARS
+            or sum(bool(v) for v in values) >= _MAX_DEFERRED_LINES)
+
+
 def _walk_text(el, parts: list[str], *, depth: int, max_nodes: int, deadline: float, seen: list[int],
                viewport: tuple[float, float, float, float] | None = None,
                deferred: list[str] | None = None, in_banner: bool = False,
-               clipped_parent: bool = False, parent=None,
-               meta: list[tuple] | None = None, deferred_meta: list[tuple] | None = None) -> None:
+               clipped_parent: bool = False, parent=None, grandparent=None,
+               meta: list[tuple] | None = None, deferred_meta: list[tuple] | None = None,
+               in_table: bool = False, row=None, cell=None, row_table: bool = False) -> None:
     if depth > 40:
         PERF.count("health.capture_ax_depth_limit")
         return
-    if seen[0] >= max_nodes or time.monotonic() > deadline:
+    if seen[0] >= max_nodes or time.monotonic() >= deadline:
         return
     seen[0] += 1
     role = str(_ax_get(el, "AXRole") or "")
     if role in _CHROME_ROLES or role in _NAV_ROLES or (in_banner and role == "AXList"):
         return
-    visible = not clipped_parent
-    located = False
-    p = s = None
-    if viewport:
-        p = _point_xy(_ax_value(_ax_get(el, "AXPosition"), kAXValueCGPointType))
-        s = _size_wh(_ax_value(_ax_get(el, "AXSize"), kAXValueCGSizeType))
-        if p is not None and s is not None:
-            located = True
-            x, y, w, h = viewport
-            # Chromium clamps offscreen text to a one-pixel strip at the
-            # viewport edge. It intersects the window but is not readable.
-            visible = s[0] > 1 and s[1] > 1 and p[0] + s[0] > x and p[0] < x + w and p[1] + s[1] > y and p[1] < y + h
-    target = parts if located or deferred is None else deferred
+    # AXColumn is another projection of the same cells, not additional content.
+    # Outside a semantic table it may be the only available content, so retain it.
+    if row_table and role == "AXColumn":
+        return
+    p, s = _node_frame(el) if viewport else (None, None)
+    located = p is not None and s is not None
+    visible = _intersects(p, s, viewport) if located else not clipped_parent
+    if not visible and deferred is not None and (
+        sum(map(len, parts)) >= _MIN_VISIBLE_CHARS
+        or _deferred_full(deferred)
+    ):
+        return
+    if role in {"AXWebArea", "AXScrollArea"} and visible and located:
+        x, y, w, h = viewport
+        left, top = max(x, p[0]), max(y, p[1])
+        viewport = (left, top, min(x + w, p[0] + s[0]) - left,
+                    min(y + h, p[1] + s[1]) - top)
+    if role in _TABLE_ROLES:
+        in_table, row, cell = True, None, None
+    elif in_table and role == "AXRow":
+        row, cell = el, None
+    elif row is not None and role in _CELL_ROLES:
+        cell = el
+    target = parts if visible and (located or viewport is None) else deferred
     target_meta = meta if target is parts else deferred_meta
-    value = None
+
+    def emit(value):
+        if target is None:
+            return
+        if target is deferred and _deferred_full(target):
+            return
+        value = value.strip()
+        if target is deferred:
+            value = value[:_MAX_DEFERRED_CHARS - sum(map(len, target))]
+        target.append(value)
+        if target_meta is not None:
+            target_meta.append((role, parent, p, s, el, row, cell, grandparent))
+
     range_used = False
-    if role in {"AXTextArea", "AXTextView"}:
+    value = None
+    if role in {"AXTextArea", "AXTextView"} and visible:
         char_range = _ax_get(el, "AXVisibleCharacterRange")
         if char_range is not None:
             value = _ax_get_param(el, "AXStringForRange", char_range)
             range_used = isinstance(value, str)
-    if not range_used:
-        value = _ax_get(el, "AXValue")
-    title = _ax_get(el, "AXTitle") if not range_used and (not isinstance(value, str) or not value.strip()) else None
-
-    # A successful visible-range read replaces the text view's entire subtree.
     children = [] if range_used else (_ax_get(el, "AXChildren") or [])
+    if role in _TABLE_ROLES:
+        row_table = bool(_ax_get(el, "AXRows")) or any(
+            time.monotonic() < deadline and _ax_get(c, "AXRole") == "AXRow" for c in children)
+    # Chromium exposes some row headers (Wikipedia's rank) as a plain group.
+    # A wrapper containing semantic cells is not itself a cell.
+    if row is not None and parent == row and role == "AXGroup" and not any(
+        time.monotonic() < deadline and _ax_get(c, "AXRole") in _CELL_ROLES for c in children
+    ):
+        cell = el
+    # Preserve empty cells too: "A |  | C" must not shift C into column two.
+    if cell is el and target is not None:
+        emit("")
     before = (len(parts), len(deferred) if deferred is not None else 0)
-    if visible and role in _TEXT_ROLES:
-        selected = value if isinstance(value, str) and value.strip() else title
-        if isinstance(selected, str) and selected.strip():
-            target.append(selected.strip())
-            if target_meta is not None:
-                target_meta.append((role, parent, p, s))
+    if role in _TEXT_ROLES:
+        if not range_used:
+            value = _ax_get(el, "AXValue")
+            if not isinstance(value, str) or not value.strip():
+                value = _ax_get(el, "AXTitle")
+        if isinstance(value, str) and value.strip():
+            emit(value)
     for child in children:
+        if not visible and deferred is not None and _deferred_full(deferred):
+            break
         _walk_text(child, parts, depth=depth + 1, max_nodes=max_nodes, deadline=deadline, seen=seen,
                    viewport=viewport, deferred=deferred, in_banner=in_banner or role == "AXLandmarkBanner",
-                   clipped_parent=not visible, parent=el, meta=meta, deferred_meta=deferred_meta)
-
-    # Chromium puts a tweet's full aria label on a container and its visible
-    # words in descendants. Emit container text only when no child supplied text.
+                   clipped_parent=not visible, parent=el, grandparent=parent, meta=meta, deferred_meta=deferred_meta,
+                   in_table=in_table, row=row, cell=cell, row_table=row_table)
+    if time.monotonic() >= deadline:
+        return
+    # Read container labels only if descendants cannot supply painted text.
     if visible and role not in _TEXT_ROLES and not range_used:
         has_child_text = before != (len(parts), len(deferred) if deferred is not None else 0)
         if not has_child_text and not _has_text_child(children, deadline):
-            selected = value if isinstance(value, str) and value.strip() else title
+            selected = _ax_get(el, "AXValue")
+            if not isinstance(selected, str) or not selected.strip():
+                selected = _ax_get(el, "AXTitle")
             from_description = not isinstance(selected, str) or not selected.strip()
             if from_description:
                 selected = _ax_get(el, "AXDescription")
-            # Icon buttons and linked images expose spoken labels for controls
-            # whose words are not actually painted in the captured window.
             icon = ((from_description and role in {"AXButton", "AXLink"} and (s is None or s[0] < 48))
                     or (role == "AXImage" and _ax_get(parent, "AXRole") in {"AXButton", "AXLink"}))
             if not icon and isinstance(selected, str) and selected.strip():
-                target.append(selected.strip())
-                if target_meta is not None:
-                    target_meta.append((role, parent, p, s))
+                emit(selected)
+
+
+def _local_unique(parts: list[str], meta: list[tuple]) -> tuple[list[str], list[tuple]]:
+    """Remove duplicate AX projections in eight neighbouring emissions.
+
+    Equal words at different positions (or in distinct comments/cells) survive.
+    Missing geometry alone is not evidence that repeated text is redundant.
+    """
+    out, locations = [], []
+    recent: list[tuple[str, tuple]] = []
+    for value, current in zip(parts, meta, strict=True):
+        key = " ".join(value.split())
+        point, size = current[2:4]
+        duplicate = False
+        for old_key, old in recent[-8:]:
+            if not key or key != old_key or current[6] != old[6]:
+                continue
+            same_element = current[4] == old[4]
+            same_frame = (point is not None and size is not None and old[2] is not None and old[3] is not None
+                          and all(abs(a - b) <= 2 for a, b in zip((*point, *size), (*old[2], *old[3]), strict=True)))
+            # A radio/checkbox's aria title can name text in an adjacent
+            # label sibling. Require both a shared local group and geometry.
+            control, label = (current, old) if current[0] in _CONTROL_LABEL_ROLES else (old, current)
+            sibling_label = (
+                control[0] in _CONTROL_LABEL_ROLES and label[0] == "AXStaticText"
+                and control[2] is not None and control[3] is not None and label[2] is not None
+                and (control[1] == label[1] or control[1] == label[7])
+                and abs(control[2][1] - label[2][1]) <= 4
+                and 0 <= label[2][0] - (control[2][0] + control[3][0]) <= 32
+            )
+            if same_element or same_frame or sibling_label:
+                duplicate = True
+                break
+        recent.append((key, current))
+        if len(recent) > 8:
+            del recent[0]
+        if not duplicate:
+            out.append(value)
+            locations.append(current)
+    return out, locations
 
 
 def _merge_static_runs(parts: list[str], meta: list[tuple]) -> list[str]:
-    """Join adjacent static text nodes that form one visual line."""
+    """Join visual text runs, then cells within each semantic row."""
+    parts, meta = _local_unique(parts, meta)
     out: list[str] = []
     prior = None
+    active_row = active_cell = None
+    cells: list[str] = []
+
+    def flush_row():
+        if cells and any(cells):
+            out.append(" | ".join(cells))
+        cells.clear()
+
     for value, current in zip(parts, meta, strict=True):
-        role, parent, point, size = current
+        role, parent, point, size, _, row, cell, _ = current
+        if row != active_row:
+            flush_row()
+            active_row, active_cell, prior = row, None, None
+        if row is not None and cell is not None:
+            if cell != active_cell:
+                cells.append("")
+                active_cell = cell
+            if value:
+                cells[-1] = " ".join(filter(None, (cells[-1], " ".join(value.split()))))
+            prior = None
+            continue
+        if not value:
+            continue
         if prior is not None and role == prior[0] == "AXStaticText" and "\n" not in value and "\n" not in out[-1]:
             old_point, old_size = prior[2], prior[3]
             same_line = point is not None and old_point is not None and abs(point[1] - old_point[1]) <= 4
@@ -346,6 +472,7 @@ def _merge_static_runs(parts: list[str], meta: list[tuple]) -> list[str]:
                 continue
         out.append(value)
         prior = current
+    flush_row()
     return out
 
 
@@ -403,11 +530,14 @@ def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: in
             PERF.count("health.capture_ax_empty.no_window")
             return ""
         if viewport:
-            p = _point_xy(_ax_value(_ax_get(win, "AXPosition"), kAXValueCGPointType))
-            s = _size_wh(_ax_value(_ax_get(win, "AXSize"), kAXValueCGSizeType))
+            p, s = _node_frame(win)
             if p is not None and s is not None and any(abs(a - b) > 2 for a, b in zip((*p, *s), viewport, strict=True)):
                 PERF.count("health.capture_ax_empty.viewport_mismatch")
                 return ""  # another window of the same app gained focus; trust captured pixels
+        if viewport is None:
+            p, s = _node_frame(win)
+            if p is not None and s is not None:
+                viewport = (*p, *s)
         deadline = time.monotonic() + timeout_ms / 1000.0
         searched = [0]
         if T.AX_TEXT_MARKERS and viewport and max_nodes >= 4:
@@ -430,12 +560,11 @@ def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: in
         _walk_text(win, parts, depth=0, max_nodes=remaining_nodes,
                    deadline=deadline, seen=seen,
                    viewport=viewport, deferred=deferred, meta=meta, deferred_meta=deferred_meta)
-        # Adjacent duplicates are common (title + value of one element).
-        out: list[str] = []
-        for p in (*_merge_static_runs(parts, meta), *_merge_static_runs(deferred, deferred_meta)):
-            if not out or out[-1] != p:
-                out.append(p)
+        out = _merge_static_runs(parts, meta)
         text = "\n".join(out)
+        if viewport and len(text) < _MIN_VISIBLE_CHARS:
+            tail = "\n".join(_merge_static_runs(deferred, deferred_meta))[:_MAX_DEFERRED_CHARS]
+            text = "\n".join(filter(None, (text, tail)))
         expired = time.monotonic() > deadline
         exhausted = seen[0] >= remaining_nodes
         if expired:

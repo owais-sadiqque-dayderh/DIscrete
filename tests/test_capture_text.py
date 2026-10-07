@@ -47,7 +47,7 @@ def test_description_does_not_repeat_text_children(monkeypatch):
     nodes["hidden_text"] = {"AXRole": "AXStaticText", "AXValue": "Offscreen text",
                             "AXPosition": (240, 10), "AXSize": (100, 20)}
     nodes["leaf"] = {"AXRole": "AXImage", "AXDescription": "Chart"}
-    assert _read(monkeypatch, nodes) == "Visible article\nChart"
+    assert _read(monkeypatch, nodes) == "Visible article\nOffscreen text\nChart"
 
 
 def test_text_area_uses_visible_range_and_falls_back_when_unsupported(monkeypatch):
@@ -84,9 +84,9 @@ def test_viewport_culls_offscreen_and_navigation_but_keeps_main(monkeypatch):
                                 "AXSize": (100, 30), "AXChildren": ["unlocated_child"]}
     nodes["unlocated_child"] = {"AXRole": "AXStaticText", "AXValue": "Hidden child"}
     nodes["main"] = {"AXRole": "AXLandmarkMain", "AXChildren": ["body"]}
-    nodes["body"] = {"AXRole": "AXStaticText", "AXValue": "Main content",
+    nodes["body"] = {"AXRole": "AXStaticText", "AXValue": "Main content " * 7,
                      "AXPosition": (10, 20), "AXSize": (100, 20)}
-    assert _read(monkeypatch, nodes) == "Main content"
+    assert _read(monkeypatch, nodes) == ("Main content " * 7).strip()
 
 
 def test_truncation_prefers_located_viewport_text(monkeypatch):
