@@ -173,8 +173,10 @@ async def _verify(claim, links: list[dict]) -> list[dict]:
     payload = {"action": {"text": claim["text"], "at": f"{to_local(claim['occurred_from']):%H:%M:%S}"},
                "links": [{"index": i, "role": lk["relation"], "at": f"{to_local(lk['at']):%H:%M:%S}",
                           "quote": lk["quote"], "explanation": lk["explanation"]} for i, lk in enumerate(links)]}
+    # The claim verifier's budget: 60 + 30 per link left a reasoning model no room to
+    # think before answering. VERIFY_LM_EXTRA_TOKENS still adds to it (llm.py).
     data = await complete_obj(ep, [{"role": "user", "content": VERIFY_TRAIL_PROMPT.format(
-        payload=json.dumps(payload, ensure_ascii=False))}], max_tokens=60 + 30 * len(links))
+        payload=json.dumps(payload, ensure_ascii=False))}], max_tokens=400 + 200 * len(links))
     decisions = supported(data, len(links), "trail verifier")
     return [lk for lk, ok in zip(links, decisions, strict=True) if ok]
 
