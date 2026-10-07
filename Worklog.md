@@ -465,6 +465,22 @@ This audit shows where each proposed feature starts from. Code paths are relativ
   - **Effect on the running eval:** #1 doesn't apply (the bench dbs have no user directives). #7 may slightly bias
     entity promotion in the `-v2` dbs; noted for interpreting `g46-branch-v2` / `live-branch-v2`.
   - All 9 are being fixed by Codex with regression tests (`…exp-discrete-review-r2-fix-1`).
+- **Retry policy committed** `c12ae56` (375 tests): attempts keep their transport timeout; budgets gate only retry
+  starts.
+- **Evaluation stopped (~08:05): provider outage.**
+  - `g46-branch` crashed when one `ask` hit the harness's 300 s subprocess timeout. A manual repro showed retrieval in
+    11 s, then 190 s of silence from the writer: three 60 s read timeouts under the old code's SDK retries.
+  - A direct probe showed OpenRouter returning `service_overloaded` with `Retry-After: 60` for
+    `meta/muse-spark-1.3-contributor` on every request.
+  - Answers produced in this window are invalid (empty or timed out), so all eval jobs and the two v2 re-drafts were
+    killed. No scores from this attempt are kept.
+  - A background probe sends one tiny muse request every 2 min and reports after two successes in a row.
+- **Harness gaps found:** `run_g46.py` lets a `TimeoutExpired` kill the whole run (it should record an error and
+  continue). An outage also produces empty answers that are judged as wrong, so the harness should flag a run whose
+  error rate exceeds a threshold as invalid instead of reporting a score. Both go to Codex.
+- **Re-run plan when muse is healthy:** a new frozen worktree at the final commit (retry policy + review fixes).
+  Re-create `branch-v2` with the fixed `redraft.py`, then score everything in parallel, with fewer concurrent jobs
+  (≤4) to avoid adding load.
 
 ---
 
