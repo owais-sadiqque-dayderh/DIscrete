@@ -12,7 +12,7 @@ from discrete.models import ClaimDraft, ObservationDraft
 from discrete.process import dream as dr
 from discrete.process.dream import run_dream
 from discrete.process.profile import render_profile
-from discrete.timeutil import now
+from discrete.timeutil import now, to_local
 
 DAY = 86400.0
 
@@ -71,7 +71,10 @@ async def test_code_checks_reject_bad_patterns(store, fake, proposal, why):
     assert report["patterns"]["added"] == 0 and report["patterns"]["rejected"] == {why: 1}
 
 
-async def test_habits_need_several_days_projects_do_not(store, fake):
+async def test_habits_need_several_days_projects_do_not(store, fake, monkeypatch):
+    # All three sittings are on one local calendar day, including when run before dawn.
+    noon = to_local(now()).replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+    monkeypatch.setattr(__name__ + ".now", lambda: noon)
     ids = [await _memory(store, "The user worked on the AMO agent repository", day=0, episode=20 + i,
                          hours_ago=2 * i) for i in range(3)]
     fake.dream = {"patterns": [_pattern(ids, "The user works on AMO in the evenings", "habit"),
@@ -115,7 +118,7 @@ async def test_audit_retires_and_withdrawn_support_retires(store, fake):
     for cid in ids:
         await store.forget_claim(cid)
     fake.dream = {"patterns": [], "audit": []}
-    assert (await run_dream(store))["patterns"]["retired"] == 1
+    assert (await run_dream(store))["patterns"]["retired"] == 0  # withdrawal already revalidated it
     assert (await store.get_claim(p["id"]))["status"] == "retired"
 
 
@@ -199,5 +202,108 @@ async def test_a_crashing_step_neither_stops_the_others_nor_reruns_every_minute(
     fake.profile = {"sections": []}
     report = await run_dream(store)
     assert "error" in report["patterns"] and "stale" in report and "error" not in report["stale"]
-    assert float(await store.get_meta("last_dream", "0")) > 0
+    assert float(await store.get_meta("last_dream", "0")) == 0  # a failed run keeps its episodes pending
+    assert float(await store.get_meta("last_dream_attempt", "0")) > 0  # but is not retried every minute
     assert ids
+
+
+async def test_quote_sample_does_not_erase_support_membership(store, fake, monkeypatch):
+    monkeypatch.setattr(T, "EVIDENCE_MAX_SUPPORTS", 1)
+    ids = await _football(store)
+    fake.dream = {"patterns": [_pattern(ids)], "audit": []}
+    await run_dream(store)
+    [p] = await store.live_claims(kind="pattern")
+    st = (await store.strengths([p["id"]]))[p["id"]]
+    assert (st.episodes, st.days) == (3, 3)
+    assert len(await store.evidence_for_claim(p["id"])) == 1
+
+
+async def test_one_reinforced_claim_can_supply_separate_occasions(store, fake):
+    ids = await _football(store)
+    [merged] = await store.consolidate_cluster(await store.get_claims(ids), [{
+        "text": "The user checks football scores on FotMob", "input_ids": ids}])
+    fake.dream = {"patterns": [_pattern([merged], "The user regularly checks football scores", "habit")], "audit": []}
+    # Three distinct evidence days, but frequency language requires still more days.
+    report = await run_dream(store)
+    assert report["patterns"]["rejected"] == {"frequency_overclaim": 1}
+    fake.dream = {"patterns": [_pattern([merged], category="habit")], "audit": []}
+    assert (await run_dream(store))["patterns"]["added"] == 1
+
+
+async def test_forgotten_pattern_cannot_be_regenerated(store, fake):
+    ids = await _football(store)
+    fake.dream = {"patterns": [_pattern(ids)], "audit": []}
+    await run_dream(store)
+    [p] = await store.live_claims(kind="pattern")
+    await store.forget_claim(p["id"])
+    assert (await run_dream(store))["patterns"]["added"] == 0
+    assert await store.live_claims(kind="pattern") == []
+
+
+async def test_withdrawal_revalidates_pattern_immediately_and_undo_restores_it(store):
+    ids = await _football(store)
+    p = await store.add_pattern(_pattern(ids)["text"], "interest", ids, reason="test", run_id="r")
+    await store.save_profile({"written_at": now(), "sections": [{"heading": "Interests", "points": [
+        {"text": "They follow football.", "claims": [p]}]}]}, run_id="r")
+    forget = await store.forget_claim(ids[0])
+    assert (await store.get_claim(p))["status"] == "retired"
+    assert (await store.get_profile())["sections"] == []
+    await store.revert_event(forget)
+    assert (await store.get_claim(p))["status"] == "live"
+    assert len((await store.get_profile())["sections"]) == 1
+
+
+async def test_partial_withdrawal_keeps_sufficient_pattern_but_removes_copied_quote(store):
+    ids = await _football(store)
+    ids.append(await _memory(store, "The user checked football scores on FotMob", day=3, episode=99))
+    p = await store.add_pattern(_pattern(ids)["text"], "interest", ids, reason="test", run_id="r")
+    removed = {r[0] for r in await store.q("SELECT observation_id FROM evidence WHERE claim_id=?", (ids[0],))}
+    await store.forget_claim(ids[0])
+    assert (await store.get_claim(p))["status"] == "live"
+    assert not removed & {r[0] for r in await store.q("SELECT observation_id FROM evidence WHERE claim_id=?", (p,))}
+    assert json.loads((await store.get_claim(p))["derived_from"]) == sorted(ids[1:])
+
+
+async def test_confirm_refuses_withdrawn_support(store):
+    ids = await _football(store)
+    p = await store.add_pattern(_pattern(ids)["text"], "interest", ids, reason="test", run_id="r")
+    more = await _memory(store, "The user checked football scores on FotMob", day=3, episode=99)
+    await store.forget_claim(more)
+    assert not await store.confirm_pattern(p, [more], reason="test", run_id="r")
+
+
+async def test_conflicts_include_high_similarity_and_old_beliefs(store, fake, monkeypatch):
+    monkeypatch.setattr(T, "CONFLICT_SIM", -1.0)
+    a = await _memory(store, "The user uses the old editor", day=T.DREAM_WINDOW_DAYS + 10, episode=90, kind="fact")
+    b = await _memory(store, "The user uses the new editor", day=0, episode=91, kind="fact")
+    await store.save_embeddings([("claim", a, [1.0, 0.0], "a"), ("claim", b, [1.0, 0.0], "b")])
+    fake.conflicts = {"pairs": [{"index": 0, "verdict": "conflict", "reason": "one primary editor"}]}
+    assert (await dr._conflicts(store, "r"))["resolved"] == 1
+    assert (await store.get_claim(a))["status"] == "invalidated"
+
+
+async def test_merge_remaps_equivalent_pattern_and_profile_support(store):
+    ids = await _football(store)
+    p = await store.add_pattern(_pattern(ids)["text"], "interest", ids, reason="test", run_id="r")
+    await store.save_profile({"written_at": now(), "sections": [{"heading": "Interests", "points": [
+        {"text": "They check scores.", "claims": [ids[0]]}]}]}, run_id="r")
+    [merged] = await store.consolidate_cluster(await store.get_claims(ids[:2]), [{
+        "text": (await store.get_claim(ids[0]))["text"], "input_ids": ids[:2]}])
+    assert set(json.loads((await store.get_claim(p))["derived_from"])) == {merged, ids[2]}
+    assert (await store.get_profile())["sections"][0]["points"][0]["claims"] == [merged]
+    [event] = await store.recent_events(op="merge")
+    await store.revert_event(event["id"])
+    assert set(json.loads((await store.get_claim(p))["derived_from"])) == set(ids)
+    assert (await store.get_profile())["sections"][0]["points"][0]["claims"] == [ids[0]]
+
+
+async def test_failed_dream_keeps_episodes_pending_but_waits_an_interval(store, fake, monkeypatch):
+    monkeypatch.setattr(T, "DREAM_INTERVAL_MIN", 60.0)
+    monkeypatch.setattr(T, "DREAM_MIN_NEW_EPISODES", 1)
+    await _memory(store, "a", day=0, episode=60)
+    assert await dr.due(store)
+    fake.dream = ["not", "an", "object"]
+    await run_dream(store)
+    assert not await dr.due(store)  # waits the interval
+    await store.set_meta("last_dream_attempt", str(now() - 3700))
+    assert await dr.due(store)  # then the same episodes are tried again

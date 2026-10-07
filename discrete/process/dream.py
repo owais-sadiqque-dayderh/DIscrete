@@ -124,7 +124,8 @@ async def due(store: Store) -> bool:
     if T.DREAM_INTERVAL_MIN <= 0:
         return False
     last = float(await store.get_meta("last_dream", "0") or 0)
-    if now() - last < T.DREAM_INTERVAL_MIN * 60:
+    tried = float(await store.get_meta("last_dream_attempt", "0") or 0)
+    if now() - max(last, tried) < T.DREAM_INTERVAL_MIN * 60:
         return False
     return await store.new_episodes_since(last) >= T.DREAM_MIN_NEW_EPISODES
 
@@ -146,8 +147,11 @@ async def run_dream(store: Store) -> dict:
                     log.exception("dream step %s crashed", name)
                     report[name] = {"error": f"{type(exc).__name__}: {exc}"[:200]}
     finally:
-        # Even a failed dream waits a full interval: a crash must not re-run paid steps every minute.
-        await store.set_meta("last_dream", str(now()))
+        # Even a failed dream waits a full interval (a crash must not re-run paid steps every minute),
+        # but only a clean run moves the watermark, so its unprocessed episodes are dreamed next time.
+        await store.set_meta("last_dream_attempt", str(now()))
+        if not any(isinstance(r, dict) and "error" in r for r in report.values()):
+            await store.set_meta("last_dream", str(now()))
     if (out := memory_export_dir()) is not None:
         # The Markdown mirror follows each dream, so its git log is the history of beliefs.
         from ..export import export_markdown
@@ -197,7 +201,7 @@ def _render(rows, episodes: dict[int, set[int]]) -> str:
 
 
 def check_pattern(item: dict, by_id: dict, episodes: dict[int, set[int]], *,
-                  pattern_ids: set[int]) -> tuple[dict | None, str]:
+                  pattern_ids: set[int], times: dict[int, list[float]] | None = None) -> tuple[dict | None, str]:
     """Code-side gate for one proposed pattern; returns (pattern, "") or (None, why)."""
     text = str(item.get("text") or "").strip()
     category = str(item.get("category") or "").lower()
@@ -214,12 +218,13 @@ def check_pattern(item: dict, by_id: dict, episodes: dict[int, set[int]], *,
     if any(i in pattern_ids for i in support):
         return None, "rests_on_pattern"  # inductions rest on drafted memories only
     eps = set().union(*(episodes.get(i, set()) for i in support))
-    days = {day_key(by_id[i]["occurred_from"]) for i in support}
+    moments = [t for i in support for t in ((times or {}).get(i) or [by_id[i]["occurred_from"]])]
+    days = {day_key(t) for t in moments}
     if len(eps) < T.DREAM_MIN_EPISODES:
         return None, "too_few_episodes"
     if category in _DAY_CATEGORIES and len(days) < T.DREAM_MIN_DAYS:
         return None, "too_few_days"
-    if occasions([by_id[i]["occurred_from"] for i in support]) < T.DREAM_MIN_OCCASIONS:
+    if occasions(moments) < T.DREAM_MIN_OCCASIONS:
         return None, "single_occasion"
     if _FREQUENCY.search(text) and len(days) < T.DREAM_FREQUENCY_DAYS:
         return None, "frequency_overclaim"
@@ -285,10 +290,11 @@ async def _patterns(store: Store, run_id: str) -> dict:
                 report["retired"] += 1
         else:
             patterns.append(p)
-    if len(memories) < T.DREAM_MIN_EPISODES:
+    if not memories:
         return report | {"skipped": "too few memories"}
     by_id = {r["id"]: r for r in rows}
     episodes = await store.episodes_of_claims(list(by_id))
+    times = await store.support_times(list(by_id))
     prompt = DREAM_PROMPT.format(
         memories=_render(memories, episodes), attention=await attention_context(store),
         patterns="\n".join(f"[{p['id']}] ({p['context'] or 'pattern'}) {p['text']}" for p in patterns) or "(none)",
@@ -304,7 +310,7 @@ async def _patterns(store: Store, run_id: str) -> dict:
         if not isinstance(item, dict):
             continue
         report["proposed"] += 1
-        pat, why = check_pattern(item, by_id, episodes, pattern_ids=pattern_ids)
+        pat, why = check_pattern(item, by_id, episodes, pattern_ids=pattern_ids, times=times)
         if pat is None:
             reject(why)
             continue
@@ -367,9 +373,13 @@ def winner(a, b) -> tuple | None:
 
 
 async def _conflicts(store: Store, run_id: str) -> dict:
-    rows = [r for r in await store.claims_for_dream(now() - T.DREAM_WINDOW_DAYS * 86400,
-                                                    limit=T.DREAM_MAX_MEMORIES)
-            if r["kind"] in ("fact", "preference", "pattern")]
+    # Split the bounded sweep between recently changed and old beliefs.
+    half = max(1, T.DREAM_MAX_MEMORIES // 2)
+    recent = await store.q("SELECT * FROM claims WHERE status='live' AND kind IN ('fact','preference','pattern') "
+                           "ORDER BY updated_at DESC LIMIT ?", (half,))
+    old = await store.q("SELECT * FROM claims WHERE status='live' AND kind IN ('fact','preference','pattern') "
+                        "ORDER BY updated_at ASC LIMIT ?", (half,))
+    rows = list({r["id"]: r for r in [*recent, *old]}.values())
     vecs = await store.vectors("claim", [r["id"] for r in rows])
     checked = await store.checked_pairs()
     pairs = []
@@ -381,14 +391,16 @@ async def _conflicts(store: Store, run_id: str) -> dict:
             if key in checked:
                 continue
             sim = float(vecs[a["id"]] @ vecs[b["id"]])
-            if T.CONFLICT_SIM <= sim < T.CONSOLIDATE_SIM:  # closer pairs are merged by consolidation
+            if sim >= T.CONFLICT_SIM:
                 pairs.append((sim, a, b))
     pairs = sorted(pairs, key=lambda x: -x[0])[: T.DREAM_MAX_PAIRS]
     report = {"pairs": len(pairs), "resolved": 0, "contested": 0}
     ep = dream_endpoint()
     if not pairs or not ep.configured:
         return report
-    payload = {"pairs": [{"index": i, "a": a["text"], "b": b["text"]} for i, (_, a, b) in enumerate(pairs)]}
+    payload = {"pairs": [{"index": i, "a": {k: a[k] for k in ("text", "context", "modality", "occurred_from", "occurred_to")},
+                         "b": {k: b[k] for k in ("text", "context", "modality", "occurred_from", "occurred_to")}}
+                         for i, (_, a, b) in enumerate(pairs)]}
     data = await complete_obj(ep, [{"role": "user", "content": CONFLICT_PROMPT.format(
         payload=json.dumps(payload, ensure_ascii=False))}], max_tokens=100 + 50 * len(pairs))
     verdicts = {d.get("index"): d for d in data.get("pairs") or [] if isinstance(d, dict)}
@@ -396,7 +408,10 @@ async def _conflicts(store: Store, run_id: str) -> dict:
         d = verdicts.get(i)
         if d is None:
             continue  # unanswered: asked again next run
-        await store.mark_pair_checked(a["id"], b["id"], str(d.get("verdict")), str(d.get("reason") or "")[:200])
+        revisions = [store._pair_revision(r) for r in sorted((a, b), key=lambda r: r["id"])]
+        if not await store.mark_pair_checked(a["id"], b["id"], str(d.get("verdict")),
+                                             str(d.get("reason") or "")[:200], revisions=revisions):
+            continue
         if d.get("verdict") != "conflict":
             continue
         decided = winner(a, b)
