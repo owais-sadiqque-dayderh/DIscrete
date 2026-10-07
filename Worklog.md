@@ -89,6 +89,13 @@ Phases 18–19).
   (main code, live session) scoring started 12:12 from there: log `bench/private/results/live-base.log`.
   - g46-base already exists (0.652).
   - The branch scores need a NEW worktree at the commit with the r3 fixes.
+- **Harness false positive fixed** (`48396d9`, 12:40). The outage detector matched DIscrete's normal warning
+  "support verification timed out; results left unverified" and re-asked questions that already had answers.
+  - Now a non-empty answer is infra only on a hard failure: traceback, exception, HTTP status, or overload.
+  - `live-base` restarted from the eval worktree; the fixed `run_g46.py` was copied in.
+- **Note for the eval:** with the support check timing out (`SUPPORT_TIMEOUT_S` 8 s, seen often in the logs), records
+  go to the writer unverified. That is DIscrete behaviour, identical for base and branch, but worth a later look
+  (the gemini-verify ablation measures it).
 - **No branch scores exist yet.** The only valid result is `bench/private/results/g46-base.json` (main code on
   g46/base.db): **0.652 (30/46)**. Everything from the 07:20–08:05 attempt was invalidated by the outage.
 - OpenRouter credit: **$7.32** left ($45 total, $37.68 used). Disk: 12 GiB free.
