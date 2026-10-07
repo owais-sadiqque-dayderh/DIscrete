@@ -75,11 +75,6 @@ def action_verb(item: dict) -> str:
     return verb if verb in ACTION_VERBS else ""
 
 
-def _thing_tokens(text: str) -> set[str]:
-    """What an action is about: its words minus "the user", the verb and filler."""
-    return {t for t in tk.content_tokens(text, min_len=3) if t not in ACTION_VERBS and t not in ("user", "users")}
-
-
 def max_events(span_min: float) -> int:
     """Event room for an episode of this length (long episodes do several things)."""
     extra = int(max(0.0, span_min - 5) // max(T.DRAFT_EVENT_MINUTES, 0.5))
