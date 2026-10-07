@@ -23,7 +23,7 @@ from ..timeutil import age_days, day_key, now, to_local
 from .enumerate import enumerate_pages
 from .page_activity import page_activity
 from .query import EventQueryPlan, build_plan, fallback_plan, page_request, relative_event
-from .rerank import llm_rerank
+from .rerank import llm_rerank, valid_order
 from .support import verify_support
 from .temporal import relative_timeline, temporal_answer
 from .why import chain_hits, resolve_why
@@ -475,10 +475,14 @@ async def _rerank(query: str, pool: list[Hit], cold: bool) -> list[Hit]:
     docs = [tk.truncate(h.text, T.RERANK_MAX_TOKENS * 4) for h in head]
     try:
         order = await rerank(query, docs, len(docs))
-    except (NotConfigured, *EXPECTED_ERRORS) as exc:
-        log.debug("rerank unavailable: %s", exc)
+    except (NotConfigured, *EXPECTED_ERRORS, KeyError, TypeError, ValueError) as exc:
+        # The last three: a malformed provider payload (llm.py parses it unchecked).
+        log.debug("rerank unavailable: %s", type(exc).__name__)
         order = await llm_rerank(query, docs) or []
+    order = valid_order(order, len(head))
     if not order:
+        if order is None:
+            log.debug("rerank returned a malformed order; keeping the fused ranking")
         return pool
     ranked = []
     for idx, score in order:

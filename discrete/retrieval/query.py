@@ -192,25 +192,33 @@ async def build_plan(text: str, *, relative_events: bool = True) -> QueryPlan:
         return plan
     if not isinstance(data, dict):
         return plan
-    for q in data.get("queries") or []:
-        q = str(q).strip()
+    # Optional structure: anything not shaped as documented is ignored, never coerced
+    # (str() of a dict or a string's characters would become search terms).
+    for q in _strings(data.get("queries")):
+        q = q.strip()
         if plan.intent == "enumerate":
             q = strip_scaffold(q)
         if q and q not in plan.queries:
             plan.queries.append(q)
-    for e in data.get("entities") or []:
-        e = str(e).strip()
+    for e in _strings(data.get("entities")):
+        e = e.strip()
         if e and e not in plan.entities:
             plan.entities.append(e)
-    kind = str(data.get("entity_kind_filter") or "").lower()
+    kind = data.get("entity_kind_filter")
+    kind = kind.lower() if isinstance(kind, str) else ""
     if not plan.entity_kind_filter and kind in ENTITY_KINDS:
         plan.entity_kind_filter = kind
-    llm_intent = str(data.get("intent") or "").lower()
+    llm_intent = data.get("intent")
+    llm_intent = llm_intent.lower() if isinstance(llm_intent, str) else ""
     if plan.intent == "recall" and llm_intent in INTENTS and llm_intent not in ("edit", "continuation"):
         if llm_intent == "temporal" and plan.interval is None:
             llm_intent = "recall"
         plan.intent = llm_intent
     return plan
+
+
+def _strings(value: object) -> list[str]:
+    return [v for v in value if isinstance(v, str)][:8] if isinstance(value, list) else []
 
 
 def fallback_plan(text: str, *, reference_at: float | None = None, relative_events: bool = True) -> QueryPlan:
