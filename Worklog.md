@@ -359,6 +359,26 @@ This audit shows where each proposed feature starts from. Code paths are relativ
     2. **Duplicate action events:** #33/#37 and #38/#48 say the same thing. Events skip the merge, so actions
        need a dedup (same action + object within an episode window).
 
+## Phase 7 — Action dedup, agent credit; the evaluation matrix (2026-10-07, ~07:00 IST →)
+
+- **Action dedup + agent credit** (commit `6465694`, 223 tests): a drafted action matching a live action with the
+  same verb on the same thing (token Jaccard ≥ `ACTION_DEDUP_JACCARD` 0.5, within `ACTION_DEDUP_WINDOW_S` 3 h)
+  reinforces it instead of adding a duplicate. This fixes Phase 6 issue 2 (two "sent PMO.pdf", two "created the UCL
+  PDF"). The drafter writes "the user had <agent> do X" when the user typed a command to an agent and the screen
+  shows it done (Phase 6 issue 1).
+- The previous session hit its limit before scoring. Picked up by a new Claude session (07:xx IST) on the user's
+  instruction, delegating to Codex where possible.
+- **All four rebuilds finished** (logs end in `DONE`): `g46/branch.db`, `g46/branch-geminiverify.db`,
+  `live1006/branch.db`, `live1006/base.db`. They were built at `45fe056`, **before** the dedup commit, so this
+  matrix measures the branch without dedup.
+- Resources at start: OpenRouter $7.35 left ($45 total), disk 13 GiB free (47%).
+- **`bench/run_matrix.sh` launched** (`nohup`, log `bench/private/results/matrix.log`). It dreams on copies, then
+  scores g46-branch, g46-branch-geminiverify, g46-base+branchretrieval, live-base and live-branch (g46-base is
+  already scored).
+- **Delegated to Codex** (gpt-6.1-sol, uncommitted until reviewed): review finding #18 (keep successful chunk drafts
+  when a later chunk fails, so a retry re-requests only the failed chunks) and a README section for the branch's
+  features. taskId `node:delegated-task:command%3Amcp%3Aa31f5b55-8276-48a6-85cd-9a27a9d59a69%3Adelegate-task%3Aexp-discrete-r18-readme-1`.
+
 ---
 
 ## ▶ HANDOFF — read this first if you are picking up (written 2026-10-07 ~00:30 IST)
