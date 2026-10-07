@@ -232,3 +232,43 @@ async def test_merge_preserves_stated_authority_only_for_its_proposition(store):
         "text": "The user likes software tools", "input_ids": [same]}])
     assert (await store.get_claim(general))["modality"] != "stated"
     assert (await store.get_claim(same))["status"] == "live"
+
+
+async def test_profile_redo_refuses_after_newer_profile(store):
+    first = await store.save_profile({"written_at": 1, "sections": []}, run_id="r")
+    undo = await store.revert_event(first)
+    await store.save_profile({"written_at": 2, "sections": []}, run_id="r")
+    with pytest.raises(RevertConflict):
+        await store.revert_event(undo)
+    assert (await store.get_profile())["written_at"] == 2
+
+
+async def test_evidence_update_restores_predecessor_quote_on_undo_and_redo(store):
+    cid = await _claim(store, "The user likes tea", n=1)
+    [before] = await store.evidence_for_claim(cid)
+
+    def reinforce():
+        with store._tx() as conn:
+            change = store._reinforce_claim(conn, cid, ClaimDraft(kind="preference", text="The user likes tea",
+                evidence=[{"observation_id": before["observation_id"], "quote": "updated quote", "field": "caption"}]))
+            return store._log_event(conn, "reinforce", "draft", claim_id=cid, changes=[change])
+
+    event = await store._call(reinforce)
+    undo = await store.revert_event(event)
+    assert dict((await store.evidence_for_claim(cid))[0]) == dict(before)
+    await store.revert_event(undo)
+    assert (await store.evidence_for_claim(cid))[0]["quote"] == "updated quote"
+
+
+async def test_overwritten_trail_restores_predecessor_row_on_undo_and_redo(store):
+    cid = await _claim(store, "The user downloaded a tool")
+    oid = await _obs(store, "tool page", 8)
+    link = {"observation_id": oid, "relation": "led_to", "confidence": 0.8, "explanation": "first", "quote": "old"}
+    await store.record_trail(cid, [link], reason="first")
+    [before] = await store.links_into("claim", [cid])
+    second = await store.record_trail(cid, [{**link, "explanation": "second", "quote": "new"}], reason="second")
+    [after] = await store.links_into("claim", [cid])
+    undo = await store.revert_event(second)
+    assert [dict(r) for r in await store.links_into("claim", [cid])] == [dict(before)]
+    await store.revert_event(undo)
+    assert [dict(r) for r in await store.links_into("claim", [cid])] == [dict(after)]

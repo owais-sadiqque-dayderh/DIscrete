@@ -132,9 +132,11 @@ class HistoryMixin(StoreBase):
         """The evidence rows a change added and evicted (in full, so a revert can put them
         back), plus untracked columns it changed (occurred_to, derived_from, flag)."""
         after = self._evidence_rows(conn, claim_id)
+        # A row updated in place is both removed (its old form) and added (its new one).
+        changed = {o for o in set(after) & set(before) if after[o] != before[o]}
         change: dict = {"id": claim_id,
-                        "evidence_added_rows": [after[o] for o in sorted(set(after) - set(before))],
-                        "evidence_removed_rows": [before[o] for o in sorted(set(before) - set(after))]}
+                        "evidence_added_rows": [after[o] for o in sorted((set(after) - set(before)) | changed)],
+                        "evidence_removed_rows": [before[o] for o in sorted((set(before) - set(after)) | changed)]}
         if fields_before is not None:
             change["fields_before"], change["fields_after"] = fields_before, fields_after or {}
         return change
@@ -227,7 +229,11 @@ class HistoryMixin(StoreBase):
                     if data.get("links"):
                         conn.execute(f"UPDATE links SET status='live' WHERE id IN ({_ph(data['links'])})",
                                      data["links"])
+                    for r in data.get("links_overwritten", []):
+                        self._restore_link(conn, r["id"], r["after"])
                     if "profile_was" in data:
+                        if not force and self._current_profile(conn) != data["profile_was"]:
+                            raise RevertConflict("the profile was rewritten after the undo; redo would discard it")
                         self._set_profile(conn, data["profile_set"])
                     rid = self._log_event(conn, "redo", "user", claim_id=ev["claim_id"], changes=out,
                                           reason=reason or f"re-applied #{original} (reverted by #{event_id})",
@@ -242,6 +248,14 @@ class HistoryMixin(StoreBase):
                 conn.execute("DELETE FROM suppressions WHERE event_id=?", (event_id,))
                 links = [r[0] for r in conn.execute("SELECT id FROM links WHERE event_id=? AND status='live'",
                                                     (event_id,))]
+                # A link this event overwrote goes back to its predecessor rather than being retired.
+                before_rows = {r["id"]: r for r in data.get("links_before", [])}
+                side["links_overwritten"] = []
+                for lid in [x for x in links if x in before_rows]:
+                    current = conn.execute("SELECT * FROM links WHERE id=?", (lid,)).fetchone()
+                    side["links_overwritten"].append({"id": lid, "after": dict(current)})
+                    self._restore_link(conn, lid, before_rows[lid])
+                links = [x for x in links if x not in before_rows]
                 side["links"] = links
                 if links:
                     conn.execute(f"UPDATE links SET status='reverted' WHERE id IN ({_ph(links)})", links)
@@ -255,6 +269,12 @@ class HistoryMixin(StoreBase):
                 return rid
 
         return await self._call(_run)
+
+    @staticmethod
+    def _restore_link(conn, link_id: int, row: dict) -> None:
+        cols = ("confidence", "reason", "evidence", "status", "event_id", "created_at")
+        conn.execute(f"UPDATE links SET {', '.join(f'{c}=?' for c in cols)} WHERE id=?",
+                     (*(row[c] for c in cols), link_id))
 
     def _recompute_after_revert(self, conn, claim_id: int) -> None:
         """Hook for ClaimsMixin: confidence follows evidence."""

@@ -24,8 +24,12 @@ class LinksMixin(ClaimsMixin):
 
         def _run() -> int:
             with self._tx() as conn:
+                # Rows this trail will overwrite, kept whole so an undo can restore them.
+                overwritten = [dict(r) for link in links for r in conn.execute(
+                    "SELECT * FROM links WHERE src_kind='observation' AND src_id=? AND dst_kind='claim' "
+                    "AND dst_id=? AND relation=?", (link["observation_id"], claim_id, link["relation"]))]
                 eid = self._log_event(conn, "trail", "trail", claim_id=claim_id, reason=reason,
-                                      data={"links": links, **(data or {})})
+                                      data={"links": links, "links_before": overwritten, **(data or {})})
                 for link in links:
                     conn.execute(
                         "INSERT INTO links(src_kind, src_id, dst_kind, dst_id, relation, confidence, reason, evidence, "
