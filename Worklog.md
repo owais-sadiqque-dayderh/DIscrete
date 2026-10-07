@@ -1053,3 +1053,43 @@ Sources: Cognition "agent memory repo" (cognition.com/agent-memory-repo), Hindsi
 - Root source checks and qualifications recorded in ADJUDICATION_NOTES.md; task recovery states in
   TASK_MANIFEST.json and RECOVERY_R2.json. Product source unchanged; no paid calls, commits, pushes or deployment.
   Next implementation choices belong to the user's decision after reviewing the report.
+
+### 2026-10-08 ~01:50 IST — Discrete git cleaned up; live-test logs read; hardening started (Claude orchestrator)
+**Discrete repo (`COMP_001/Discrete`) — what was mixed and how it's organised now.** The folder sat on the Oct 1 commit
+`ff5a268` (detached) with 47 files of uncommitted changes from two later layers. Nothing was deleted; every layer is
+now a branch in that repo:
+| Branch | Commit | Content |
+|---|---|---|
+| `main` (checked out, clean) | `ff5a268` | Oct 1 12:34 "Second Iteration on Oct1" — what the user wanted. 83 tests pass. Opens the current live db fine. |
+| `archive/2026-10-01-evening` | `dcfb13f` | Oct 1 22:48–23:26 uncommitted session (support verifier, drafts, verification, golden CUA, replay tools), recovered from T3 checkpoint `c7342b8`. |
+| `archive/2026-10-06-worktree` | `1c2898e` | + Oct 6 edits (app/site denylist `capture/privacy.py`, bubble/screen hooks, `tools/amb_bridge.py`). Same tree as exp baseline `41e2f9f` minus Worklog. |
+| `exp-baseline-2026-10-06` | `41e2f9f` | exp_discrete's "main" baseline (imported). |
+| `feat/memory-evolution` | `e6dfa85` | the whole exp_discrete branch (imported; exp_discrete itself is now at `d8847a5`). |
+- Consequence for past numbers: every "main" baseline in the evaluations was `41e2f9f` = Oct 1 commit + the Oct 1 evening
+  session + the Oct 6 denylist, **not** the pure Oct 1 commit.
+- Live `~/.cache/discrete` now holds only a 4-minute session from 2026-10-07 23:43 (33 observations, 0 claims); the
+  Oct 6 data survives as the `bench/private/live1006` snapshot.
+
+**User's live test of the branch (`jarvis-exp`, log `~/.cache/jarvis-exp_discrete/discrete.log`, running since
+2026-10-07 16:53, restarted 21:44, still running):** 0 tracebacks; ~89 episodes drafted with few rejections; network
+outage 23:52–00:33 caused draft/VLM/embedding "Connection error"s that recovered via retries (episodes 65–67 re-drafted
+at 00:46). Problems seen:
+- Bubble: "what all articles did i read in yc hacker news" and "summarise all the messages i viewed in iit mandi imba
+  group" → intent=enumerate, 0 hits, empty answer — while recall questions on the same subjects found 7 and 3 hits.
+  Ties to review QA-03. Recall answers took 9.7–13.4 s total.
+- Capture: dropped_failed 17/178 (~10%); repeated "near-flat frame — check Screen Recording permission".
+- Trails: muse verifier used all 1180 tokens before answering (budget too small for a reasoning model).
+- Dream on one day: 1 then 3 patterns proposed, all rejected single_occasion (correct); profile got 3 points.
+
+**Hardening of the review findings (assess + fix), 5 Codex workers in parallel** (gpt-6.1-sol, medium), each in its own
+worktree/branch off `feat/production-hardening` (= `d8847a5`), integration worktree `../exp_discrete_hardening`. The
+user's running app in `exp_discrete` is untouched. Brief: `../hardening_2026-10-08/BRIEF.md`; task IDs:
+`../hardening_2026-10-08/TASKS.json`; reports land in that folder.
+- W1 privacy: PR-01/02 (P0), PR-04/05/06, ME-01, dropped_failed investigation.
+- W2 runtime: RT-01..04, EV-01, cost telemetry.
+- W3 formation: ME-03/04/08/10, ME-05 (pipeline side), PR-05, ME-09, trails budget; ME-02 design note only.
+- W4 evolution: date-dependent dream test, PR-07/08, ME-05 (store side), ME-06/07/09/11, dream watermark.
+- W5 retrieval: PR-03 (P0), QA-01..04, the live enumerate misses, routing paraphrase tests, deadline.
+- Baseline in worktrees: 723 pass, 1 fails (`test_habits_need_several_days_projects_do_not`, date-dependent; W4).
+- Next: review each branch diff, merge into `feat/production-hardening`, full suite, then an independent Claude
+  (kaustubh, medium) review; offline only. A paid re-evaluation needs the user's OK (credit).
