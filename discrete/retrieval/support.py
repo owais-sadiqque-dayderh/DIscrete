@@ -6,8 +6,8 @@ such as ownership, payment, authorship or preference: a calculator showing
 call it one. This final batched check keeps directly supporting records and fails
 closed when verification is unavailable or malformed. It costs one verifier round
 trip per query (batches run together), so VERIFY_LM should be a fast model. A
-provider slower than SUPPORT_TIMEOUT_S (SUPPORT_TIMEOUT_WHY_S for why) leaves
-results unverified, as before this check existed, so Bubble's wait stays bounded. DISCRETE_SUPPORT_CHECK=0
+provider slower than SUPPORT_TIMEOUT_S (SUPPORT_TIMEOUT_WHY_S for why) cannot
+authorize factual output. The deliberate why fallback remains explicitly hedged. DISCRETE_SUPPORT_CHECK=0
 turns it off.
 """
 
@@ -82,13 +82,22 @@ def _preverified(h: Hit) -> bool:
 async def verify_support(result: RetrievalResult) -> None:
     if result.page_answer and result.plan.page_operation:
         return  # closed page aggregate route, with deterministic output
-    if not T.SUPPORT_CHECK or not result.hits or result.plan.intent in ("edit", "continuation", "world"):
+    if not T.SUPPORT_CHECK or result.plan.intent in ("edit", "continuation", "world"):
+        for h in result.hits:
+            h.verification = "unchecked"
+        if result.digest:
+            result.digest_verification = "unchecked"
+        return
+    if not result.hits:
         return
     if not verifier_endpoint().configured:
         result.hits, result.digest = [], ""
         result.why_chain = None
         return
     fixed = {id(h) for h in result.hits if _preverified(h)}
+    for h in result.hits:
+        if id(h) in fixed:
+            h.verification = "verified"
     order = {id(h): n for n, h in enumerate(result.hits)}
     checked = [h for h in result.hits if id(h) not in fixed]
     if not checked:
@@ -104,11 +113,15 @@ async def verify_support(result: RetrievalResult) -> None:
     timeout = T.SUPPORT_TIMEOUT_WHY_S if why else T.SUPPORT_TIMEOUT_S
     try:
         # Bounded request size even for a long page list; the batches run together.
-        found = await asyncio.wait_for(asyncio.gather(*(_supported(result, r) for r in records)),
-                                       timeout=timeout)
+        found = await asyncio.wait_for(asyncio.gather(*(_supported(result, r) for r in records),
+                                                      return_exceptions=True), timeout=timeout)
     except TimeoutError:
         log.warning("retrieval support verification timed out; results left unverified")
         PERF.count("retrieve.support_timeout")
+        for h in checked:
+            h.verification = "timed_out"
+        result.digest = ""
+        result.digest_verification = "timed_out"
         if why:
             if result.why_chain:
                 result.why_chain.verified = False
@@ -119,19 +132,33 @@ async def verify_support(result: RetrievalResult) -> None:
         result.hits = [h for h in result.hits if not h.via.startswith("attention provenance")]
         result.why_chain = None
         return
-    except (*EXPECTED_ERRORS, ValueError) as exc:
-        log.warning("retrieval support verification failed: %s", exc)
+    for exc in found:
+        if isinstance(exc, BaseException) and not isinstance(exc, (*EXPECTED_ERRORS, ValueError)):
+            raise exc
+    if all(isinstance(ok, BaseException) for ok in found):
+        log.warning("retrieval support verification failed: %s", type(found[0]).__name__)
         result.hits, result.digest = [], ""
         result.why_chain = None
         return
+    for h in checked:
+        h.verification = "rejected"
     kept = []
+    # A failed batch fails closed for its own records only (left "unverified").
     for batch, ok in zip(batches, found, strict=True):
+        if isinstance(ok, BaseException):
+            log.warning("retrieval support verification failed for one batch: %s", type(ok).__name__)
+            for h in batch:
+                h.verification = "unverified"
+            continue
         for i in sorted(ok):
             if i < len(batch):
+                batch[i].verification = "verified"
                 batch[i].strong = True
                 kept.append(batch[i])
-    if result.digest and len(batches[0]) not in found[0]:
+    if result.digest and (isinstance(found[0], BaseException) or len(batches[0]) not in found[0]):
         result.digest = ""
+    if result.digest:
+        result.digest_verification = "verified"
     # A trail link stays only next to its action: alone it answers nothing.
     kept_claims = {h.ref_id for h in kept if h.ref_kind == "claim"}
     kept += [h for h in result.hits if id(h) in fixed and _target(h) in kept_claims]

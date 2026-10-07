@@ -71,15 +71,18 @@ def _url(raw: str) -> str:
                                  if re.match(r"^[a-z][a-z0-9+.-]*://", raw, re.I) else "")
 
 
-def _hit(moment: AttentionMoment, *, via: str) -> Hit:
+def _hit(moment: AttentionMoment, *, via: str, terms: list[str] | None = None) -> Hit:
+    from .hybrid import source_windows
+
     fields = moment.fields
     title = f"{moment.app} — {moment.title}" if moment.title != moment.app else moment.app
-    # Keep actual command lines, including lines beyond materialize's normal
-    # screen-text truncation, so the verifier can see the anchor evidence.
-    body = "\n".join(p for p in (fields.get("caption", ""), fields.get("screen_text", "")) if p)
+    # The event's own lines, wherever they are on the screen, so the verifier can see
+    # the anchor evidence; not the whole screen (it goes to a remote verifier).
+    screen, spans = source_windows(fields.get("screen_text", "") or "", terms or [])
+    body = "\n".join(p for p in (fields.get("caption", ""), screen) if p)
     return Hit("observation", moment.observation_id, title[:120], body, strong=True,
                occurred_at=moment.at, occurred_to=moment.ended_at, untrusted=True,
-               url=fields.get("url", ""), via=via)
+               url=fields.get("url", ""), via=via, source_spans=spans)
 
 
 def _moment_score(moment: AttentionMoment, event: RelativeEvent) -> float:
@@ -146,7 +149,8 @@ async def resolve_anchor(store: Store, plan: EventQueryPlan) -> EventAnchor | No
                 ids.update(r["observation_id"] for r in await store.evidence_for_claim(row["id"]))
             summaries += list((await materialize(store, kind, [row["id"]])).values())
     moments = await store.effect_moments(terms, observation_ids=ids, interval=plan.interval, limit=1000)
-    candidates = [EventAnchor(_hit(m, via=_ANCHOR), score, m.session_id, _identity(m))
+    words = list(dict.fromkeys(terms + tk.content_tokens(event.phrase)))  # stems and the words as typed
+    candidates = [EventAnchor(_hit(m, via=_ANCHOR, terms=words), score, m.session_id, _identity(m))
                   for m in moments if (score := _moment_score(m, event)) > 0]
     if candidates:
         best = max(a.score for a in candidates)
@@ -220,10 +224,10 @@ def temporal_answer(result: RetrievalResult) -> None:
     """Build plain output only after support verification kept the anchor and visits."""
     if not isinstance(result.plan, EventQueryPlan) or not result.hits:
         return
-    if result.hits[0].via != _ANCHOR:
+    if result.hits[0].via != _ANCHOR or not result.hits[0].eligible:
         # A verified neighbor without the event does not establish this boundary.
         result.hits = []
         return
-    neighbors = [h for h in result.hits[1:] if h.via.startswith("right ") and h.strong]
+    neighbors = [h for h in result.hits[1:] if h.via.startswith("right ") and h.eligible]
     if neighbors:
         result.page_answer = "\n".join(f"- {h.title} ({to_local(h.occurred_at):%H:%M:%S})" for h in neighbors)

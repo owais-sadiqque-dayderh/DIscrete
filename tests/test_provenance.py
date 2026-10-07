@@ -235,7 +235,7 @@ async def test_chain_records_require_support_and_adjacent_rejection_fails_closed
 async def test_non_why_unchanged_and_effect_alone_cannot_answer_why(store, fake):
     await obs(store, 0, "Quartz report")
     assert (await resolve_why(store, "what did I read?")).reason == "not a why question"
-    hit = Hit("observation", 1, "Quartz", "", strong=True)
+    hit = Hit("observation", 1, "Quartz", "", strong=True, verification="verified")
     assert evaluate(RetrievalResult("what did I read?", QueryPlan("", intent="recall"), [hit])).mode == "grounded"
     assert evaluate(RetrievalResult("why did I open Quartz?", QueryPlan("", intent="why"), [hit])).mode == "thin"
     assert fake.calls == []

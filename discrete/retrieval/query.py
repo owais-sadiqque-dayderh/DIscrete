@@ -45,14 +45,34 @@ _ABOUT_USER = re.compile(
 # "what time on Monday did I…" asks when, not how long: no bare "time on".
 _TIME_SPENT = re.compile(r"\b(?:how much time|how long (?:did|do|have) i (?:spend|spent|been)|most (?:of my )?time|"
                          r"time spent|spend(?:ing)? (?:my |the most )?time|spent (?:the )?most)\b", re.I)
-_EDIT_VERBS = ("fix", "rewrite", "complete", "summarize", "translate", "format", "rephrase", "shorten")
+_EDIT_VERBS = ("fix", "rewrite", "complete", "summarize", "summarise", "translate", "format", "rephrase", "shorten")
+# "Summarize the messages I viewed" asks about the user's past, not about the draft;
+# "summarize what I wrote above" still points at the field.
+_OWN_PAST = re.compile(r"\bi\s+(?:\w+ed|saw|seen|read|did|had|was|were|wrote|sent|got|went|heard|met|took|made)\b"
+                       r"|\b(?:did|have|had)\s+i\b", re.I)
+# A request for an answer, not a draft to continue.
+_REQUEST = re.compile(r"\s*(?:give|tell|show|list|find|summari[sz]e)\s+(?:me|all|every|the|my)\b", re.I)
+_DEICTIC = re.compile(r"\b(?:above|below|this|these|here)\b", re.I)
+# Page enumeration lists visited pages. A summary, or a list of things *inside* pages
+# (messages, names, prices), is answered from their contents by ordinary search.
+_SUMMARY = re.compile(r"\bsummar(?:y|ies|ise|ize|ised|ized)\b|\brecap\b|\bgist\b", re.I)
+_ENUM_OBJECT = re.compile(r"\b(?:list|show me|what|all|every)(?:\s+(?:all|every|of|the|my))*\s+([a-z]+)\b", re.I)
+_PAGE_NOUNS = frozenset(
+    "article articles page pages site sites website websites link links tab tabs url urls video videos post posts "
+    "story stories thread threads blog blogs doc docs document documents file files repo repos repositories "
+    "app apps window windows".split())
+_NOT_NOUNS = frozenset("i you we that what which where when did do have things stuff everything".split())
 # Match the user's completion question, not an action mentioned later in a recall question.
 _COMPLETED_ACTION = (
-    r"(?:book(?:ed)?|order(?:ed)?|buy|bought|pay|paid|send|sent|submit(?:ted)?|"
-    r"switch(?:ed)?|install(?:ed)?|subscribe(?:d)?|reply|replied|purchase(?:d)?)"
+    r"(?:book(?:ed|ing)?|order(?:ed|ing)?|buy(?:ing)?|bought|pay(?:ing)?|paid|send(?:ing)?|sent|submit(?:ted|ting)?|"
+    r"switch(?:ed|ing)?|install(?:ed|ing)?|subscrib(?:e|ed|ing)|repl(?:y|ied|ying)|purchas(?:e|ed|ing)|"
+    r"complete(?:d)? the (?:purchase|order|payment|booking|checkout|subscription))"
 )
+# "Did I end up buying", "have I already paid", "did I go ahead and submit".
+_PREMISE_FILLER = (r"(?:(?:actually|really|already|ever|finally|eventually)\s+)?"
+                   r"(?:(?:end(?:ed)? up|go ahead and|get around to|manage(?:d)? to|finish(?:ed)?)\s+)?")
 _PREMISE_CLOSED = re.compile(
-    r"^\s*(?:did|have|had)\s+i\s+(?:(?:actually|really)\s+)?" + _COMPLETED_ACTION + r"\b", re.I)
+    r"^\s*(?:did|have|had)\s+i\s+" + _PREMISE_FILLER + _COMPLETED_ACTION + r"\b", re.I)
 _PREMISE_ACTUAL = re.compile(
     r"\b(?:did|have|had)\s+i\s+(?:actually|really)\s+" + _COMPLETED_ACTION + r"\b", re.I)
 _PREMISE_CHOICE = re.compile(
@@ -69,6 +89,17 @@ _ENUM_SCAFFOLD = frozenset(
 
 def strip_scaffold(text: str) -> str:
     return " ".join(t for t in tk.content_tokens(text) if t not in _ENUM_SCAFFOLD)
+
+
+def page_enumeration(text: str) -> bool:
+    """Does this list request ask for visited pages (not a summary or things inside them)?"""
+    if _SUMMARY.search(text):
+        return False
+    if set(tk.tokens(text)) & _PAGE_NOUNS:
+        return True
+    m = _ENUM_OBJECT.search(text)
+    noun = m[1].lower() if m else ""
+    return not noun or noun in _PAGE_NOUNS or noun in _NOT_NOUNS
 
 
 def is_why(text: str, plan: QueryPlan | None = None) -> bool:
@@ -165,25 +196,33 @@ async def build_plan(text: str, *, relative_events: bool = True) -> QueryPlan:
         return plan
     if not isinstance(data, dict):
         return plan
-    for q in data.get("queries") or []:
-        q = str(q).strip()
+    # Optional structure: anything not shaped as documented is ignored, never coerced
+    # (str() of a dict or a string's characters would become search terms).
+    for q in _strings(data.get("queries")):
+        q = q.strip()
         if plan.intent == "enumerate":
             q = strip_scaffold(q)
         if q and q not in plan.queries:
             plan.queries.append(q)
-    for e in data.get("entities") or []:
-        e = str(e).strip()
+    for e in _strings(data.get("entities")):
+        e = e.strip()
         if e and e not in plan.entities:
             plan.entities.append(e)
-    kind = str(data.get("entity_kind_filter") or "").lower()
+    kind = data.get("entity_kind_filter")
+    kind = kind.lower() if isinstance(kind, str) else ""
     if not plan.entity_kind_filter and kind in ENTITY_KINDS:
         plan.entity_kind_filter = kind
-    llm_intent = str(data.get("intent") or "").lower()
+    llm_intent = data.get("intent")
+    llm_intent = llm_intent.lower() if isinstance(llm_intent, str) else ""
     if plan.intent == "recall" and llm_intent in INTENTS and llm_intent not in ("edit", "continuation"):
         if llm_intent == "temporal" and plan.interval is None:
             llm_intent = "recall"
         plan.intent = llm_intent
     return plan
+
+
+def _strings(value: object) -> list[str]:
+    return [v for v in value if isinstance(v, str)][:8] if isinstance(value, list) else []
 
 
 def fallback_plan(text: str, *, reference_at: float | None = None, relative_events: bool = True) -> QueryPlan:
@@ -194,9 +233,11 @@ def fallback_plan(text: str, *, reference_at: float | None = None, relative_even
     queries = [q for q in queries if q]
     low = text.lower().strip()
     intent = "recall"
-    if any(low.startswith(v) for v in _EDIT_VERBS) and "?" not in text:
+    summary_of_past = bool(_SUMMARY.search(low[:12]) and _OWN_PAST.search(text) and not _DEICTIC.search(text))
+    if any(low.startswith(v) for v in _EDIT_VERBS) and "?" not in text and not summary_of_past:
         intent = "edit"
-    elif "?" not in text and len(text.split()) > 12 and not (set(tk.tokens(text)[:2]) & tk.INTERROGATIVES):
+    elif ("?" not in text and len(text.split()) > 12 and not (set(tk.tokens(text)[:2]) & tk.INTERROGATIVES)
+          and not _REQUEST.match(text)):
         intent = "continuation"
     interval = parse_interval(text, reference_at)
     anchor = relative_event(text) if relative_events else None
@@ -209,7 +250,7 @@ def fallback_plan(text: str, *, reference_at: float | None = None, relative_even
         intent = "aggregate"
         words = set(tk.tokens(text))
         kind = next((k for k, vocab in KIND_VOCAB.items() if words & set(vocab)), "")
-    elif intent == "recall" and _ENUM.search(text):
+    elif intent == "recall" and _ENUM.search(text) and page_enumeration(text):
         intent = "enumerate"
         terms = [t for t in terms if t not in _ENUM_SCAFFOLD]
         queries = list(dict.fromkeys(q for q in (strip_scaffold(x) for x in queries) if q))

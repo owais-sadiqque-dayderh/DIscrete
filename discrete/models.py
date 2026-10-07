@@ -6,6 +6,7 @@ Dependency direction: models → store → llm → capture/process/retrieval →
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from . import textkit as tk
 
@@ -108,6 +109,12 @@ class QueryPlan:
     premise_check: bool = False
 
 
+# "unchecked": support verification does not apply (turned off, or a continuation/world
+# question). "unverified": it applied but did not complete; only eligible states answer.
+Verification = Literal["verified", "unchecked", "unverified", "rejected", "timed_out"]
+ELIGIBLE: frozenset[str] = frozenset({"verified", "unchecked"})
+
+
 @dataclass
 class Hit:
     ref_kind: str
@@ -136,10 +143,16 @@ class Hit:
     action: str = ""
     # For lasting claims: "established: seen in 4 episodes over 3 days" (store/beliefs.py).
     strength: str = ""
+    verification: Verification = "unverified"
+    source_spans: list[tuple[int, int]] = field(default_factory=list)
 
     @property
     def text(self) -> str:
         return f"{self.title}\n{self.body}"
+
+    @property
+    def eligible(self) -> bool:
+        return self.verification in ELIGIBLE
 
     def in_interval(self, interval: tuple[float, float] | None) -> bool:
         """planS3 §4.1: episodes, observations and events outside the interval are dropped."""
@@ -158,6 +171,11 @@ class RetrievalResult:
     digest: str = ""
     why_chain: WhyChain | None = None
     page_answer: str = ""
+    digest_verification: Verification = "unverified"
+    # Page enumeration: the full item count when the list was cut at ENUMERATE_MAX, and
+    # whether it may be incomplete (cut, or a candidate search reached its limit).
+    enumeration_total: int = 0
+    enumeration_truncated: bool = False
 
     def of(self, kind: str) -> list[Hit]:
         return [h for h in self.hits if h.ref_kind == kind]

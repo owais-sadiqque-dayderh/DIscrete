@@ -22,9 +22,8 @@ from dataclasses import dataclass, field
 from .. import textkit as tk
 from ..config import USER_NAME, T, writer_endpoint
 from ..llm import EmptyCompletion, interactive, stream
-from ..models import Hit, RetrievalResult
+from ..models import ELIGIBLE, Hit, RetrievalResult
 from ..perf import PERF
-from ..retrieval.enumerate import shape_enumerate_items
 from ..retrieval.grounding import GroundingDecision, evaluate
 from ..retrieval.hybrid import retrieve
 from ..store import Store
@@ -71,6 +70,14 @@ def field_query(text: str, max_chars: int | None = None) -> str:
     return para.strip()
 
 
+#: The draft the writer sees: the text just before the caret, not a whole long document.
+_FIELD_CONTEXT_CHARS = 4000
+
+
+def _field_context(text: str) -> str:
+    return text if len(text) <= _FIELD_CONTEXT_CHARS else "…" + text[-_FIELD_CONTEXT_CHARS:]
+
+
 def needs_space(field_text: str, first: str) -> bool:
     return bool(field_text) and not field_text[-1].isspace() and bool(first) and first[0] not in _NO_SPACE_BEFORE
 
@@ -93,11 +100,27 @@ def _when_short(h: Hit) -> str:
 
 
 def format_enumerate_answer(result: RetrievalResult) -> str:
-    """Deterministic list output — no LLM paraphrase (insights.md §7.38)."""
-    items = shape_enumerate_items(result.hits, result.plan)
+    """Deterministic list output — no LLM paraphrase (insights.md §7.38).
+
+    The hits were already shaped into items during retrieval. A page that was only
+    open nearby in the same app, with no recorded link to the source, is listed
+    apart: proximity is not membership."""
+    items = [h for h in result.hits if h.eligible]
     if not items:
         return ""
-    lines = [f"- {h.title} ({_when_short(h)})" for h in items]
+    linked = [h for h in items if h.status != "trail" or h.navigated_from]
+    nearby = [h for h in items if h.status == "trail" and not h.navigated_from]
+    lines = [f"- {h.title} ({_when_short(h)})" for h in linked]
+    if nearby:
+        if lines:
+            lines.append("Also open nearby in the same app (not confirmed as part of this):")
+        else:
+            lines.append("Open nearby in the same app (not confirmed as part of this):")
+        lines += [f"- {h.title} ({_when_short(h)})" for h in nearby]
+    if result.enumeration_total:
+        lines.append(f"(showing {len(items)} of {result.enumeration_total})")
+    elif result.enumeration_truncated:
+        lines.append(f"(showing {len(items)}; the search limit was reached, so there may be more)")
     return "\n".join(lines)
 
 
@@ -110,11 +133,12 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
         return render_chain(result.why_chain)
     if result.plan.intent == "enumerate":
         # One compact line per page, time-ordered, so the whole trail fits (planS3 §17).
-        if not result.hits:
+        verified = [h for h in result.hits if h.eligible]
+        if not verified:
             return "(no records)"
         lines = ["Timeline of pages/windows (★ matched the question directly; → opened shortly after a ★ "
                  "page in the same app; [listing] = a feed, index or results page):"]
-        for h in result.hits:
+        for h in verified:
             mark = "★" if h.status == "matched" else "→"
             site, _, caption = h.body.partition("\n")
             line = f"{mark}{_when(h)} · {h.title}{' [listing]' if h.is_listing else ''} · {site}"
@@ -124,17 +148,18 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
                 line += f"\n    ({caption})"
             lines.append(line)
         return tk.truncate("\n".join(lines), max_chars * 2)
-    terms = set(result.plan.terms)
     blocks: list[str] = []
     used = 0
     if result.why_chain and result.why_chain.edges and not result.why_chain.verified:
         blocks.append("[attention provenance: inferred, unverified sequence; "
                       "describe what preceded it, never assert causation]")
         used += len(blocks[-1])
-    if result.digest:
+    if result.digest and result.digest_verification in ELIGIBLE:
         blocks.append(f"[day digest]\n{tk.truncate(result.digest, 1200)}")
         used += len(blocks[-1])
     for h in result.hits:
+        if not h.eligible and result.plan.intent != "why":
+            continue
         if h.ref_kind == "claim":
             kind = f"{h.claim_kind} ({h.action})" if h.action else h.claim_kind
             strength = f" · {h.strength}" if h.strength else ""
@@ -149,15 +174,17 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
             body = h.body
         elif h.ref_kind == "observation":
             head = f"[screen {h.ref_id}{_when(h)} · {h.title}]"
-            caption, _, screen = h.body.partition("\n")
-            snippet = tk.best_window(screen, terms, width=110)[0] if terms and screen else screen
-            body = "\n".join(p for p in (caption, tk.truncate(snippet or screen, 900)) if p)
+            body = h.body
+            if h.source_spans:
+                head += " · source chars " + ", ".join(f"{a}:{b}" for a, b in h.source_spans)
         elif h.ref_kind == "episode":
             head = f"[episode {h.ref_id}{_when(h)}] {h.title}"
             body = h.body
         else:
             head = f"[entity {h.ref_id}] {h.title}"
             body = h.body
+        if not h.eligible:
+            head += f" [support {h.verification}; inferred context only]"
         block = f"{head}\n{tk.truncate(body, 1100)}"
         if used + len(block) > max_chars and blocks:
             break
@@ -204,7 +231,7 @@ class BubbleEngine:
             {"role": "system", "content": WRITER_SYSTEM.format(user_name=self.user_name)},
             {"role": "user", "content": WRITER_USER.format(
                 user_name=self.user_name, app=p.app, field=p.field_desc, now=f"{to_local(now()):%a %b %d %Y %H:%M}",
-                text=p.field_text, records=records, instruction=instruction)},
+                text=_field_context(p.field_text), records=records, instruction=instruction)},
         ]
 
     async def write(self, p: Prepared, emit: Callable[[str], bool],
