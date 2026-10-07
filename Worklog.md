@@ -915,3 +915,10 @@ Sources: Cognition "agent memory repo" (cognition.com/agent-memory-repo), Hindsi
 - Fix delegated to Codex (clientRequestId why-support-timeout-r1): SUPPORT_TIMEOUT_WHY_S=25, hedged unverified chain on timeout, keep the verified prefix on partial rejection.
 - Implication: all branch why numbers in the current eval run are understated; re-score after the fix (move the frozen worktree to the fix commit).
 - Why it's slow: each job answers 30-46 questions one at a time (~15-20 s answer + judge each). Redraft re-drafts whole sessions with muse (~12 min). 4 jobs share muse, so some answers come back empty -> infra retries.
+
+### ~13:55 IST — why fix committed (e7a1150); eval round 2 queued
+- e7a1150: SUPPORT_TIMEOUT_WHY_S=25; why timeout keeps chain as hedged "inferred, unverified" sequence (grounding -> mode why); partial rejection keeps the verified path adjacent to the effect; verifier errors still fail closed. 627 tests.
+- Round 1 (528a57b) valid results: g46-branch **0.756** vs g46-base 0.652 (recall 28/30 vs 22/30; aggregate 0/2 vs 2/2). live-branch 0.367, live-branch-v2 0.367 (why 1/6, 0/6: timeout bug, discard these why numbers).
+- /tmp/handover.sh waits for g46-branch-v2 to finish, kills round-1 phase 2, checks out e7a1150 in ../exp_discrete_eval (detached), and runs `bench/private/eval_branch2.sh` -> results/branch2-driver.log
+  (live-branch-r2, live-branch-v2-r2, g46-branch-geminiverify, g46-base+branchretrieval; then both compares; ends "ALL DONE").
+- If interrupted: check which results/*.json exist; re-run only the missing `score` lines from eval_branch2.sh.
