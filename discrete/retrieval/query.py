@@ -64,11 +64,15 @@ _PAGE_NOUNS = frozenset(
 _NOT_NOUNS = frozenset("i you we that what which where when did do have things stuff everything".split())
 # Match the user's completion question, not an action mentioned later in a recall question.
 _COMPLETED_ACTION = (
-    r"(?:book(?:ed)?|order(?:ed)?|buy|bought|pay|paid|send|sent|submit(?:ted)?|"
-    r"switch(?:ed)?|install(?:ed)?|subscribe(?:d)?|reply|replied|purchase(?:d)?)"
+    r"(?:book(?:ed|ing)?|order(?:ed|ing)?|buy(?:ing)?|bought|pay(?:ing)?|paid|send(?:ing)?|sent|submit(?:ted|ting)?|"
+    r"switch(?:ed|ing)?|install(?:ed|ing)?|subscrib(?:e|ed|ing)|repl(?:y|ied|ying)|purchas(?:e|ed|ing)|"
+    r"complete(?:d)? the (?:purchase|order|payment|booking|checkout|subscription))"
 )
+# "Did I end up buying", "have I already paid", "did I go ahead and submit".
+_PREMISE_FILLER = (r"(?:(?:actually|really|already|ever|finally|eventually)\s+)?"
+                   r"(?:(?:end(?:ed)? up|go ahead and|get around to|manage(?:d)? to|finish(?:ed)?)\s+)?")
 _PREMISE_CLOSED = re.compile(
-    r"^\s*(?:did|have|had)\s+i\s+(?:(?:actually|really)\s+)?" + _COMPLETED_ACTION + r"\b", re.I)
+    r"^\s*(?:did|have|had)\s+i\s+" + _PREMISE_FILLER + _COMPLETED_ACTION + r"\b", re.I)
 _PREMISE_ACTUAL = re.compile(
     r"\b(?:did|have|had)\s+i\s+(?:actually|really)\s+" + _COMPLETED_ACTION + r"\b", re.I)
 _PREMISE_CHOICE = re.compile(
