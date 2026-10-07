@@ -30,7 +30,7 @@ from ..store import Store
 from . import accessibility as ax
 from . import ocr
 from .browser import browser_url, note_private
-from .enrich import Capture, EnrichJob
+from .enrich import APPROVED, Capture, EnrichJob
 from .frames import FrameGrabber, is_blank
 from .privacy import denied
 from .redact import SecretMemory, redact_capture
@@ -335,6 +335,8 @@ class ScreenObserver:
             self.stats["redacted"] += 1
             PERF.count("health.capture_redaction_frame_drops")
             before = after = None
+        elif after is not None and T.REDACT_SECRETS:
+            after.info[APPROVED] = True  # its own full text passed; the before frame is checked at egress
         origin = classify_origin(ctx.app, ctx.window_title, screen_text)
         base: dict[str, Any] = dict(
             origin=origin, event_kind=pending["kind"], session_id=self.session.session_id,
@@ -369,8 +371,7 @@ class ScreenObserver:
             return
         # Stored now with the basic caption; the vision caption follows (enrich.py).
         self.stats["captured"] += 1
-        # Cached before frames have no independent privacy approval: omit them.
-        job = EnrichJob(frames=[after] if after is not None else [], app=ctx.app,
+        job = EnrichJob(frames=[f for f in (before, after) if f is not None], app=ctx.app,
                         window_title=ctx.window_title, url=url, screen_text=screen_text, counts=dict(counts))
         PERF.sample("capture.local", since_ms(t0))  # hash, text, frame save: all work before the queue
         await self.queue.put(Capture(ObservationDraft(

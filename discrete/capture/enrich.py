@@ -28,9 +28,10 @@ from ..llm import EXPECTED_ERRORS, TokenLimit, complete_json, image_part
 from ..models import ObservationDraft
 from ..perf import PERF, since_ms
 from ..store import Store
+from . import ocr
 from .frames import downscale
 from .prompts import CAPTURE_PROMPT
-from .redact import redact, redact_url
+from .redact import redact, redact_capture, redact_url
 
 log = logging.getLogger("discrete.capture.enrich")
 
@@ -44,6 +45,9 @@ def model_text(value: object) -> str:
         text = re.sub(r"https?://[^\s<>\"']+", lambda m: redact_url(m[0]).text, text)
     return text
 
+
+# Image.info key: the capture already screened this frame's own full text (in memory only).
+APPROVED = "_discrete_privacy_approved"
 
 # The caption's answer budget; a reasoning model's thinking needs CAPTION_LM_EXTRA_TOKENS on top.
 VLM_MAX_TOKENS = 500
@@ -204,6 +208,7 @@ class Enricher:
         """The vision call with retries; no sleep after the final attempt."""
         if not self.ep.configured:
             return None
+        job = await asyncio.to_thread(screen_frames, job)
         messages = vlm_messages(job)
         for attempt in range(T.CAPTURE_MAX_RETRIES):
             if attempt:
@@ -220,6 +225,31 @@ class Enricher:
                 log.warning("VLM attempt %s failed: %s", attempt + 1, exc)
             self.stats["vlm_attempts_failed"] += 1
         return None
+
+
+def screen_frames(job: EnrichJob) -> EnrichJob:
+    """Keep only frames whose own pixels pass the secret check, read just before egress.
+
+    The capture marks the frame it screened (APPROVED); any other frame (a cached
+    before frame, a frame reloaded from disk) is OCR'd here. A frame whose text
+    cannot be read is withheld, never treated as empty.
+    """
+    if not T.REDACT_SECRETS:
+        return job
+    if redact_capture(job.window_title, job.url, job.screen_text).drop_frame:
+        return dataclasses.replace(job, frames=[])
+    frames = []
+    for frame in job.frames:
+        if not frame.info.get(APPROVED):
+            try:
+                text = ocr.ocr_image(frame.info.get("_ocr_native", frame))
+            except Exception as exc:
+                log.debug("frame withheld, OCR failed: %s", exc)
+                continue
+            if redact_capture("", "", text, "ocr").drop_frame:
+                continue
+        frames.append(frame)
+    return dataclasses.replace(job, frames=frames)
 
 
 def vlm_messages(job: EnrichJob) -> list[dict]:
