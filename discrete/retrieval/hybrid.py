@@ -20,9 +20,10 @@ from ..store import KINDS, Store
 from ..timeutil import age_days, day_key, now, to_local
 from .enumerate import enumerate_pages
 from .page_activity import page_activity
-from .query import build_plan, fallback_plan, page_request
+from .query import EventQueryPlan, build_plan, fallback_plan, page_request, relative_event
 from .rerank import llm_rerank
 from .support import verify_support
+from .temporal import relative_timeline, temporal_answer
 from .why import chain_hits, resolve_why
 
 log = logging.getLogger("discrete.retrieval.hybrid")
@@ -98,11 +99,22 @@ async def retrieve(store: Store, query: str, *, field_text: str = "", progress=N
         result = await _retrieve(store, query, field_text=field_text, progress=progress or _noop)
         with PERF.timer("retrieve.support", n=len(result.hits)):
             await verify_support(result)
+        temporal_answer(result)
         t.n = len(result.hits)
     return result
 
 
 async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> RetrievalResult:
+    unresolved_event = False
+    structural = fallback_plan(query) if relative_event(query) else None
+    if isinstance(structural, EventQueryPlan):
+        result = RetrievalResult(query=query, plan=structural)
+        progress("searching", "temporal")
+        if await relative_timeline(store, result):
+            return result
+        # An unresolved event must keep the old route; it is not an invented
+        # calendar interval or an empty synthetic timeline.
+        unresolved_event = True
     if T.PAGES and page_request(query)[0]:
         structural = fallback_plan(query)
         if structural.page_operation:
@@ -113,7 +125,7 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> R
     qvec_task = asyncio.create_task(try_embed(query))
     try:
         with PERF.timer("retrieve.plan"):
-            plan = await build_plan(query)
+            plan = await build_plan(query, relative_events=False) if unresolved_event else await build_plan(query)
     except BaseException:
         qvec_task.cancel()
         raise

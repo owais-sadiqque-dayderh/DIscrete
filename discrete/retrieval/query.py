@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from dataclasses import dataclass
 from datetime import timedelta
 
 from dateparser.search import search_dates
@@ -69,6 +70,43 @@ KIND_VOCAB = {
     "file": ("file", "files", "document", "documents"),
 }
 
+
+@dataclass(frozen=True)
+class RelativeEvent:
+    phrase: str
+    direction: str
+    last: bool = False
+
+
+@dataclass
+class EventQueryPlan(QueryPlan):
+    anchor: RelativeEvent | None = None
+
+
+def relative_event(text: str) -> RelativeEvent | None:
+    # Causal questions have their own resolver; dates and clocks remain intervals.
+    if is_why(text):
+        return None
+    m = re.search(r"\b(?:(?:right|just|immediately)\s+)?(after|before)\s+(.+?)\s*[?.!]*$"
+                  r"|\bwhen\s+I\s+(finished\s+.+?)\s*[?.!]*$", text, re.I)
+    if not m:
+        return None
+    phrase = (m[2] or m[3]).strip().rstrip("?.!")
+    phrase = re.sub(r"^I\s+(?:had\s+)?", "", phrase, flags=re.I)
+    if not phrase or re.fullmatch(r"(?:\d[\d: .apm-]*|today|yesterday|last .+|this .+)", phrase, re.I):
+        return None
+    # A clock/date ("after midnight on Oct 1") is an interval, not an event.
+    if _TEMPORAL_CUE.search(phrase) or re.search(r"\b(?:midnight|noon|lunch|dinner|breakfast)\b", phrase, re.I):
+        return None
+    # Only the user's own next steps: "what did X reply after I…" asks for content the
+    # following moments cannot supply, and an unanswerable must stay a refusal.
+    head = text[:m.start()]
+    if not re.search(r"\b(?:what|where|which|who)\b.*\b(?:did|was|were|do)\s+I\b", head, re.I):
+        return None
+    last = bool(re.match(r"(?:finish(?:ed|ing)?|complet(?:ed|ing|e)|done with)\b", phrase, re.I))
+    return RelativeEvent(phrase, (m[1] or "after").lower(), last)
+
+
 # A dateparser match is trusted only if it contains one of these (planS3 Rev 3).
 _TEMPORAL_CUE = re.compile(
     r"\d|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b"
@@ -90,9 +128,9 @@ Return strict JSON:
 """
 
 
-async def build_plan(text: str) -> QueryPlan:
-    plan = fallback_plan(text)
-    if plan.intent == "edit" or plan.page_operation or not T.QUERY_LLM_PLAN:
+async def build_plan(text: str, *, relative_events: bool = True) -> QueryPlan:
+    plan = fallback_plan(text, relative_events=relative_events)
+    if plan.intent == "edit" or isinstance(plan, EventQueryPlan) or plan.page_operation or not T.QUERY_LLM_PLAN:
         return plan
     ep = utility_endpoint()
     if not ep.configured:
@@ -128,7 +166,7 @@ async def build_plan(text: str) -> QueryPlan:
     return plan
 
 
-def fallback_plan(text: str, *, reference_at: float | None = None) -> QueryPlan:
+def fallback_plan(text: str, *, reference_at: float | None = None, relative_events: bool = True) -> QueryPlan:
     ents = list(dict.fromkeys(m.group(0) for m in _IDENT.finditer(text)))
     files = list(dict.fromkeys(m.group(0) for m in _FILE.finditer(text)))
     terms = tk.content_tokens(text)
@@ -141,9 +179,12 @@ def fallback_plan(text: str, *, reference_at: float | None = None) -> QueryPlan:
     elif "?" not in text and len(text.split()) > 12 and not (set(tk.tokens(text)[:2]) & tk.INTERROGATIVES):
         intent = "continuation"
     interval = parse_interval(text, reference_at)
+    anchor = relative_event(text) if relative_events else None
     kind = ""
     if intent in ("recall", "continuation") and is_why(text):
         intent = "why"
+    elif intent == "recall" and anchor:
+        intent = "temporal"
     elif intent == "recall" and _AGG.search(text):
         intent = "aggregate"
         words = set(tk.tokens(text))
@@ -157,11 +198,15 @@ def fallback_plan(text: str, *, reference_at: float | None = None) -> QueryPlan:
     operation, page_search = page_request(text) if T.PAGES and intent not in ("edit", "continuation", "why") else ("", "")
     if operation:
         intent = "enumerate" if operation == "edited" else "aggregate"
-    return QueryPlan(raw=text, intent=intent, queries=queries, entities=ents + files, terms=terms,
+    plan_type = EventQueryPlan if anchor and intent == "temporal" else QueryPlan
+    plan = plan_type(raw=text, intent=intent, queries=queries, entities=ents + files, terms=terms,
                      interval=interval, entity_kind_filter=kind, needs_store=intent != "edit",
                      about_user=intent not in ("edit", "continuation") and bool(_ABOUT_USER.search(text)),
                      time_spent=intent not in ("edit", "continuation") and bool(_TIME_SPENT.search(text)),
                      page_operation=operation, page_search=page_search)
+    if isinstance(plan, EventQueryPlan):
+        plan.anchor = anchor
+    return plan
 
 
 def page_request(text: str) -> tuple[str, str]:

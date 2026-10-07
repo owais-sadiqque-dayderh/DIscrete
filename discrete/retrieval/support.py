@@ -46,6 +46,9 @@ page or step that led straight to it. An attention-provenance record also suppor
 the answer when its linking term is visibly present before the next step in the
 chain, including inside embedded media. This is evidence of what preceded the
 action, not of motive. Use each record's "context" for how it relates.
+For relative temporal questions (right after/before an event), retain the event
+anchor itself and visits whose context places them immediately after/before it.
+The anchor establishes the boundary; it is not the first item of the answer list.
 """
 
 

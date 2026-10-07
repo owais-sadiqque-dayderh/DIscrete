@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..models import RetrievalResult
+from .query import EventQueryPlan
 
 
 @dataclass
@@ -17,7 +18,7 @@ class GroundingDecision:
 def evaluate(result: RetrievalResult) -> GroundingDecision:
     if result.why_chain and result.why_chain.candidates:
         return GroundingDecision("ambiguous", 0, 0)
-    if result.page_answer and result.plan.page_operation:
+    if result.page_answer and (result.plan.page_operation or isinstance(result.plan, EventQueryPlan)):
         return GroundingDecision("pages", len(result.hits), 0)
     intent = result.plan.intent
     if intent == "edit":
