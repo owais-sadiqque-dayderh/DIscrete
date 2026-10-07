@@ -505,7 +505,7 @@ This audit shows where each proposed feature starts from. Code paths are relativ
   - provider failures are retried and excluded from accuracy;
   - more than 10% of them marks the run invalid;
   - an endpoint preflight runs first, and `run_matrix.sh` stops on an invalid run.
-- **AX text markers verified live** on Arc (`docs/ax_text_markers_report.md`, `14a…` see git log): **0/40 attempts
+- **AX text markers verified live** on Arc (`docs/ax_text_markers_report.md`, commit `c32d8cc`): **0/40 attempts
   worked** (`kAXErrorIllegalArgument`, then `kAXErrorNoValue` with a corrected argument type), 209 ms either way.
   - Stays **off**.
   - Follow-ups for the node walk: Hacker News returns 4.7k AX chars vs 2.4k visible (19% duplicate lines); tables
