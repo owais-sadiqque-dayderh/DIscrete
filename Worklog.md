@@ -110,8 +110,12 @@ Phases 18–19).
   - Follow-up running: the **first arrival in the latest sitting**; "again"/"last time" select the latest; far-apart
     sittings with no time context → ask. Task `…exp-discrete-why-effect-select-1` (cmd d8b8c8e8). Commit r3 fixes +
     this together, then make the branch eval worktree.
-- **No branch scores exist yet.** The only valid result is `bench/private/results/g46-base.json` (main code on
-  g46/base.db): **0.652 (30/46)**. Everything from the 07:20–08:05 attempt was invalidated by the outage.
+- **Baseline scores (main code, valid):**
+  - `g46-base` **0.652 (30/46)**.
+  - `live-base` **0.433 (13/30)**, scored 12:45 with the hardened harness, 0 infra errors. By category: why 4/6,
+    unanswerable 4/5, recall 4/9, temporal 1/4, profile 0/3, enumerate 0/2, aggregate 0/1. Supported 0.633, hit@k
+    0.52, p50 19.1 s, $0.07. File: `bench/private/results/live-base.json`.
+  - **No branch scores yet.** Everything from the 07:20–08:05 attempt was invalidated by the outage.
 - OpenRouter credit: **$7.32** left ($45 total, $37.68 used). Disk: 12 GiB free.
 
 **Evaluation plan, to run once muse answers:**
