@@ -45,7 +45,7 @@ Phases 18–19).
   the branch. The user decides whether to merge.
 
 **State right now:**
-- Branch HEAD `ac435c2`, 58 commits ahead of main; suite ≈ 524 tests (run `.venv/bin/python -m pytest -q`).
+- Branch HEAD `669a298`+worklog commits; suite ≈ 524 tests (run `.venv/bin/python -m pytest -q`).
 - Committed this session (Phase 7, details below):
   - action dedup and agent credit;
   - #18 chunk checkpoints;
@@ -59,21 +59,17 @@ Phases 18–19).
   - the AX markers verdict (off);
   - the AX node walk (6× faster);
   - caption reuse measured and NOT shipped.
-- **Uncommitted in the working tree (45 files):**
-  1. **Encryption at rest** (done, reviewed, waiting to commit): `discrete/encryption.py`,
-     `discrete/encryption_migration.py`, `docs/encryption.md`, `tests/test_encryption.py`,
-     `tools/measure_encryption_overhead.py`, plus hunks in store/base/db (connect)/index, capture
-     screen/enrich/retention, cli, export, dream, bubble/service, invariants, replay_session, compare_models,
-     bench/audit/*, bench/export_discrete_session.py, pyproject, config, .env.example, README.
-  2. **"Why" for any moment** (Codex still running, taskId
-     `node:delegated-task:command%3Amcp%3Aa31f5b55-8276-48a6-85cd-9a27a9d59a69%3Adelegate-task%3Aexp-discrete-why-any-1`):
-     `discrete/process/provenance.py`, `discrete/store/provenance.py`, `discrete/retrieval/why.py`,
-     `docs/attention_provenance.md`, `tests/test_provenance.py`, plus hunks in retrieval/*, bubble/prompts,
-     models, pipeline, app, store/__init__, db (m013?), cli, config, .env.example, README, tests (bubble, trails,
-     store).
-  - **To do:** when the why task reports, read its result with `task_status` and review its diff. Run the full suite
-    and `.venv/bin/ruff check discrete tests bench tools`. Then commit encryption and why together (two commits if
-    you can split by file; shared files go in the second), and log both.
+- **Working tree clean** (09:15). Encryption at rest + "why" for any moment were committed together in `669a298`
+  (they share cli/config/db). 528 tests, ruff clean; no golden-set terms in the code (grep-checked).
+  - Why dry run on `live1006/branch.db`, read-only, no models: all 6 held-out why questions produce the expected
+    chain. Theo's video (OCR) → "helium" search → homepage → download; Cognition's X post → spec page; copied
+    GitHub + Cognition URLs → the typed ChatGPT question; Kaustubh's DM → Agently post → Omar's profile; EmbeddingGemma
+    post → typed openrouter.ai → Models; Helium import dialog ← Arc recently in use (hedged).
+  - `g46/branch.db` finds no effect for these questions, as expected: they belong to the live session.
+  - `discrete why "…" --chain [--backfill]`. Design: `docs/attention_provenance.md`.
+  - **Before scoring, backfill provenance edges** on every branch db copy:
+    `discrete --db X why "x" --backfill` (or check the CLI help). Edges are built after drafting, and the old dbs
+    have none.
 - **Muse (`meta/muse-spark-1.3-contributor`) is DOWN at OpenRouter** (Meta-side outage, confirmed by the user;
   `service_overloaded`, Retry-After 60). A probe (Bash background task in the old session) was retrying every 2 min;
   re-check with:
