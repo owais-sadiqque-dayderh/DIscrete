@@ -345,7 +345,8 @@ class ScreenObserver:
             return
         # Stored now with the basic caption; the vision caption follows (enrich.py).
         self.stats["captured"] += 1
-        job = EnrichJob(frames=[f for f in (before, after) if f is not None], app=ctx.app,
+        # Cached before frames have no independent privacy approval: omit them.
+        job = EnrichJob(frames=[after] if after is not None else [], app=ctx.app,
                         window_title=ctx.window_title, url=url, screen_text=screen_text, counts=dict(counts))
         PERF.sample("capture.local", since_ms(t0))  # hash, text, frame save: all work before the queue
         await self.queue.put(Capture(ObservationDraft(
