@@ -500,6 +500,16 @@ This audit shows where each proposed feature starts from. Code paths are relativ
   SQLCipher vs per-file AES-GCM vs column-level, with the key in the Keychain. It is opt-in
   (`DISCRETE_ENCRYPT_AT_REST`, default off on the branch) with crash-safe `discrete encrypt` / `decrypt`, so the bench
   dbs stay plaintext.
+- **Bench harness hardened** `fa01372`:
+  - timeouts are recorded, not fatal;
+  - provider failures are retried and excluded from accuracy;
+  - more than 10% of them marks the run invalid;
+  - an endpoint preflight runs first, and `run_matrix.sh` stops on an invalid run.
+- **AX text markers verified live** on Arc (`docs/ax_text_markers_report.md`, `14a…` see git log): **0/40 attempts
+  worked** (`kAXErrorIllegalArgument`, then `kAXErrorNoValue` with a corrected argument type), 209 ms either way.
+  - Stays **off**.
+  - Follow-ups for the node walk: Hacker News returns 4.7k AX chars vs 2.4k visible (19% duplicate lines); tables
+    lose their structure.
 - **Re-run plan when muse is healthy:** a new frozen worktree at the final commit (retry policy + review fixes).
   Re-create `branch-v2` with the fixed `redraft.py`, then score everything in parallel, with fewer concurrent jobs
   (≤4) to avoid adding load.
