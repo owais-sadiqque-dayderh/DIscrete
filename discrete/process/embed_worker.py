@@ -14,6 +14,7 @@ import time
 import numpy as np
 
 from .. import textkit as tk
+from ..capture import privacy
 from ..config import T
 from ..llm import EXPECTED_ERRORS, NotConfigured, embed
 from ..perf import PERF, since_ms
@@ -21,6 +22,28 @@ from ..store import Store
 from ..store.index import embedding_text
 
 log = logging.getLogger("discrete.process.embed")
+
+
+def source_denied(row) -> str:
+    """Today's privacy policy for a stored observation, as pages apply it: capture
+    applied the policy of its own day, and a newly denied app or site must not leave
+    the machine from history (drafting, embedding)."""
+    return privacy.denied(row["app"], row["bundle_id"], row["url"]) or \
+        (privacy.denied(url="https://" + row["site"]) if row["site"] else "")
+
+
+async def policy_blocked(store: Store, kind: str, rid: int) -> bool:
+    """Whether a row's text comes from an observation today's policy denies."""
+    if kind == "observation":
+        rows = await store.q("SELECT * FROM observations WHERE id=?", (rid,))
+    elif kind == "claim":
+        rows = await store.q("SELECT o.* FROM observations o JOIN evidence e ON e.observation_id=o.id "
+                             "WHERE e.claim_id=?", (rid,))
+    elif kind == "episode":
+        rows = await store.observations_for_episode(rid)
+    else:
+        return False  # entity names and pages are filtered where they are built (store/pages.py)
+    return any(source_denied(r) for r in rows)
 
 
 def observation_text(row) -> str:
@@ -66,6 +89,10 @@ async def embed_row(store: Store, kind: str, rid: int, text: str) -> np.ndarray 
     text; on failure returns None and leaves the row in the outbox for a retry."""
     if not text.strip():
         return None
+    if await policy_blocked(store, kind, rid):
+        await store.outbox_discard(kind, rid)
+        await store.bump_metric("embed_policy_blocked")
+        return None
     th = tk.content_hash(text)
     if (have := await store.get_vector(kind, rid, th)) is not None:
         return _unit(have)
@@ -89,6 +116,10 @@ async def drain_once(store: Store, *, limit: int | None = None) -> int:
         text = await text_for(store, kind, rid)
         if not text or not text.strip():
             await store.outbox_discard(kind, rid)
+            continue
+        if await policy_blocked(store, kind, rid):
+            await store.outbox_discard(kind, rid)
+            await store.bump_metric("embed_policy_blocked")
             continue
         texts.append(text)
         refs.append((kind, rid))

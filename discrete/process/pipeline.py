@@ -16,7 +16,7 @@ from ..perf import PERF
 from ..store import DraftConflict, Store
 from ..timeutil import to_local
 from .actions import detect, hints
-from .embed_worker import claim_text
+from .embed_worker import claim_text, policy_blocked, source_denied
 from .entities import promotable, resolve_existing, structural_candidates
 from .prompts import DRAFT_EPISODE_PROMPT, RELATE_BLOCK, RELATE_PROMPT
 from .validation import atomic, injection_drop, subject_ok, verify_evidence
@@ -144,6 +144,11 @@ class ProcessPipeline:
     async def _draft(self, episode_id: int) -> DraftOutcome:
         outcome = DraftOutcome(episode_id=episode_id)
         rows = await self.store.observations_for_episode(episode_id)
+        if blocked := [r["id"] for r in rows if source_denied(r)]:
+            # Excluded from every model call; the rest of the episode is drafted.
+            await self.store.set_meta(f"draft_policy_blocked:{episode_id}", json.dumps(blocked))
+            await self.store.bump_metric("draft_policy_blocked", len(blocked))
+            rows = [r for r in rows if r["id"] not in blocked]
         apps = sorted({r["app"] for r in rows if r["app"]})
         sites = sorted({r["site"] for r in rows if r["site"]})
         engaged = sum(1 for r in rows if r["keys"] or r["clicks"] or r["clipboard"]) / max(1, len(rows))
@@ -151,7 +156,7 @@ class ProcessPipeline:
             await self.store.bump_metric("draft_skipped_unconfigured", len(rows))
             raise DraftDeferred("no insight model configured")
         if not rows:
-            title = " / ".join(apps)[:80] or "(no user activity)"
+            title = " / ".join(apps)[:80] or ("(excluded by privacy settings)" if blocked else "(no user activity)")
             await self.store.close_episode(episode_id, title=title, summary="", apps=apps, sites=sites,
                                            engaged_fraction=engaged)
             return outcome
@@ -423,7 +428,8 @@ class ProcessPipeline:
         fused = sorted(tk.rrf(rankings, k=T.RRF_K).items(), key=lambda x: -x[1])
         rows = {r["id"]: r for r in await self.store.get_claims([i for i, _ in fused])}
         out = [rows[i] for i, _ in fused if i in rows and rows[i]["status"] == "live" and rows[i]["kind"] == d.cd.kind]
-        return out[: T.RELATE_CANDIDATES]
+        # The relation prompt quotes these: none from a source today's policy denies.
+        return [c for c in out[: T.RELATE_CANDIDATES] if not await policy_blocked(self.store, "claim", c["id"])]
 
     async def _relate(self, durables: list[_Durable]) -> None:
         asked = [(n, d) for n, d in enumerate(durables) if d.candidates]
