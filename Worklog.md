@@ -96,6 +96,20 @@ Phases 18–19).
 - **Note for the eval:** with the support check timing out (`SUPPORT_TIMEOUT_S` 8 s, seen often in the logs), records
   go to the writer unverified. That is DIscrete behaviour, identical for base and branch, but worth a later look
   (the gemini-verify ablation measures it).
+- **Review r3 fixes done** (Codex, 605 tests, UNCOMMITTED; report `/tmp/discrete-review-implementation-report.md`).
+  All 7 have regression tests:
+  - denied frames are never cached or forwarded;
+  - every model field is redacted before storage and provenance;
+  - frame encryption is bound to the owning store, failing closed when unsure;
+  - same-host succession is context only (0.30);
+  - an uncorroborated model referrer gets 0.35;
+  - provenance cost is bounded: 2,000 moments backfill in 0.68 s, a why query in 198 ms;
+  - an ambiguous effect asks for clarification.
+  - **Regression caught in my review.** "Prefer the latest visit" moved the Agent Memory Repo why chain from its true
+    origin (18 → 20, Cognition's X post) to a later same-session return (218 → … → 235).
+  - Follow-up running: the **first arrival in the latest sitting**; "again"/"last time" select the latest; far-apart
+    sittings with no time context → ask. Task `…exp-discrete-why-effect-select-1` (cmd d8b8c8e8). Commit r3 fixes +
+    this together, then make the branch eval worktree.
 - **No branch scores exist yet.** The only valid result is `bench/private/results/g46-base.json` (main code on
   g46/base.db): **0.652 (30/46)**. Everything from the 07:20–08:05 attempt was invalidated by the outage.
 - OpenRouter credit: **$7.32** left ($45 total, $37.68 used). Disk: 12 GiB free.
