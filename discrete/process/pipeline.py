@@ -75,6 +75,16 @@ def action_verb(item: dict) -> str:
     return verb if verb in ACTION_VERBS else ""
 
 
+def _narrative(text: str, actions: set[str], sources: list[str]) -> str:
+    """The drafted title or summary, without the sentences verification never saw: a
+    completed action (purchased, sent, ...) no verified event claim backs, or an
+    instruction copied off the screen. What remains describes what was on screen; it
+    is indexed and grouped into tasks, so it must not assert what the claims do not."""
+    kept = [s for s in tk.sentences(text)
+            if not ({t for t in tk.tokens(s) if t in ACTION_VERBS} - actions) and not injection_drop(s, sources)]
+    return " ".join(kept)
+
+
 def _relate_line(text: str, context: str, seen_from: float, seen_to: float) -> str:
     """A claim for the relation prompt, with the context and time that decide whether
     two claims really conflict."""
@@ -246,9 +256,12 @@ class ProcessPipeline:
                 names_seen += structural_candidates(r["screen_text"])
             if r["keys"] or r["clicks"] or r["clipboard"]:
                 names_seen += [x for x in (r["app"], r["site"]) if x]
+        actions = {cd.action for cd in drafts if cd.action}
+        sources = [r["screen_text"] for r in rows]
+        title = _narrative(str(data.get("title") or ""), actions, sources) or " / ".join(apps)
         ops = await self.store.commit_episode_draft(
-            episode_id, title=tk.truncate(str(data.get("title") or ""), 80),
-            summary=tk.truncate(str(data.get("summary") or ""), 600), apps=apps, sites=sites,
+            episode_id, title=tk.truncate(title, 80),
+            summary=tk.truncate(_narrative(str(data.get("summary") or ""), actions, sources), 600), apps=apps, sites=sites,
             engaged_fraction=engaged, writes=writes,
             candidates=sorted({n.strip() for n in names_seen if n and promotable(n)}), rejected=outcome.rejected,
         )
