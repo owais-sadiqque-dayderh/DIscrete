@@ -1178,3 +1178,14 @@ user's running app in `exp_discrete` is untouched. Brief: `../hardening_2026-10-
 - To test the hardening branch live: `jarvis-exp stop` (old code; the new stop also catches it) → in
   `exp_hindsight/exp_discrete`: `git switch feat/production-hardening` (or run from `../exp_discrete_hardening`) →
   `jarvis-exp start`. Still pending: live Mac check of Bubble typing/incognito, paid re-eval (needs the user's OK).
+
+### 2026-10-08 ~04:25 IST — user OK'd the four open items + paid benchmark
+- R1-04 done **b24d32e**: `erase` keeps only the wording hash (no vector); a reworded version can return from kept observations.
+- Live app switched: backup `~/.cache/exp_discrete-backup-20261008-pre-hardening.db`; `exp_discrete` now on
+  `feat/production-hardening` (`exp_discrete_hardening` worktree detached); daemon started on new code, drafting OK.
+  jarvis start fix (exec daemon) committed.
+- Benchmark running @ 955b0ee from `../exp_discrete_eval`: `bench/private/eval_hard.sh` → `results/hard-driver.log`
+  (ends "ALL DONE"). Wave 1 hret = hardening retrieval on the same dbs as live-final-a/b, g46-final-a/b; wave 2 hard =
+  redraft with hardening code + dream, x2. Note: eval .venv is a symlink to exp_discrete's venv → scripts need
+  `PYTHONPATH=$PWD`. Credit at start $2.87 (~$2 expected).
+- Remaining: live Mac check (incognito detection, Bubble per-chunk focus) and results write-up — delegated to Codex.
