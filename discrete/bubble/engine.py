@@ -24,7 +24,6 @@ from ..config import USER_NAME, T, writer_endpoint
 from ..llm import EmptyCompletion, interactive, stream
 from ..models import ELIGIBLE, Hit, RetrievalResult
 from ..perf import PERF
-from ..retrieval.enumerate import shape_enumerate_items
 from ..retrieval.grounding import GroundingDecision, evaluate
 from ..retrieval.hybrid import retrieve
 from ..store import Store
@@ -93,11 +92,27 @@ def _when_short(h: Hit) -> str:
 
 
 def format_enumerate_answer(result: RetrievalResult) -> str:
-    """Deterministic list output — no LLM paraphrase (insights.md §7.38)."""
-    items = shape_enumerate_items([h for h in result.hits if h.eligible], result.plan)
+    """Deterministic list output — no LLM paraphrase (insights.md §7.38).
+
+    The hits were already shaped into items during retrieval. A page that was only
+    open nearby in the same app, with no recorded link to the source, is listed
+    apart: proximity is not membership."""
+    items = [h for h in result.hits if h.eligible]
     if not items:
         return ""
-    lines = [f"- {h.title} ({_when_short(h)})" for h in items]
+    linked = [h for h in items if h.status != "trail" or h.navigated_from]
+    nearby = [h for h in items if h.status == "trail" and not h.navigated_from]
+    lines = [f"- {h.title} ({_when_short(h)})" for h in linked]
+    if nearby:
+        if lines:
+            lines.append("Also open nearby in the same app (not confirmed as part of this):")
+        else:
+            lines.append("Open nearby in the same app (not confirmed as part of this):")
+        lines += [f"- {h.title} ({_when_short(h)})" for h in nearby]
+    if result.enumeration_total:
+        lines.append(f"(showing {len(items)} of {result.enumeration_total})")
+    elif result.enumeration_truncated:
+        lines.append(f"(showing {len(items)}; the search limit was reached, so there may be more)")
     return "\n".join(lines)
 
 

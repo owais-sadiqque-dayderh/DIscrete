@@ -172,6 +172,10 @@ class RetrievalResult:
     why_chain: WhyChain | None = None
     page_answer: str = ""
     digest_verification: Verification = "unverified"
+    # Page enumeration: the full item count when the list was cut at ENUMERATE_MAX, and
+    # whether it may be incomplete (cut, or a candidate search reached its limit).
+    enumeration_total: int = 0
+    enumeration_truncated: bool = False
 
     def of(self, kind: str) -> list[Hit]:
         return [h for h in self.hits if h.ref_kind == kind]

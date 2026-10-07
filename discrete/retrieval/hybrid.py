@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import re
@@ -163,12 +164,26 @@ async def retrieve(store: Store, query: str, *, field_text: str = "", progress=N
         result = await _retrieve(store, query, field_text=field_text, progress=progress or _noop)
         with PERF.timer("retrieve.support", n=len(result.hits)):
             await verify_support(result)
+        if result.plan.intent == "enumerate" and not result.plan.page_operation and not result.hits:
+            # A list that found no pages must never answer worse than an ordinary
+            # search on the same subject: the items may be inside pages, not pages.
+            PERF.count("retrieve.enumerate_fallback")
+            plan = dataclasses.replace(result.plan, intent="recall")
+            result = await _retrieve(store, query, field_text=field_text, progress=progress or _noop, plan=plan)
+            await verify_support(result)
         temporal_answer(result)
         t.n = len(result.hits)
     return result
 
 
-async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> RetrievalResult:
+async def _retrieve(store: Store, query: str, *, field_text: str, progress,
+                    plan: QueryPlan | None = None) -> RetrievalResult:
+    if plan is not None:
+        result = RetrievalResult(query=query, plan=plan)
+        if await _short_interval(store, plan, result):
+            return result
+        return await _search(store, plan, result, field_text=field_text, progress=progress,
+                             qvec=await try_embed(query))
     unresolved_event = False
     structural = fallback_plan(query) if relative_event(query) else None
     if isinstance(structural, EventQueryPlan):
@@ -204,16 +219,25 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> R
             await enumerate_pages(store, plan, result, await qvec_task)
         return result
 
+    if await _short_interval(store, plan, result):
+        qvec_task.cancel()
+        return result
+    return await _search(store, plan, result, field_text=field_text, progress=progress, qvec=await qvec_task)
+
+
+async def _short_interval(store: Store, plan: QueryPlan, result: RetrievalResult) -> bool:
+    """Every episode of a short interval, when there are any (planS3 §4.4)."""
     if plan.interval and plan.interval[1] - plan.interval[0] <= T.EXHAUSTIVE_MAX_SPAN_S and plan.intent in ("temporal", "recall"):
         await _exhaustive(store, plan, result)
-        if result.hits:
-            qvec_task.cancel()
-            return result
+        return bool(result.hits)
+    return False
 
+
+async def _search(store: Store, plan: QueryPlan, result: RetrievalResult, *, field_text: str, progress,
+                  qvec) -> RetrievalResult:
     t_search = time.perf_counter()
     cold = await store.observation_count() < T.COLD_START_ROWS
     df_info = await store.df_lookup(plan.terms)
-    qvec = await qvec_task
     pool: list[Hit] = []
 
     if plan.intent == "aggregate":
@@ -255,7 +279,7 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> R
     PERF.sample("retrieve.search", since_ms(t_search), n=len(pool))  # BM25 ‖ dense → fused, gated pool
     progress("ranking", len(pool))
     with PERF.timer("retrieve.rerank", n=len(pool)):
-        pool = await _rerank(query, pool, cold)
+        pool = await _rerank(result.query, pool, cold)
     with PERF.timer("retrieve.mmr"):
         result.hits = await _mmr(store, pool, T.TOP_K)
     await expand_tasks(store, result)

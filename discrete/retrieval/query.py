@@ -45,7 +45,23 @@ _ABOUT_USER = re.compile(
 # "what time on Monday did I…" asks when, not how long: no bare "time on".
 _TIME_SPENT = re.compile(r"\b(?:how much time|how long (?:did|do|have) i (?:spend|spent|been)|most (?:of my )?time|"
                          r"time spent|spend(?:ing)? (?:my |the most )?time|spent (?:the )?most)\b", re.I)
-_EDIT_VERBS = ("fix", "rewrite", "complete", "summarize", "translate", "format", "rephrase", "shorten")
+_EDIT_VERBS = ("fix", "rewrite", "complete", "summarize", "summarise", "translate", "format", "rephrase", "shorten")
+# "Summarize the messages I viewed" asks about the user's past, not about the draft;
+# "summarize what I wrote above" still points at the field.
+_OWN_PAST = re.compile(r"\bi\s+(?:\w+ed|saw|seen|read|did|had|was|were|wrote|sent|got|went|heard|met|took|made)\b"
+                       r"|\b(?:did|have|had)\s+i\b", re.I)
+# A request for an answer, not a draft to continue.
+_REQUEST = re.compile(r"\s*(?:give|tell|show|list|find|summari[sz]e)\s+(?:me|all|every|the|my)\b", re.I)
+_DEICTIC = re.compile(r"\b(?:above|below|this|these|here)\b", re.I)
+# Page enumeration lists visited pages. A summary, or a list of things *inside* pages
+# (messages, names, prices), is answered from their contents by ordinary search.
+_SUMMARY = re.compile(r"\bsummar(?:y|ies|ise|ize|ised|ized)\b|\brecap\b|\bgist\b", re.I)
+_ENUM_OBJECT = re.compile(r"\b(?:list|show me|what|all|every)(?:\s+(?:all|every|of|the|my))*\s+([a-z]+)\b", re.I)
+_PAGE_NOUNS = frozenset(
+    "article articles page pages site sites website websites link links tab tabs url urls video videos post posts "
+    "story stories thread threads blog blogs doc docs document documents file files repo repos repositories "
+    "app apps window windows".split())
+_NOT_NOUNS = frozenset("i you we that what which where when did do have things stuff everything".split())
 # Match the user's completion question, not an action mentioned later in a recall question.
 _COMPLETED_ACTION = (
     r"(?:book(?:ed)?|order(?:ed)?|buy|bought|pay|paid|send|sent|submit(?:ted)?|"
@@ -69,6 +85,17 @@ _ENUM_SCAFFOLD = frozenset(
 
 def strip_scaffold(text: str) -> str:
     return " ".join(t for t in tk.content_tokens(text) if t not in _ENUM_SCAFFOLD)
+
+
+def page_enumeration(text: str) -> bool:
+    """Does this list request ask for visited pages (not a summary or things inside them)?"""
+    if _SUMMARY.search(text):
+        return False
+    if set(tk.tokens(text)) & _PAGE_NOUNS:
+        return True
+    m = _ENUM_OBJECT.search(text)
+    noun = m[1].lower() if m else ""
+    return not noun or noun in _PAGE_NOUNS or noun in _NOT_NOUNS
 
 
 def is_why(text: str, plan: QueryPlan | None = None) -> bool:
@@ -194,9 +221,11 @@ def fallback_plan(text: str, *, reference_at: float | None = None, relative_even
     queries = [q for q in queries if q]
     low = text.lower().strip()
     intent = "recall"
-    if any(low.startswith(v) for v in _EDIT_VERBS) and "?" not in text:
+    summary_of_past = bool(_SUMMARY.search(low[:12]) and _OWN_PAST.search(text) and not _DEICTIC.search(text))
+    if any(low.startswith(v) for v in _EDIT_VERBS) and "?" not in text and not summary_of_past:
         intent = "edit"
-    elif "?" not in text and len(text.split()) > 12 and not (set(tk.tokens(text)[:2]) & tk.INTERROGATIVES):
+    elif ("?" not in text and len(text.split()) > 12 and not (set(tk.tokens(text)[:2]) & tk.INTERROGATIVES)
+          and not _REQUEST.match(text)):
         intent = "continuation"
     interval = parse_interval(text, reference_at)
     anchor = relative_event(text) if relative_events else None
@@ -209,7 +238,7 @@ def fallback_plan(text: str, *, reference_at: float | None = None, relative_even
         intent = "aggregate"
         words = set(tk.tokens(text))
         kind = next((k for k, vocab in KIND_VOCAB.items() if words & set(vocab)), "")
-    elif intent == "recall" and _ENUM.search(text):
+    elif intent == "recall" and _ENUM.search(text) and page_enumeration(text):
         intent = "enumerate"
         terms = [t for t in terms if t not in _ENUM_SCAFFOLD]
         queries = list(dict.fromkeys(q for q in (strip_scaffold(x) for x in queries) if q))

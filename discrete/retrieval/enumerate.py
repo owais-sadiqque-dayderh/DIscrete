@@ -36,11 +36,17 @@ async def enumerate_pages(store: Store, plan: QueryPlan, result: RetrievalResult
     `ENUMERATE_TRAIL_S` after a match (status "trail") (insights.md §7.34)."""
     result.exhaustive = True
     ids: list[int] = []
+    saturated = False
     subject = " ".join(plan.queries[:8]).strip()
     if subject:
-        for q in plan.queries[:8]:
-            ids += await store.fts_ids("observation", q, limit=T.ENUMERATE_POOL)
-            ids += await store.observation_ids_navigated_from(q, limit=T.ENUMERATE_POOL)
+        for n, q in enumerate(plan.queries[:8]):
+            found = await store.fts_ids("observation", q, limit=T.ENUMERATE_POOL)
+            saturated = saturated or len(found) >= T.ENUMERATE_POOL
+            ids += found
+            # A recorded source is often named by part of the subject ("hacker news" for
+            # "yc hacker news"), so every run of two or more of its words is looked up.
+            for phrase in _subphrases(q) if n == 0 else [q]:
+                ids += await store.observation_ids_navigated_from(phrase, limit=T.ENUMERATE_POOL)
         # Embed the subject, not the raw request: its scaffolding pulls in unrelated rows.
         qvec = await try_embed(subject) if subject != plan.raw else qvec
         if qvec is not None:
@@ -107,14 +113,27 @@ async def enumerate_pages(store: Store, plan: QueryPlan, result: RetrievalResult
         if r["caption"] and not v["caption"]:
             v["caption"] = r["caption"]
 
-    for v in visits[: T.ENUMERATE_MAX]:
+    hits = []
+    for v in visits:
         body = " · ".join(x for x in (v["site"] or v["app"], v["url"]) if x)
         if v["caption"]:
             body += f"\n{tk.truncate(v['caption'], 160)}"
-        result.hits.append(Hit("observation", v["id"], v["title"][:140], body, strong=True, untrusted=True,
-                               status="matched" if v["matched"] else "trail", url=v["url"],
-                               occurred_at=v["first"], occurred_to=v["last"], is_listing=v["is_listing"],
-                               navigated_from=v["navigated_from"]))
+        hits.append(Hit("observation", v["id"], v["title"][:140], body, strong=True, untrusted=True,
+                        status="matched" if v["matched"] else "trail", url=v["url"],
+                        occurred_at=v["first"], occurred_to=v["last"], is_listing=v["is_listing"],
+                        navigated_from=v["navigated_from"]))
+    # Only the items go on to verification and the answer; a cut list says so.
+    items = shape_enumerate_items(hits, plan)
+    result.hits = items[: T.ENUMERATE_MAX]
+    if len(items) > T.ENUMERATE_MAX:
+        result.enumeration_total = len(items)
+    result.enumeration_truncated = saturated or len(items) > T.ENUMERATE_MAX
+
+
+def _subphrases(q: str) -> list[str]:
+    words = q.split()[:6]
+    return list(dict.fromkeys(" ".join(words[i:j]) for i in range(len(words))
+                              for j in range(len(words), i + 1, -1))) or [q]
 
 
 def shape_enumerate_items(hits: list[Hit], plan: QueryPlan) -> list[Hit]:
@@ -129,7 +148,8 @@ def shape_enumerate_items(hits: list[Hit], plan: QueryPlan) -> list[Hit]:
     labeled: list[Hit] = []
     seen: set[str] = set()
     for h in hits:
-        key = tk.norm_key(h.title)
+        # Two different URLs under one title are two items.
+        key = canon_url(h.url) or tk.norm_key(h.title)
         if key not in seen:
             seen.add(key)
             labeled.append(h)
@@ -149,4 +169,6 @@ def shape_enumerate_items(hits: list[Hit], plan: QueryPlan) -> list[Hit]:
     # reached from the source, same-app pages merely open nearby in time are dropped.
     if any(h.status == "trail" and h.navigated_from for h in items):
         items = [h for h in items if h.status == "matched" or h.navigated_from]
-    return items or labeled
+    # When every page was a source or a generic window, nothing was opened from it;
+    # falling back to the excluded pages would list exactly what was ruled out.
+    return items
