@@ -191,6 +191,11 @@ def consolidate_endpoint() -> Endpoint:
     return _ep("consolidate", "CONSOLIDATE_LM", "INSIGHT_LM")
 
 
+def verifier_endpoint() -> Endpoint:
+    """Independent semantic support verification before committing memories."""
+    return _ep("verifier", "VERIFY_LM", "INSIGHT_LM")
+
+
 def utility_endpoint() -> Endpoint:
     """Query planning, listwise rerank fallback (planS3)."""
     return _ep("utility", "UTILITY_LM")
@@ -220,6 +225,7 @@ def all_endpoints() -> list[Endpoint]:
     return [
         caption_endpoint(),
         insight_endpoint(),
+        verifier_endpoint(),
         consolidate_endpoint(),
         utility_endpoint(),
         embedding_endpoint(),
@@ -288,6 +294,8 @@ class T:
     LLM_TIMEOUT_S = _typed("LLM_TIMEOUT_S", 60.0)
     # Vision calls in flight at once; captures never wait for them (capture/enrich.py).
     ENRICH_CONCURRENCY = _typed("ENRICH_CONCURRENCY", 2)
+    # Rows holding a caption task (and their images) at once; the rest wait on disk.
+    ENRICH_MAX_PENDING = _typed("ENRICH_MAX_PENDING", 8)
     # Windows remembered for the frame-duplicate check.
     LAST_KEPT_MAX = _typed("LAST_KEPT_MAX", 512)
 
@@ -306,6 +314,8 @@ class T:
     DRAFT_MAX_OBS = _typed("DRAFT_MAX_OBS", 40)
     EVIDENCE_MIN_OVERLAP = _typed("EVIDENCE_MIN_OVERLAP", 0.2)
     DRAFT_MAX_ATTEMPTS = _typed("DRAFT_MAX_ATTEMPTS", 3)
+    # Failed drafts/embeddings are retried after this, then with doubling waits (outages).
+    FAILED_WORK_RETRY_S = _typed("FAILED_WORK_RETRY_S", 900.0)
     RELATE_CANDIDATES = _typed("RELATE_CANDIDATES", 5)
     OUTBOX_MAX_ATTEMPTS = _typed("OUTBOX_MAX_ATTEMPTS", 5)
     CANDIDATE_LIMIT = _typed("CANDIDATE_LIMIT", 8)
@@ -351,6 +361,9 @@ class T:
     LLM_RERANK = _typed("LLM_RERANK", False)
     LLM_RERANK_POOL = _typed("LLM_RERANK_POOL", 24)
     QUERY_LLM_PLAN = _typed("QUERY_LLM_PLAN", True)
+    # Verifier pass that drops related-but-unsupporting records (retrieval/support.py).
+    SUPPORT_CHECK = _typed("SUPPORT_CHECK", True)
+    SUPPORT_TIMEOUT_S = _typed("SUPPORT_TIMEOUT_S", 8.0)  # slower: results stay unverified
     TOP_K = _typed("TOP_K", 8)
     # Enumeration ("list all …") bypasses TOP_K/MMR: it returns every distinct page.
     ENUMERATE_MAX = _typed("ENUMERATE_MAX", 200)

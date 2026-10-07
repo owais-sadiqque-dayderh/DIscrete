@@ -71,6 +71,20 @@ class ClaimDraft:
 
 
 @dataclass
+class ClaimWrite:
+    """A prepared mutation; model calls and entity resolution precede persistence."""
+
+    draft: ClaimDraft
+    operation: str = "added"
+    target_id: int | None = None
+    refines_id: int | None = None
+    contested_id: int | None = None
+    vector: list[float] | None = None
+    text_hash: str = ""
+    mentions: list[int] = field(default_factory=list)
+
+
+@dataclass
 class QueryPlan:
     raw: str
     intent: str = "recall"

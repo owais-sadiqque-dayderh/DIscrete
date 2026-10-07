@@ -1,0 +1,82 @@
+# Fixture suite: expectations about the sanitized replay in golden/cua_manifest.jsonl,
+# not about your own activity. Build its isolated store first (see README).
+cases:
+  - question: What SQLite documentation did I view?
+    category: recall
+    expect_any: [SQLite FTS5]
+    answer_expect_any: [FTS5]
+    answer_expect_all: [FTS5]
+  - question: Which PostgreSQL index types did I read about?
+    category: recall
+    expect_any: [GIN]
+    expect_all: [GIN, BRIN]
+    answer_expect_any: [GIN]
+  - question: What calculation did I perform in Calculator?
+    category: recall
+    expect_any: [3,000, '3000']
+    answer_expect_any: [3,000, '3000']
+  - question: What was the result of multiplying 250 by 12?
+    category: recall
+    expect_any: [3,000, '3000']
+    answer_expect_any: [3,000, '3000']
+  - question: Which PDF did I open in Preview?
+    category: recall
+    expect_any: [notebook-review.pdf]
+    answer_expect_any: [notebook-review, OFFLINE RESEARCH NOTEBOOK]
+  - question: What was the prototype decision written in the research review document?
+    category: document
+    expect_any: [SQLite]
+    answer_expect_any: [SQLite]
+  - question: What indexing strategy does the PostgreSQL GIN page describe?
+    category: document
+    expect_any: [inverted]
+    answer_expect_any: [inverted]
+  - question: What kind of technical notes do I prefer?
+    category: preference
+    expect_any: [concise]
+    answer_expect_any: [concise]
+  - question: Do I prefer examples in technical notes?
+    category: preference
+    expect_any: [concrete examples]
+    answer_expect_any: [concrete, examples]
+  - question: What is my preference about sources in technical notes?
+    category: preference
+    expect_any: [explicit sources]
+    answer_expect_any: [explicit, sources]
+  - question: Which database do I prefer for offline prototypes?
+    category: preference
+    expect_any: [local SQLite]
+    answer_expect_any: [SQLite]
+  - question: Why do I prefer SQLite files for database prototypes?
+    category: preference
+    expect_any: [offline]
+    answer_expect_any: [offline]
+  - question: What did I do in Calculator on October 1 2026?
+    category: temporal
+    expect_any: [Calculator]
+    answer_expect_any: [3,000, '3000']
+  - question: List all the database documentation pages I viewed.
+    category: enumerate
+    expect_any: [FTS5, Index Types]
+    expect_all: [FTS5, PostgreSQL]
+    answer_expect_any: [FTS5]
+    answer_expect_all: [FTS5, PostgreSQL]
+  - question: Which files did I see in the fixtures folder?
+    category: enumerate
+    expect_any: [notebook-review.pdf]
+    answer_expect_any: [notebook-review.pdf]
+  - question: Which software tools have I used?
+    category: aggregate
+    expect_any: [SQLite, PostgreSQL, TextEdit, Calculator, Preview]
+  - question: Which airline did I book tickets with?
+    category: unanswerable
+    unanswerable: true
+  - question: What is my annual salary?
+    category: unanswerable
+    unanswerable: true
+  - question: What is my preferred web browser theme?
+    category: unanswerable
+    unanswerable: true
+  - question: Which database did I deploy to production?
+    category: unanswerable
+    unanswerable: true

@@ -124,26 +124,6 @@ async def resolve_existing(store: Store, name: str, *, use_embeddings: bool = Fa
     return None
 
 
-async def note_candidates(store: Store, names: list[str], episode_id: int) -> None:
-    for name in {n.strip() for n in names if n and n.strip()}:
-        if promotable(name):
-            await store.bump_entity_candidate(name, tk.entity_key(name), episode_id)
-
-
-async def attach_claim_mentions(store: Store, claim_id: int, claim_text: str, quotes: list[str], names: list[str]) -> int:
-    """planS2 §10.5: a claim mention requires the alias in the claim text or a quote."""
-    found = []
-    haystack = "\n".join([claim_text, *quotes])
-    for name in {n.strip() for n in names if n and n.strip()}:
-        if not tk.contains_phrase(haystack, name):
-            continue
-        eid = await resolve_existing(store, name)
-        if eid is not None:
-            found.append((eid, "claim", claim_id))
-    await store.record_mentions(found)
-    return len(found)
-
-
 async def promote_recurring(store: Store) -> int:
     """Candidates seen in ≥ ENTITY_MIN_EPISODES episodes become entities (or aliases),
     then mentions are back-filled from live claims in one pass."""

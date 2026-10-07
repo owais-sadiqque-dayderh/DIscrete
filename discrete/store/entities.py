@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from collections.abc import Sequence
 from typing import Any
@@ -112,23 +111,6 @@ class EntitiesMixin(StoreBase):
             return n
 
         return await self._call(_rec)
-
-    async def bump_entity_candidate(self, name: str, key: str, episode_id: int) -> None:
-        def _bump():
-            ts = now()
-            row = self.conn.execute("SELECT episodes FROM entity_candidates WHERE name_norm=?", (key,)).fetchone()
-            if row:
-                eps = set(tk.parse_json_list(row[0]))
-                eps.add(episode_id)
-                self.conn.execute("UPDATE entity_candidates SET episodes=?, last_seen=? WHERE name_norm=?",
-                                  (json.dumps(sorted(eps)), ts, key))
-            else:
-                self.conn.execute(
-                    "INSERT INTO entity_candidates(name_norm, name, episodes, first_seen, last_seen) VALUES (?,?,?,?,?)",
-                    (key, name.strip(), json.dumps([episode_id]), ts, ts),
-                )
-
-        await self._call(_bump)
 
     async def entity_candidates(self) -> list[sqlite3.Row]:
         return await self.q("SELECT * FROM entity_candidates")

@@ -45,9 +45,9 @@ Restart the terminal after granting, then check everything:
 | `discrete query "…"` | show exactly what retrieval returns (debugging) |
 | `discrete stats` | store summary and **model use per component** (calls, tokens, cost) |
 | `discrete bench [--since last-run] [--eval] [--save N] [--compare N]` | cost, latency per stage, capture volume, quality, storage; saved snapshots and comparisons ([`docs/C7.md`](docs/C7.md)) |
-| `discrete process [--recover] [--consolidate]` | draft waiting episodes now |
+| `discrete process [--recover] [--consolidate]` | draft waiting episodes now; `--recover` also retries failed work |
 | `discrete backfill-pages` | one-off: add page fields to rows captured before C6 |
-| `discrete eval [--cases F] [--verbose]` | score golden retrieval cases |
+| `discrete eval [--cases F] [--verbose]` | score golden retrieval cases; add `--answers` to check final answers |
 | `discrete gaps` / `discrete answer ID "…"` | knowledge gaps and answering them |
 
 Add `--db PATH` before the command to use another store. Data lives in
@@ -94,3 +94,35 @@ Dependencies point one way: `models, perf → store → llm → capture/process/
 Tests use a fake model backend and a temp data dir; they never touch the
 network or your real store. CI (`.github/workflows/ci.yml`) runs lint, type
 check and tests on a macOS runner.
+
+## Reliability and repeatable validation
+
+Captures are stored before any model call. Vision captions run in a bounded pool
+(`DISCRETE_ENRICH_MAX_PENDING`); the backlog waits on disk (row + saved frame) and
+resumes after a restart, and segmentation follows capture order. An episode's
+claims, evidence, merges, entity candidates and closure commit in one transaction.
+An independent verifier (`VERIFY_LM_*`, default `INSIGHT_LM_*`) checks actor,
+negation, scope and completion before memories are written, and checks search
+results against the question before Bubble answers (`DISCRETE_SUPPORT_CHECK`).
+That second check runs on every query, so give `VERIFY_LM` a fast model. Search
+fails closed when verification is unavailable. Failed drafting/indexing is retried
+after `DISCRETE_FAILED_WORK_RETRY_S` (900 s), then with doubling waits;
+`discrete process --recover` retries everything immediately.
+
+`golden/cases.yaml` is for questions about **your own** recorded activity
+([`docs/C7.md`](docs/C7.md)). `golden/fixture.yaml` holds expectations about a
+sanitized replay, scored against its own isolated store:
+
+```bash
+.venv/bin/python tools/replay_session.py --manifest golden/cua_manifest.jsonl --db /tmp/discrete-fixture.db
+.venv/bin/discrete --db /tmp/discrete-fixture.db eval --cases golden/fixture.yaml --answers --verbose
+```
+
+Use a new database path for each replay. The manifest replays text through
+processing and retrieval; live capture and vision need real screenshots
+(`tools/capture_task.py` records a window, `tools/replay_session.py` processes a
+manifest, `tools/evaluate_session.py` and `tools/compare_models.py` compare
+revisions and models). `golden/cua_session.yaml` and `golden/cua_holdout.yaml`
+need those live captures. `eval --answers` also generates each answer with
+Bubble's writer and has it judged; contamination, missing list items and
+unsupported answers fail, and a failing suite exits nonzero.

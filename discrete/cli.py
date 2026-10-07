@@ -141,7 +141,7 @@ async def cmd_doctor(args) -> int:
         ok = False
         _print("ISSUE: no front window detected")
     g = FrameGrabber()
-    img = g.grab(ctx.bounds, max_width=1600)
+    img = g.grab(ctx.bounds, max_width=1600, window_id=ctx.window_id)
     g.close()
     if img is None or is_blank(img):
         ok = False
@@ -199,6 +199,8 @@ async def cmd_process(args) -> int:
         recovered = []
         if args.recover:
             await store.reset_stuck_drafting()
+            await store.retry_failed_drafts()
+            await store.retry_failed_outbox()
             await store.fail_stale_enrichment()
             recovered = await store.recover_open_episodes(older_than_s=T.EPISODE_IDLE_CLOSE_S)
         pipe = ProcessPipeline(store)
@@ -234,7 +236,7 @@ async def cmd_consolidate(_args) -> int:
 async def cmd_eval(args) -> int:
     path = Path(args.cases) if args.cases else default_cases()
     async with _session() as store:
-        result = await run_suite(store, path)
+        result = await run_suite(store, path, answers=args.answers)
         if not result.cases:
             _print(f"no cases in {path}")
             return 1
@@ -255,7 +257,7 @@ async def cmd_eval(args) -> int:
             _print(json.dumps({k: v for k, v in cmp.items() if k != "baseline"}, indent=2))
             if cmp["regressions"] and not result.stale:
                 return 2
-    return 0
+    return 1 if not result.stale and any(not case.correct for case in result.cases) else 0
 
 
 async def cmd_bench(args) -> int:
@@ -349,6 +351,7 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--cases", help="case file (default golden/cases.yaml)")
     pe.add_argument("--save-baseline", action="store_true")
     pe.add_argument("--verbose", action="store_true")
+    pe.add_argument("--answers", action="store_true", help="also generate and independently check final answers")
     pe.set_defaults(func=cmd_eval)
 
     pbe = sub.add_parser("bench", help="cost, speed, volume, quality and storage over a time window")

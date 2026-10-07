@@ -69,8 +69,25 @@ class EpisodesMixin(StoreBase):
     async def draft_failed(self, episode_id: int) -> None:
         await self.execute(
             "UPDATE episodes SET status=CASE WHEN draft_attempts>=? THEN 'failed' ELSE 'ready' END, updated_at=? "
-            "WHERE id=?",
+            "WHERE id=? AND status='drafting'",
             (T.DRAFT_MAX_ATTEMPTS, now(), episode_id),
+        )
+
+    async def retry_failed_drafts(self, *, older_than_s: float | None = None) -> None:
+        """Give failed episodes another chance after a provider outage.
+
+        With `older_than_s` (the daemon): one more attempt per round, waiting
+        older_than_s, then twice as long each round (capped at 64x), so an episode
+        that can never be drafted costs a handful of calls a day, not a steady stream.
+        Without it (`discrete process --recover`): every failed episode, attempts reset."""
+        if older_than_s is None:
+            await self.execute("UPDATE episodes SET status='ready', draft_attempts=0, updated_at=? "
+                               "WHERE status='failed'", (now(),))
+            return
+        await self.execute(
+            "UPDATE episodes SET status='ready', updated_at=? WHERE status='failed' "
+            "AND updated_at <= ? - ? * (1 << MIN(MAX(draft_attempts - ?, 0), 6))",
+            (now(), now(), older_than_s, T.DRAFT_MAX_ATTEMPTS),
         )
 
     async def close_episode(self, episode_id: int, *, title: str, summary: str, apps: list[str],

@@ -1,0 +1,53 @@
+# Additional real CUA windows, evaluated after a preference revision.
+cases:
+  - question: Which Japanese city did I research on Wikipedia?
+    category: recall
+    expect_any: [Kyoto]
+    answer_expect_any: [Kyoto]
+  - question: Which laptop product page did I view on Apple’s website?
+    category: recall
+    expect_any: [MacBook Air]
+    answer_expect_any: [MacBook Air]
+  - question: Which Python release tag did I view on GitHub?
+    category: recall
+    expect_any: [v3.13.0]
+    answer_expect_any: [3.13.0]
+  - question: What kind of technical notes do I prefer now?
+    category: preference
+    expect_any: [detailed]
+    answer_expect_any: [detailed]
+  - question: What kind of technical notes did I previously prefer?
+    category: temporal
+    expect_any: [concise]
+    answer_expect_any: [concise]
+  - question: Do I still require examples and sources in technical notes?
+    category: preference
+    expect_any: [concrete examples]
+    answer_expect_all: [examples, sources]
+  - question: Which database do I prefer for offline prototypes?
+    category: preference
+    expect_any: [SQLite]
+    answer_expect_any: [SQLite]
+  - question: What kind of reports does Sofia prefer?
+    category: recall
+    expect_any: [formal]
+    answer_expect_all: [long, formal]
+  - question: Do I prefer long formal reports like Sofia?
+    category: unanswerable
+    unanswerable: true
+  - question: Which hotel did I book in Kyoto?
+    category: unanswerable
+    unanswerable: true
+  - question: Which laptop did I purchase?
+    category: unanswerable
+    unanswerable: true
+  - question: Which Python version did I install?
+    category: unanswerable
+    unanswerable: true
+  - question: What next steps were listed on page 2 of the notebook review PDF?
+    category: document
+    expect_all: [Compare search quality, Evaluate PostgreSQL]
+    answer_expect_all: [search quality, PostgreSQL]
+  - question: Which database migration did I complete in the notebook review?
+    category: unanswerable
+    unanswerable: true

@@ -19,6 +19,7 @@ from ..timeutil import age_days, day_key, now, to_local
 from .enumerate import enumerate_pages
 from .query import build_plan
 from .rerank import llm_rerank
+from .support import verify_support
 
 log = logging.getLogger("discrete.retrieval.hybrid")
 
@@ -87,6 +88,8 @@ async def retrieve(store: Store, query: str, *, field_text: str = "", progress=N
     """`progress(stage, detail)` is an optional UI hook (Bubble's overlay)."""
     with PERF.timer("retrieve.total") as t:
         result = await _retrieve(store, query, field_text=field_text, progress=progress or _noop)
+        with PERF.timer("retrieve.support", n=len(result.hits)):
+            await verify_support(result)
         t.n = len(result.hits)
     return result
 

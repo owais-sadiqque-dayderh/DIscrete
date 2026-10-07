@@ -8,14 +8,15 @@ from dataclasses import dataclass, field
 from .. import textkit as tk
 from ..config import T, insight_endpoint
 from ..llm import EXPECTED_ERRORS, LLMError, NotConfigured, complete_json, embed
-from ..models import ClaimDraft
+from ..models import ClaimDraft, ClaimWrite
 from ..perf import PERF
-from ..store import Store
+from ..store import DraftConflict, Store
 from ..timeutil import to_local
 from .embed_worker import claim_text
-from .entities import attach_claim_mentions, note_candidates, structural_candidates
+from .entities import promotable, resolve_existing, structural_candidates
 from .prompts import DRAFT_EPISODE_PROMPT, RELATE_BLOCK, RELATE_PROMPT
 from .validation import atomic, injection_drop, subject_ok, verify_evidence
+from .verification import verify_claims
 
 log = logging.getLogger("discrete.process.pipeline")
 
@@ -67,7 +68,7 @@ class ProcessPipeline:
                 res = await self._draft(episode_id)
                 t.n = res.added + res.reinforced
             return res
-        except EXPECTED_ERRORS as exc:
+        except (*EXPECTED_ERRORS, DraftConflict) as exc:
             log.warning("episode %s draft failed: %s", episode_id, exc)
             await self.store.draft_failed(episode_id)
             await self.store.bump_metric("draft_failed")
@@ -90,16 +91,12 @@ class ProcessPipeline:
 
         data = await self._call_draft(rows)
         by_id = {r["id"]: r for r in rows}
-        await self.store.close_episode(
-            episode_id, title=tk.truncate(str(data.get("title") or ""), 80),
-            summary=tk.truncate(str(data.get("summary") or ""), 600), apps=apps, sites=sites,
-            engaged_fraction=engaged,
-        )
         t0 = min(r["started_at"] for r in rows)
         t1 = max(r["ended_at"] for r in rows)
         counts = {"event": 0, "durable": 0}
         names_seen: list[str] = []
-        durables: list[_Durable] = []
+        drafts: list[ClaimDraft] = []
+        seen: set[tuple[str, str]] = set()
         for item in data.get("claims") or []:
             if not isinstance(item, dict):
                 continue
@@ -115,16 +112,25 @@ class ProcessPipeline:
             cd = self._validate(item, kind, by_id, episode_id, t0, t1, outcome)
             if cd is None:
                 continue
+            key = (cd.kind, tk.norm_key(cd.text))
+            if key in seen:
+                outcome.reject("duplicate")
+                continue
+            seen.add(key)
             counts[bucket] += 1
-            names_seen += cd.entities
-            if kind == "event":
-                cid = await self.store.create_claim(cd)
-                await self._mentions(cid, cd)
-                outcome.added += 1
-            else:
-                durables.append(_Durable(cd=cd, text=claim_text(cd.text, cd.context)))
-        for op in await self._merge(durables):
-            setattr(outcome, op, getattr(outcome, op) + 1)
+            drafts.append(cd)
+        drafts = await self._verify(drafts, by_id, outcome)
+        writes = [ClaimWrite(cd) for cd in drafts if cd.kind == "event"]
+        durables = [_Durable(cd=cd, text=claim_text(cd.text, cd.context)) for cd in drafts if cd.kind != "event"]
+        writes += await self._merge(durables)
+        for w in writes:
+            names_seen += w.draft.entities
+            haystack = "\n".join([w.draft.text, *(e["quote"] for e in w.draft.evidence)])
+            for name in sorted(set(w.draft.entities)):
+                if tk.contains_phrase(haystack, name):
+                    eid = await resolve_existing(self.store, name)
+                    if eid is not None:
+                        w.mentions.append(eid)
 
         # Entity candidates (planS2 §10.2): VLM working entities, claim entities, the
         # structural pass on AX text, and ground-truth app/site where the user acted.
@@ -134,9 +140,14 @@ class ProcessPipeline:
                 names_seen += structural_candidates(r["screen_text"])
             if r["keys"] or r["clicks"] or r["clipboard"]:
                 names_seen += [x for x in (r["app"], r["site"]) if x]
-        await note_candidates(self.store, names_seen, episode_id)
-        for reason, n in outcome.rejected.items():
-            await self.store.bump_metric(f"claims_rejected_{reason}", n)
+        ops = await self.store.commit_episode_draft(
+            episode_id, title=tk.truncate(str(data.get("title") or ""), 80),
+            summary=tk.truncate(str(data.get("summary") or ""), 600), apps=apps, sites=sites,
+            engaged_fraction=engaged, writes=writes,
+            candidates=sorted({n.strip() for n in names_seen if n and promotable(n)}), rejected=outcome.rejected,
+        )
+        for op in ops:
+            setattr(outcome, op, getattr(outcome, op) + 1)
         return outcome
 
     async def _call_draft(self, rows) -> dict:
@@ -207,12 +218,23 @@ class ProcessPipeline:
             entities=entities, evidence=evidence,
         )
 
-    async def _mentions(self, claim_id: int, cd: ClaimDraft) -> None:
-        await attach_claim_mentions(self.store, claim_id, cd.text, [e["quote"] for e in cd.evidence], cd.entities)
+    async def _verify(self, drafts: list[ClaimDraft], by_id: dict, outcome: DraftOutcome) -> list[ClaimDraft]:
+        """One independent support check per episode, before any claim is persisted."""
+        if not drafts:
+            return []
+        with PERF.timer("draft.verify", n=len(drafts)):
+            decisions = await verify_claims(drafts, by_id)
+        accepted = []
+        for i, cd in enumerate(drafts):
+            if decisions[i]:
+                accepted.append(cd)
+            else:
+                outcome.reject("not_entailed")
+        return accepted
 
     # ----------------------------------------------------------- online merge
 
-    async def _merge(self, durables: list[_Durable]) -> list[str]:
+    async def _merge(self, durables: list[_Durable]) -> list[ClaimWrite]:
         """planS2 §6.2: ADD / REINFORCE / INVALIDATE for an episode's durable claims.
         One embeddings call and one relation call per episode, however many claims;
         each new claim's vector is stored with it, so it is never embedded again."""
@@ -226,7 +248,7 @@ class ProcessPipeline:
             d.vec = v
             d.candidates = await self._candidates(d)
         await self._relate(durables)
-        return [await self._apply(d) for d in durables]
+        return [self._operation(d) for d in durables]
 
     async def _candidates(self, d: _Durable) -> list:
         rankings = [await self.store.fts_ids("claim", d.cd.text, limit=T.CANDIDATE_LIMIT * 3)]
@@ -246,40 +268,41 @@ class ProcessPipeline:
                                 candidates="\n".join(f"[id={c['id']}] {c['text']}" for c in d.candidates))
             for n, d in asked
         )
-        try:
-            data = await complete_json(self.ep, [{"role": "user", "content": RELATE_PROMPT.format(blocks=blocks)}],
-                                       max_tokens=150 + 60 * sum(len(d.candidates) for _, d in asked))
-        except EXPECTED_ERRORS:
-            return
-        for r in (data or {}).get("relations") or []:
-            try:
-                n, rid, rel = int(r.get("new")), int(r.get("id")), str(r.get("relation") or "")
-            except (TypeError, ValueError, AttributeError):
-                continue
-            if 0 <= n < len(durables) and rel in _RELATIONS and any(c["id"] == rid for c in durables[n].candidates):
-                durables[n].relations[rid] = rel
+        data = await complete_json(self.ep, [{"role": "user", "content": RELATE_PROMPT.format(blocks=blocks)}],
+                                   max_tokens=150 + 60 * sum(len(d.candidates) for _, d in asked))
+        if not isinstance(data, dict) or not isinstance(data.get("relations"), list):
+            raise LLMError("relations: not a complete object")
+        expected = {(n, c["id"]) for n, d in asked for c in d.candidates}
+        decisions = {}
+        for r in data["relations"]:
+            if not isinstance(r, dict):
+                raise LLMError("relations: invalid decision")
+            n, rid, rel = r.get("new"), r.get("id"), r.get("relation")
+            if type(n) is not int or type(rid) is not int or rel not in _RELATIONS:
+                raise LLMError("relations: invalid decision")
+            key = (n, rid)
+            if key not in expected or key in decisions:
+                raise LLMError("relations: duplicate or unknown pair")
+            decisions[key] = rel
+        if set(decisions) != expected:
+            raise LLMError("relations: incomplete decisions")
+        for (n, rid), rel in decisions.items():
+            durables[n].relations[rid] = rel
 
-    async def _apply(self, d: _Durable) -> str:
-        """Never rewrites claim text."""
+    def _operation(self, d: _Durable) -> ClaimWrite:
+        """Prepare a mutation without writing. The store commits all mutations together."""
         cd = d.cd
-        vector = (d.vec, tk.content_hash(d.text)) if d.vec is not None else None
+        w = ClaimWrite(cd, vector=d.vec, text_hash=tk.content_hash(d.text))
         by_rel = {rel: [c for c in d.candidates if d.relations.get(c["id"]) == rel]
                   for rel in ("same", "contradicts", "refines")}
         if by_rel["same"]:
-            await self.store.reinforce_claim(by_rel["same"][0]["id"], cd)
-            return "reinforced"
-        if by_rel["contradicts"]:
+            w.operation, w.target_id = "reinforced", by_rel["same"][0]["id"]
+        elif by_rel["contradicts"]:
             old = by_rel["contradicts"][0]
             if cd.modality == "passive" and old["modality"] in ("engaged", "stated"):
-                cid = await self.store.create_claim(cd, vector=vector)
-                await self.store.flag_claims([cid, old["id"]], "contested")
-                await self._mentions(cid, cd)
-                return "added"
-            cid = await self.store.create_claim(cd, invalidates_id=old["id"], vector=vector)
-            await self.store.invalidate_claim(old["id"], by_id=cid, at=cd.occurred_from)
-            await self._mentions(cid, cd)
-            return "invalidated"
-        refines = by_rel["refines"][0]["id"] if by_rel["refines"] else None
-        cid = await self.store.create_claim(cd, refines_id=refines, vector=vector)
-        await self._mentions(cid, cd)
-        return "added"
+                w.contested_id = old["id"]
+            else:
+                w.operation, w.target_id = "invalidated", old["id"]
+        elif by_rel["refines"]:
+            w.refines_id = by_rel["refines"][0]["id"]
+        return w

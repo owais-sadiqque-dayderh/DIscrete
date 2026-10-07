@@ -62,22 +62,72 @@ class EnrichStats:
 
 
 class Enricher:
-    def __init__(self, store: Store, *, concurrency: int | None = None):
+    """Vision captions with bounded memory: at most ENRICH_MAX_PENDING rows hold a task
+    (and their images) at once. Rows beyond that stay `pending` in the store with a
+    saved frame, and `fill_pending` starts them as slots free up, oldest first."""
+
+    def __init__(self, store: Store, *, concurrency: int | None = None, on_done=None):
         self.store = store
         self.ep = caption_endpoint()
         self._sem = asyncio.Semaphore(concurrency or T.ENRICH_CONCURRENCY)
         self._tasks: set[asyncio.Task] = set()
+        self._active: set[int] = set()
+        self._on_done = on_done  # called when a row's caption is final (the runtime's wake-up)
+        self._closed = False
         self.stats = EnrichStats().counts
 
     @property
     def configured(self) -> bool:
         return self.ep.configured
 
-    def submit(self, oid: int, job: EnrichJob) -> asyncio.Task:
-        """Start enriching `oid`; the returned task finishes when its row is final."""
-        return spawn(self._run(oid, job), name=f"enrich-{oid}", owner=self._tasks)
+    def submit(self, oid: int, job: EnrichJob) -> asyncio.Task | None:
+        """Start enriching `oid`; the returned task finishes when its row is final.
+        None when the pool is full (or shutting down): the row stays pending."""
+        if self._closed or oid in self._active or len(self._active) >= T.ENRICH_MAX_PENDING:
+            return None
+        self._active.add(oid)
+        task = spawn(self._run(oid, job), name=f"enrich-{oid}", owner=self._tasks)
+
+        def done(_: asyncio.Task) -> None:
+            self._active.discard(oid)
+            if self._on_done is not None:
+                self._on_done()
+
+        task.add_done_callback(done)
+        return task
+
+    async def fill_pending(self) -> int:
+        """Start pending rows from their saved frame, oldest first, while slots are free."""
+        slots = T.ENRICH_MAX_PENDING - len(self._active)
+        if slots <= 0 or self._closed:
+            return 0
+        n = 0
+        for r in await self.store.pending_enrichment(limit=T.ENRICH_MAX_PENDING + len(self._active)):
+            if n >= slots:
+                break
+            if r["id"] in self._active:
+                continue
+
+            def load(path=r["frame_path"]) -> list[Image.Image]:
+                if path and Path(path).exists():
+                    with Image.open(path) as im:
+                        return [im.convert("RGB")]
+                return []
+
+            frames = await asyncio.to_thread(load)
+            row = await self.store.get_observation(r["id"])
+            if row is None or row["enrich_state"] != "pending" or r["id"] in self._active:
+                continue  # finished while the frame loaded
+            job = EnrichJob(frames, r["app"], r["window_title"], r["url"], r["screen_text"],
+                            {k: r[k] for k in ("keys", "clicks", "scrolls", "clipboard")})
+            if self.submit(r["id"], job) is not None:
+                n += 1
+        return n
 
     async def cancel_all(self) -> None:
+        """Shutdown: stop captions in flight and accept no new ones. Their rows stay
+        pending (the saved frame is on disk) and are captioned on the next run."""
+        self._closed = True
         for t in list(self._tasks):
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -90,11 +140,14 @@ class Enricher:
                 t_call = time.perf_counter()
                 data = await self.vlm(job)
                 PERF.sample("enrich.vision", since_ms(t_call), n=len(job.frames), ref_id=oid)
-        except asyncio.CancelledError:
-            await asyncio.shield(self.store.enrichment_failed(oid))
-            raise
-        try:
             await self._apply(oid, job, data)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Never leave a row pending after an unexpected error: segmentation waits on it.
+            log.exception("enrichment of %s failed", oid)
+            self.stats["degraded"] += 1
+            await self.store.enrichment_failed(oid)
         finally:
             PERF.sample("enrich.total", since_ms(t0), ref_id=oid)  # stored → final caption
 

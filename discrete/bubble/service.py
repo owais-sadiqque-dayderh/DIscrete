@@ -56,6 +56,10 @@ class BubbleService:
         self.tap.stop()
         if self._task and not self._task.done():
             self._task.cancel()
+        tasks = [t for t in [self._task, *self._bg] if t is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         self.overlay.close()
         log.info("bubble stats: %s", self.stats)
 
@@ -120,7 +124,7 @@ class BubbleService:
         def shoot() -> bytes:
             g = FrameGrabber()
             try:
-                img = g.grab(snap.window_bounds, max_width=1280)
+                img = g.grab(snap.window_bounds, max_width=1280, window_id=snap.window_id)
             finally:
                 g.close()
             if img is None:

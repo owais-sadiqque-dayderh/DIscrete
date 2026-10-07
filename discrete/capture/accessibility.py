@@ -30,6 +30,7 @@ try:
         AXUIElementCreateApplication,
         AXUIElementCreateSystemWide,
         AXUIElementSetAttributeValue,
+        AXUIElementSetMessagingTimeout,
         AXValueGetValue,
         kAXValueCFRangeType,
         kAXValueCGPointType,
@@ -55,6 +56,7 @@ class WindowContext:
     pid: int = 0
     # Window frame in global display points (top-left origin), or None.
     bounds: tuple[float, float, float, float] | None = None
+    window_id: int = 0
 
     @property
     def key(self) -> tuple:
@@ -97,10 +99,16 @@ def _front_window() -> dict | None:
     return None
 
 
+# Per-call ceiling for one AX attribute read. The system default (~6 s) lets one hung
+# app stall a capture or Bubble; Chromium can need ~100 ms while it builds its tree.
+_AX_TIMEOUT_S = 0.25
+
+
 def _ax_get(el, attr: str):
     if el is None:
         return None
     try:
+        AXUIElementSetMessagingTimeout(el, _AX_TIMEOUT_S)
         err, val = AXUIElementCopyAttributeValue(el, attr, None)
         return val if err == _AX_OK else None
     except Exception:
@@ -145,7 +153,8 @@ def window_context() -> WindowContext:
                 if page_url:
                     # The tab, not the window: Arc titles windows by Space ("Space 1").
                     url, title = page_url, page_title or title
-        return WindowContext(app=name, bundle_id=bundle, window_title=title, url=url, pid=pid, bounds=bounds)
+        return WindowContext(app=name, bundle_id=bundle, window_title=title, url=url, pid=pid, bounds=bounds,
+                             window_id=int(w.get("kCGWindowNumber", 0)))
     except Exception as exc:
         log.debug("window_context failed: %s", exc)
         return WindowContext()
@@ -211,23 +220,34 @@ def _enable_full_tree(app_el, pid: int) -> None:
             pass
 
 
-def _walk_text(el, parts: list[str], *, depth: int, max_nodes: int, deadline: float, seen: list[int]) -> None:
+def _walk_text(el, parts: list[str], *, depth: int, max_nodes: int, deadline: float, seen: list[int],
+               viewport: tuple[float, float, float, float] | None = None) -> None:
     if depth > 40 or seen[0] >= max_nodes or time.monotonic() > deadline:
         return
     seen[0] += 1
     role = str(_ax_get(el, "AXRole") or "")
     if role in _CHROME_ROLES:
         return
+    visible = True
+    if viewport:
+        p = _point_xy(_ax_value(_ax_get(el, "AXPosition"), kAXValueCGPointType))
+        s = _size_wh(_ax_value(_ax_get(el, "AXSize"), kAXValueCGSizeType))
+        if p is not None and s is not None:
+            x, y, w, h = viewport
+            # Chromium clamps offscreen text to a one-pixel strip at the
+            # viewport edge. It intersects the window but is not readable.
+            visible = s[0] > 1 and s[1] > 1 and p[0] + s[0] > x and p[0] < x + w and p[1] + s[1] > y and p[1] < y + h
     for attr in ("AXValue", "AXTitle", "AXDescription"):
         val = _ax_get(el, attr)
-        if isinstance(val, str) and val.strip():
+        if visible and isinstance(val, str) and val.strip():
             parts.append(val.strip())
             break
     for child in _ax_get(el, "AXChildren") or []:
-        _walk_text(child, parts, depth=depth + 1, max_nodes=max_nodes, deadline=deadline, seen=seen)
+        _walk_text(child, parts, depth=depth + 1, max_nodes=max_nodes, deadline=deadline, seen=seen, viewport=viewport)
 
 
-def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: int) -> str:
+def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: int,
+                     viewport: tuple[float, float, float, float] | None = None) -> str:
     """AX text walk of the focused window of `pid`. Empty when AX is not trusted."""
     if not _HAS_QUARTZ or not pid or not accessibility_granted():
         return ""
@@ -237,9 +257,14 @@ def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: in
         win = _ax_get(app_el, "AXFocusedWindow")
         if win is None:
             return ""
+        if viewport:
+            p = _point_xy(_ax_value(_ax_get(win, "AXPosition"), kAXValueCGPointType))
+            s = _size_wh(_ax_value(_ax_get(win, "AXSize"), kAXValueCGSizeType))
+            if p is not None and s is not None and any(abs(a - b) > 2 for a, b in zip((*p, *s), viewport, strict=True)):
+                return ""  # another window of the same app gained focus; trust captured pixels
         parts: list[str] = []
         deadline = time.monotonic() + timeout_ms / 1000.0
-        _walk_text(win, parts, depth=0, max_nodes=max_nodes, deadline=deadline, seen=[0])
+        _walk_text(win, parts, depth=0, max_nodes=max_nodes, deadline=deadline, seen=[0], viewport=viewport)
         # Adjacent duplicates are common (title + value of one element).
         out: list[str] = []
         for p in parts:
@@ -273,6 +298,7 @@ class FocusSnapshot:
     # Caret (or field) rect in global top-left display points, for the overlay.
     caret: tuple[float, float, float, float] | None = None
     window_bounds: tuple[float, float, float, float] | None = None
+    window_id: int = 0
     element: object = None
 
     @property
@@ -400,7 +426,7 @@ def capture_focus() -> FocusSnapshot:
     """Everything Bubble needs about the focused field, in one pass (~2-5 ms)."""
     ctx = window_context()
     snap = FocusSnapshot(pid=ctx.pid, app=ctx.app, window_title=ctx.window_title, url=ctx.url,
-                         window_bounds=ctx.bounds)
+                         window_bounds=ctx.bounds, window_id=ctx.window_id)
     if not _HAS_QUARTZ or not accessibility_granted():
         return snap
     el = _ax_get(AXUIElementCreateApplication(ctx.pid), "AXFocusedUIElement") if ctx.pid else None
