@@ -1053,3 +1053,128 @@ Sources: Cognition "agent memory repo" (cognition.com/agent-memory-repo), Hindsi
 - Root source checks and qualifications recorded in ADJUDICATION_NOTES.md; task recovery states in
   TASK_MANIFEST.json and RECOVERY_R2.json. Product source unchanged; no paid calls, commits, pushes or deployment.
   Next implementation choices belong to the user's decision after reviewing the report.
+
+### 2026-10-08 ~01:50 IST — Discrete git cleaned up; live-test logs read; hardening started (Claude orchestrator)
+**Discrete repo (`COMP_001/Discrete`) — what was mixed and how it's organised now.** The folder sat on the Oct 1 commit
+`ff5a268` (detached) with 47 files of uncommitted changes from two later layers. Nothing was deleted; every layer is
+now a branch in that repo:
+| Branch | Commit | Content |
+|---|---|---|
+| `main` (checked out, clean) | `ff5a268` | Oct 1 12:34 "Second Iteration on Oct1" — what the user wanted. 83 tests pass. Opens the current live db fine. |
+| `archive/2026-10-01-evening` | `dcfb13f` | Oct 1 22:48–23:26 uncommitted session (support verifier, drafts, verification, golden CUA, replay tools), recovered from T3 checkpoint `c7342b8`. |
+| `archive/2026-10-06-worktree` | `1c2898e` | + Oct 6 edits (app/site denylist `capture/privacy.py`, bubble/screen hooks, `tools/amb_bridge.py`). Same tree as exp baseline `41e2f9f` minus Worklog. |
+| `exp-baseline-2026-10-06` | `41e2f9f` | exp_discrete's "main" baseline (imported). |
+| `feat/memory-evolution` | `e6dfa85` | the whole exp_discrete branch (imported; exp_discrete itself is now at `d8847a5`). |
+- Consequence for past numbers: every "main" baseline in the evaluations was `41e2f9f` = Oct 1 commit + the Oct 1 evening
+  session + the Oct 6 denylist, **not** the pure Oct 1 commit.
+- Live `~/.cache/discrete` now holds only a 4-minute session from 2026-10-07 23:43 (33 observations, 0 claims); the
+  Oct 6 data survives as the `bench/private/live1006` snapshot.
+
+**User's live test of the branch (`jarvis-exp`, log `~/.cache/jarvis-exp_discrete/discrete.log`, running since
+2026-10-07 16:53, restarted 21:44, still running):** 0 tracebacks; ~89 episodes drafted with few rejections; network
+outage 23:52–00:33 caused draft/VLM/embedding "Connection error"s that recovered via retries (episodes 65–67 re-drafted
+at 00:46). Problems seen:
+- Bubble: "what all articles did i read in yc hacker news" and "summarise all the messages i viewed in iit mandi imba
+  group" → intent=enumerate, 0 hits, empty answer — while recall questions on the same subjects found 7 and 3 hits.
+  Ties to review QA-03. Recall answers took 9.7–13.4 s total.
+- Capture: dropped_failed 17/178 (~10%); repeated "near-flat frame — check Screen Recording permission".
+- Trails: muse verifier used all 1180 tokens before answering (budget too small for a reasoning model).
+- Dream on one day: 1 then 3 patterns proposed, all rejected single_occasion (correct); profile got 3 points.
+
+**Hardening of the review findings (assess + fix), 5 Codex workers in parallel** (gpt-6.1-sol, medium), each in its own
+worktree/branch off `feat/production-hardening` (= `d8847a5`), integration worktree `../exp_discrete_hardening`. The
+user's running app in `exp_discrete` is untouched. Brief: `../hardening_2026-10-08/BRIEF.md`; task IDs:
+`../hardening_2026-10-08/TASKS.json`; reports land in that folder.
+- W1 privacy: PR-01/02 (P0), PR-04/05/06, ME-01, dropped_failed investigation.
+- W2 runtime: RT-01..04, EV-01, cost telemetry.
+- W3 formation: ME-03/04/08/10, ME-05 (pipeline side), PR-05, ME-09, trails budget; ME-02 design note only.
+- W4 evolution: date-dependent dream test, PR-07/08, ME-05 (store side), ME-06/07/09/11, dream watermark.
+- W5 retrieval: PR-03 (P0), QA-01..04, the live enumerate misses, routing paraphrase tests, deadline.
+- Baseline in worktrees: 723 pass, 1 fails (`test_habits_need_several_days_projects_do_not`, date-dependent; W4).
+- Next: review each branch diff, merge into `feat/production-hardening`, full suite, then an independent Claude
+  (kaustubh, medium) review; offline only. A paid re-evaluation needs the user's OK (credit).
+- 02:07 IST: W1 and W3 (Codex) failed on the Codex usage limit (resets 05:53 IST) after partial work (W1: PR-01, PR-02,
+  PR-04-part committed; W3: ME-03 committed; both left uncommitted edits). Relaunched both as round 2 on the user's
+  second Claude account (claudeAgent_kaustubh, Opus medium, no nested subagents), told to review the committed fixes and
+  finish/discard the uncommitted edits. W2/W4/W5 still running on Codex (W4: 4 commits, W5: 3 commits, W2: 1 so far).
+- 02:10 IST: W2, W4, W5 (Codex) also stopped on the Codex usage limit (W2: RT-02 committed + large uncommitted diff;
+  W4: dream-test fix, ME-07, PR-07, ME-05 store side committed + in-progress claims/history; W5: PR-03, QA-01, QA-02
+  committed + untracked tests). Relaunched as round 2 on claudeAgent_kaustubh: W5 Opus medium, W2 and W4 Sonnet 5.5
+  medium (to spare that account's 5h limit). IDs in TASKS.json. If kaustubh runs out too, resume on Codex after 05:53.
+- 02:5x IST: **W2 runtime done** (kaustubh Sonnet): RT-01 a4c4a31, RT-02 6827360, RT-03 6510695, RT-04 8e41876, cost
+  telemetry 042c803, EV-01 1053f56; 761 pass / 2 fail (date-dependent dream test owned by W4; pre-existing 0.3 s timing
+  assert in test_provenance_review). Report `../hardening_2026-10-08/W2-runtime.md`. My review notes for integration:
+  (a) jarvis no longer warns when the *other* checkout is running on the same Option+Tab hotkey — add a warning (no kill);
+  (b) the new `instance stop` uses a data-dir lease the currently running old daemon doesn't hold → the user must stop
+  the running app with the OLD jarvis-exp before switching, or add a legacy-pidfile fallback; (c) strict config may
+  reject a value in the user's .env — validate the real .env (without printing values) before handing over.
+- ~03:00 IST: **W4 evolution done** (kaustubh Sonnet): ME-06 0e7122d, ME-11 463266b, dream watermark db5abc6, ME-09
+  partial 58f9435 (entity pages cleared/rebuilt on withdrawal; digest/profile prose verification not done), PR-08
+  3b5d3d8 + d940abf (`forget` wording honest; new `discrete erase ID --yes` purges claim text/quotes/links/FTS/embeddings/
+  history payloads/profile snapshots; source observations, screenshots, summaries and export git history NOT erased).
+  The dream-test change is test-only (two sittings straddle midnight before local dawn). Report `W4-evolution.md`.
+- **Integration (`feat/production-hardening`, worktree `../exp_discrete_hardening`):** merged W2 and W4 (one trivial
+  conflict in tests/test_bubble.py). 779 pass, 1 fail = pre-existing timing assert
+  (`test_dense_provenance_backfill_and_why_have_bounded_cost`, 0.3 s budget; slower under 5 concurrent agents).
+  Ruff clean. The user's real exp .env passes the new strict config (checked without printing values).
+  My follow-up dcef089 in jarvis: stop also kills a lease-less daemon started by an older jarvis (matched by this
+  checkout's exact binary path — verified it matches the running exp daemon, not other checkouts); start refuses while
+  such a daemon runs and warns (never kills) when another checkout holds Option+Tab.
+- ~03:20 IST: **W1 privacy done** (kaustubh Opus): PR-01 3960a40 (one gate right before every vision call: any frame
+  not already screened — cached before-frames, frames reloaded from disk — is OCR'd + checked; OCR failure withholds it),
+  PR-02 6a95339+cc596bb, PR-04 ea34f94+c32df71 (no full-display fallback; canonical hosts; unknown browser URL blocks
+  only when denied sites are set; Chrome/Edge/Brave incognito detected via AppleScript, Safari/Arc private windows NOT
+  detectable), PR-05 capture part 8809205, PR-06 a8cb9ca (doctor prints only OK/ISSUE; `--models` uses a synthetic
+  image), ME-01 abeaca8 (pHash only a hint; text must match the latest row; in-memory dedup cache removed), live-run
+  aabfe24: part of `dropped_failed` was a real bug (window-switch events lack the tab URL so the page's cached frame was
+  never matched) — fixed; counter renamed `missing_frame`; Screen-Recording warning now needs 3 distinct flat windows.
+  Dropped on purpose: Codex's "never merge rows whose numbers differ" (would stop most merges on pages with clocks).
+  Cost note: more OCR per capture. Report `W1-privacy.md`.
+- Integrated W1 (conflict in capture/screen.py: took W1's frame matching + W2's `max_pending`). My jarvis follow-up now
+  matches daemons by exact binary path from `ps` (W2's test bans pgrep/pkill); still finds the running exp daemon
+  77405 only. **Integration: 802 passed, 0 failed; ruff clean.** Waiting on W3 (formation) and W5 (retrieval).
+- ~02:45 IST: **W5 retrieval done** (kaustubh Opus): kept PR-03 cc896cd; fixed two regressions in Codex's QA-01 (continuation/
+  "world" questions and DISCRETE_SUPPORT_CHECK=0 lost all records → explicit "unchecked" state, e74cd13) and QA-02's
+  120-char caption cut (85% of real captions longer → 400, 8e787a4). Real user failures diagnosed on a /tmp copy of the
+  live exp db (no model calls), 5 causes fixed: "summarise all the messages…" routed to page-title listing (and without
+  "?" even to the edit path); "opened from" lookup matched only the full subject (missed 12/13 linked rows); verifier got
+  114 raw pages instead of 3 items; one failed verifier batch wiped every batch; empty list now falls back to recall.
+  QA-03 6861a5a, QA-04 603dafa (focus/URL/field/deny re-checked before each typed chunk; typed text recorded in finally),
+  R11 0a2453c, 60 s total Bubble deadline 5247ba5, writer context capped to 4,000 chars before cursor 4580a35,
+  completion-question routing 57f980c. Field/window checks covered by mocks only. Report `W5-retrieval.md`.
+- ~02:50 IST: **W3 formation done** (kaustubh Opus): ME-03 178e848+05a951f, ME-04 faaea55, ME-08 56fea35 (save a late
+  vector only if the row is still live with unchanged text), ME-10 9ed702d, ME-05 pipeline side 2325127 (contract: never
+  invalidate when the new evidence is older than the claim's latest support → mark both contested), PR-05 formation part
+  c998003, ME-09 partial 211417c (drop summary sentences asserting unverified actions / copied on-screen instructions),
+  C2-05 0bb9b29, trail verifier budget b9daa0c (same as claim verification + VERIFY_LM_EXTRA_TOKENS), ME-02 design note
+  `docs/visits_design.md` 943b3e8. Report `W3-formation.md`.
+- **All five merged into `feat/production-hardening`.** My review caught a regression in ME-03: requiring identical text
+  + a shared observation re-introduced duplicate actions (the Phase-7 "download page + Finder" case; W3 had rewritten that
+  test to expect 2). Fixed in 99cb3c8: similarity proposes, and a merge is refused only when BOTH wordings carry an
+  argument the other lacks (recipient, amount, file, URL); trade-off documented (an identical verbatim repeat within 3 h
+  reads as one action). **Suite: 930 passed, 0 failed; ruff clean.** (The provenance timing test fails only under heavy
+  machine load; passes alone.) Next: independent review of d8847a5..HEAD.
+- ~02:55 IST: independent report-only review r1 of d8847a5..HEAD launched (kaustubh Opus medium) → `../hardening_2026-10-08/REVIEW-r1.md`.
+- ~02:55 IST: review r1 on kaustubh failed immediately ("Claude API rate limit reached") — both subscriptions are now
+  rate-limited. Scheduled task "Relaunch hardening review r1 on Codex" fires 06:00 IST (after the 05:53 Codex reset);
+  brief saved in `../hardening_2026-10-08/REVIEW_BRIEF.md`. The scheduled run must delete itself (it is weekly).
+  **State:** `feat/production-hardening` = all five workers merged + orchestrator fixes, 930 tests pass; not yet reviewed;
+  the user's live app still runs the old code from `exp_discrete` — do NOT restart it on the new branch before review.
+
+### 2026-10-08 ~03:30 IST — review r1 done by the orchestrator; Discrete repo tagged (user asked not to wait)
+- Deleted the 06:00 scheduled relaunch (user's request) and reviewed d8847a5..HEAD myself. Report:
+  `../hardening_2026-10-08/REVIEW-r1.md`. Real-data upgrade check on a read-only `.backup` copy of the live exp db
+  (1,266 obs, 364 claims): no migration, `stats`/`check` clean, all invariants pass.
+- Fixed R1-01 in **133e01a**: RT-01 had made a capture that fails 3 ingest attempts fatal for the daemon; now it is
+  dropped and counted, and only `INGEST_MAX_DROPPED_IN_A_ROW` (5) consecutive drops exit. Suite **932 passed**, ruff clean.
+- Open decision R1-04: `erase` keeps the claim's embedding vector in its suppression row (embeddings are partly
+  invertible). Accepted trade-offs R1-05/06; live checks needed for R1-07 (Bubble focus/URL per chunk).
+- **Discrete repo (`COMP_001/Discrete`) now holds the whole history, with milestone tags:**
+  `2026-09-14-plans` (14f2b2f) → `2026-09-18-first-iteration` (6fa975a = origin/main) → `2026-10-01-second-iteration`
+  (ff5a268 = `main`, checked out) → `2026-10-06-exp-baseline` (41e2f9f) → `2026-10-07-memory-evolution` (d8847a5) →
+  `2026-10-08-production-hardening` (133e01a). Branches: `main`, `feat/memory-evolution`, `feat/production-hardening`,
+  `archive/2026-10-01-evening`, `archive/2026-10-06-worktree` (the redundant `exp-baseline-2026-10-06` branch was replaced
+  by its tag). T3's `refs/t3/checkpoints/*` are left alone (T3 uses them for restore).
+- To test the hardening branch live: `jarvis-exp stop` (old code; the new stop also catches it) → in
+  `exp_hindsight/exp_discrete`: `git switch feat/production-hardening` (or run from `../exp_discrete_hardening`) →
+  `jarvis-exp start`. Still pending: live Mac check of Bubble typing/incognito, paid re-eval (needs the user's OK).
