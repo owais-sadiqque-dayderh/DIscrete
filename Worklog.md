@@ -25,6 +25,97 @@ Phases 18–19).
 
 ---
 
+## ▶ HANDOFF v2 — READ THIS FIRST (updated 2026-10-07 ~09:00 IST; keep it current)
+
+**Who you are:** the next orchestrating agent. The user's standing rules, all still in force:
+- **Orchestrate; let Codex engineer.** Delegate implementation, tests and audits through T3 `delegate_task`
+  (`providerInstanceId: codex`, model `gpt-6.1-sol`, reasoningEffort `high`/`xhigh`; use `gpt-6-sol` xhigh for
+  independent reviews). You plan, review diffs, run evaluations, commit and log. Claude's limit is small; Codex's
+  is generous.
+- Work only in `COMP_001/exp_hindsight/exp_discrete`, branch **`feat/memory-evolution`** (`main` = baseline
+  `41e2f9f`, also checked out as `../exp_discrete_main`).
+  - Never touch `COMP_001/Discrete/` (the user's live copy).
+  - Don't merge, push or open PRs.
+  - Commit with explicit paths only (`git add <files>`, never `-A`): agents edit concurrently.
+- Use DIscrete's exact models for every comparison (`.env`): muse-spark-1.3-contributor (minimal reasoning),
+  gemini-3.8-flash verifier, gpt-4o-mini utility, text-embedding-3-small, cohere rerank-4-fast. Judge:
+  deepseek-v4-pro.
+- Log everything in this file as you go; the user spawns a fresh agent when one hits its limit.
+- At the end: brief the user on what changed and what didn't, with before/after numbers, and give setup notes to test
+  the branch. The user decides whether to merge.
+
+**State right now:**
+- Branch HEAD `ac435c2`, 58 commits ahead of main; suite ≈ 524 tests (run `.venv/bin/python -m pytest -q`).
+- Committed this session (Phase 7, details below):
+  - action dedup and agent credit;
+  - #18 chunk checkpoints;
+  - `bench/redraft.py`;
+  - episodes by task + `tasks` layer (m011);
+  - `discrete check` invariants/SLOs/health counters;
+  - the shared retry policy;
+  - review-r2 fixes 1–9;
+  - draft state as columns (m012);
+  - bench harness hardening;
+  - the AX markers verdict (off);
+  - the AX node walk (6× faster);
+  - caption reuse measured and NOT shipped.
+- **Uncommitted in the working tree (45 files):**
+  1. **Encryption at rest** (done, reviewed, waiting to commit): `discrete/encryption.py`,
+     `discrete/encryption_migration.py`, `docs/encryption.md`, `tests/test_encryption.py`,
+     `tools/measure_encryption_overhead.py`, plus hunks in store/base/db (connect)/index, capture
+     screen/enrich/retention, cli, export, dream, bubble/service, invariants, replay_session, compare_models,
+     bench/audit/*, bench/export_discrete_session.py, pyproject, config, .env.example, README.
+  2. **"Why" for any moment** (Codex still running, taskId
+     `node:delegated-task:command%3Amcp%3Aa31f5b55-8276-48a6-85cd-9a27a9d59a69%3Adelegate-task%3Aexp-discrete-why-any-1`):
+     `discrete/process/provenance.py`, `discrete/store/provenance.py`, `discrete/retrieval/why.py`,
+     `docs/attention_provenance.md`, `tests/test_provenance.py`, plus hunks in retrieval/*, bubble/prompts,
+     models, pipeline, app, store/__init__, db (m013?), cli, config, .env.example, README, tests (bubble, trails,
+     store).
+  - **To do:** when the why task reports, read its result with `task_status` and review its diff. Run the full suite
+    and `.venv/bin/ruff check discrete tests bench tools`. Then commit encryption and why together (two commits if
+    you can split by file; shared files go in the second), and log both.
+- **Muse (`meta/muse-spark-1.3-contributor`) is DOWN at OpenRouter** (Meta-side outage, confirmed by the user;
+  `service_overloaded`, Retry-After 60). A probe (Bash background task in the old session) was retrying every 2 min;
+  re-check with:
+  `curl -s https://openrouter.ai/api/v1/chat/completions -H "Authorization: Bearer $(grep ^CORE_LM_API_KEY .env|cut -d= -f2-)" -H 'Content-Type: application/json' -d '{"model":"meta/muse-spark-1.3-contributor","max_tokens":400,"reasoning":{"effort":"minimal"},"messages":[{"role":"user","content":"Reply with OK"}]}'`
+  Don't run paid evaluations while it is down: answers come back empty.
+- **No branch scores exist yet.** The only valid result is `bench/private/results/g46-base.json` (main code on
+  g46/base.db): **0.652 (30/46)**. Everything from the 07:20–08:05 attempt was invalidated by the outage.
+- OpenRouter credit: **$7.32** left ($45 total, $37.68 used). Disk: 12 GiB free.
+
+**Evaluation plan, to run once muse answers:**
+1. Commit everything. Then make a **fresh frozen worktree** at that commit:
+   `git worktree remove ../exp_discrete_eval --force` (it is stale, at `e57ca8f`), then
+   `git worktree add --detach ../exp_discrete_eval <commit>`, `cd ../exp_discrete_eval`,
+   `ln -s ../exp_discrete/.venv .venv`, `cp ../exp_discrete/.env .env`,
+   `rm -rf bench/private && ln -s ../../exp_discrete/bench/private bench/private`. Score only from there (agents
+   edit the main checkout).
+2. Re-create the v2 dbs with the final code (only drafting is paid for):
+   `rm -f bench/private/{g46,live1006}/branch-v2*.db`, then
+   `.venv/bin/python bench/redraft.py bench/private/g46/branch.db bench/private/g46/branch-v2.db` (same for live1006),
+   then `.venv/bin/python -m discrete.cli --db … process --recover --consolidate`.
+   - Caveat: `branch.db` was replayed at `45fe056`. Episode-boundary changes (#8) only show up in a **full replay**
+     (`tools/replay_session.py`, which also pays for captions). Do one full replay of live1006 later if credit allows.
+3. Adapt `bench/private/eval_parallel.sh` (it waits on old PIDs; remove those lines and the redraft lines). Run with
+   **≤4 concurrent jobs**, against `--code .` (the frozen worktree) for the branch and `../exp_discrete_main` for the
+   baseline.
+   - Scores: `g46-branch`, `g46-branch-v2`, `g46-branch-geminiverify`, `g46-base+branchretrieval`, `live-base`,
+     `live-branch`, `live-branch-v2`.
+   - Each branch db is dreamed on a `-dream.db` copy first. Delete the old `*-dream.db` from the failed attempt:
+     `g46/branch-dream.db` lost its profile to a 503.
+   - The harness now flags invalid runs (`"valid": false`); never report one as a score.
+4. Compare with `.venv/bin/python bench/run_g46.py --compare …`. Report per category, especially `why` (6 live
+   questions), `profile`, `unanswerable`. Noise is about 2 of 46 questions.
+5. Also run `discrete --db <db> check --expect bench/expect_g46.yaml` (and the live1006 one) on each db.
+
+**Open engineering ideas (not started):**
+- trails/why quality tuning after the scores;
+- Touch ID / key recovery for encryption;
+- pages as first-class objects (audit schema #2);
+- preference slots (#6);
+- table-aware drafting;
+- live-test the branch on the user's Mac (setup notes in HANDOFF v1 → still valid, plus `.[encryption]` if wanted).
+
 ## Workspace
 
 | What | Where |
@@ -536,7 +627,7 @@ This audit shows where each proposed feature starts from. Code paths are relativ
 
 ---
 
-## ▶ HANDOFF — read this first if you are picking up (written 2026-10-07 ~00:30 IST)
+## HANDOFF v1 (superseded by HANDOFF v2 at the top; kept for history, written 2026-10-07 ~00:30 IST)
 
 The previous agent (Claude Opus 5.5, user's main subscription) hit its time limit. The user wants another Claude to
 carry on, delegating sub-tasks to Codex/other Claude agents where useful (`delegate_task` via the T3 orchestrator;
