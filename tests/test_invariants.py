@@ -441,7 +441,6 @@ def test_ax_empty_walk_budget_reason(monkeypatch, reason):
 
 
 async def test_redaction_drop_counts_and_saves_no_frame(monkeypatch):
-    from collections import OrderedDict
     from types import SimpleNamespace
 
     from PIL import Image
@@ -455,7 +454,7 @@ async def test_redaction_drop_counts_and_saves_no_frame(monkeypatch):
     capture.stats = {"redacted": 0, "degraded": 0}
     capture.queue = asyncio.Queue()
     capture.session = SimpleNamespace(session_id="test")
-    capture._last_kept = OrderedDict()
+    capture.store = None
     capture._secrets = SecretMemory()
     capture._last_full_text = ""
     capture._last_full_capture = 0

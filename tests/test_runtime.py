@@ -145,14 +145,6 @@ async def test_useless_frame_leaves_every_index(store, fake):
     assert not is_new
 
 
-def test_frame_duplicate_memory_is_bounded(monkeypatch):
-    monkeypatch.setattr(T, "LAST_KEPT_MAX", 10)
-    obs = sc.ScreenObserver(queue=asyncio.Queue())
-    for i in range(50):
-        obs._remember(("app", f"w{i}", ""), "0" * 16)
-    assert len(obs._last_kept) == 10 and ("app", "w49", "") in obs._last_kept
-
-
 # ------------------------------------------------------ runtime wiring
 
 async def test_runtime_embeds_each_observation_once_after_its_caption(store, fake):

@@ -31,8 +31,8 @@ Grant permissions to the app you run it from (Terminal, iTerm, VS Code…) in
 Restart the terminal after granting, then check everything:
 
 ```bash
-.venv/bin/discrete doctor     # endpoints, permissions, a real test capture → "OK"
-.venv/bin/discrete doctor --models   # one real request per model (after changing models in .env)
+.venv/bin/discrete doctor     # endpoints, permissions, a local test capture (nothing shown or sent) → "OK"
+.venv/bin/discrete doctor --models   # one real request per model, synthetic content (after changing models in .env)
 .venv/bin/discrete run        # capture + processing + Bubble on Option+Tab (Ctrl-C to stop)
 ```
 

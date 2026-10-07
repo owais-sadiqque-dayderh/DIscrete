@@ -31,7 +31,7 @@
 #   jarvis unblock app|site X stop blocking it
 #   jarvis blocked            list what is blocked
 #
-#   jarvis setup              check permissions and models
+#   jarvis setup              check permissions and models (no screen content shown or sent)
 #   jarvis logs               follow the log
 
 set -euo pipefail
@@ -183,7 +183,7 @@ case "$cmd" in
   revert) [ $# -gt 0 ] || die "usage: jarvis revert EVENT"; dis revert "$1" ;;
   graph) dis graph "${1:-}" ;;
   export) dis export ;;
-  setup) dis doctor; dis doctor --models ;;
+  setup) dis doctor --models ;;  # one pass: permissions, then synthetic model checks
   logs) tail -f "$LOG" ;;
   help | -h | --help | *) sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
 esac

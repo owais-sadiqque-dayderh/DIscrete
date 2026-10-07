@@ -28,9 +28,11 @@ from ..llm import EXPECTED_ERRORS, TokenLimit, complete_json, image_part
 from ..models import ObservationDraft
 from ..perf import PERF, since_ms
 from ..store import Store
+from . import ocr
 from .frames import downscale
+from .privacy import denied
 from .prompts import CAPTURE_PROMPT
-from .redact import redact, redact_url
+from .redact import redact, redact_capture, redact_url
 
 log = logging.getLogger("discrete.capture.enrich")
 
@@ -44,6 +46,9 @@ def model_text(value: object) -> str:
         text = re.sub(r"https?://[^\s<>\"']+", lambda m: redact_url(m[0]).text, text)
     return text
 
+
+# Image.info key: the capture already screened this frame's own full text (in memory only).
+APPROVED = "_discrete_privacy_approved"
 
 # The caption's answer budget; a reasoning model's thinking needs CAPTION_LM_EXTRA_TOKENS on top.
 VLM_MAX_TOKENS = 500
@@ -61,6 +66,7 @@ class EnrichJob:
     # The screen text minus this app/site's navigation chrome, for the prompt (set by the
     # Enricher; the stored row keeps the full text).
     content_text: str | None = None
+    bundle_id: str = ""
 
 
 @dataclass
@@ -124,6 +130,10 @@ class Enricher:
                 break
             if r["id"] in self._active:
                 continue
+            if denied(r["app"], r["bundle_id"], r["url"], window_title=r["window_title"]):
+                # Denied since it was captured (policy is read at start): no call, finalized as is.
+                await self.store.enrichment_failed(r["id"])
+                continue
 
             def load(path=r["frame_path"]) -> list[Image.Image]:
                 if path and Path(path).exists():
@@ -144,7 +154,7 @@ class Enricher:
             if row is None or row["enrich_state"] != "pending" or r["id"] in self._active:
                 continue  # finished while the frame loaded
             job = EnrichJob(frames, r["app"], r["window_title"], r["url"], r["screen_text"],
-                            {k: r[k] for k in ("keys", "clicks", "scrolls", "clipboard")})
+                            {k: r[k] for k in ("keys", "clicks", "scrolls", "clipboard")}, bundle_id=r["bundle_id"])
             if self.submit(r["id"], job) is not None:
                 n += 1
         return n
@@ -164,7 +174,7 @@ class Enricher:
                 PERF.sample("enrich.wait", since_ms(t0), ref_id=oid)  # queued behind other vision calls
                 t_call = time.perf_counter()
                 job = await self._declutter(oid, job)
-                data = await self.vlm(job)
+                data = await self.vlm(job, oid=oid)
                 PERF.sample("enrich.vision", since_ms(t_call), n=len(job.frames), ref_id=oid)
             await self._apply(oid, job, data)
         except asyncio.CancelledError:
@@ -208,14 +218,18 @@ class Enricher:
             navigated_from=tk.truncate(model_text(data.get("navigated_from")), 200),
         )
 
-    async def vlm(self, job: EnrichJob) -> dict | None:
-        """The vision call with retries; no sleep after the final attempt."""
-        if not self.ep.configured:
+    async def vlm(self, job: EnrichJob, *, oid: int | None = None) -> dict | None:
+        """The vision call with retries; no sleep after the final attempt. None, with no
+        call, for a source the current policy denies or a row deleted meanwhile."""
+        if not self.ep.configured or denied(job.app, job.bundle_id, job.url, window_title=job.window_title):
             return None
+        job = await asyncio.to_thread(screen_frames, job)
         messages = vlm_messages(job)
         for attempt in range(T.CAPTURE_MAX_RETRIES):
             if attempt:
                 await asyncio.sleep(T.CAPTURE_RETRY_BASE_S * (2 ** (attempt - 1)))
+            if oid is not None and await self.store.get_observation(oid) is None:
+                return None  # forgotten while queued or between retries
             try:
                 data = await complete_json(self.ep, messages, max_tokens=VLM_MAX_TOKENS)
                 if isinstance(data, dict):
@@ -228,6 +242,31 @@ class Enricher:
                 log.warning("VLM attempt %s failed: %s", attempt + 1, exc)
             self.stats["vlm_attempts_failed"] += 1
         return None
+
+
+def screen_frames(job: EnrichJob) -> EnrichJob:
+    """Keep only frames whose own pixels pass the secret check, read just before egress.
+
+    The capture marks the frame it screened (APPROVED); any other frame (a cached
+    before frame, a frame reloaded from disk) is OCR'd here. A frame whose text
+    cannot be read is withheld, never treated as empty.
+    """
+    if not T.REDACT_SECRETS:
+        return job
+    if redact_capture(job.window_title, job.url, job.screen_text).drop_frame:
+        return dataclasses.replace(job, frames=[])
+    frames = []
+    for frame in job.frames:
+        if not frame.info.get(APPROVED):
+            try:
+                text = ocr.ocr_image(frame.info.get("_ocr_native", frame))
+            except Exception as exc:
+                log.debug("frame withheld, OCR failed: %s", exc)
+                continue
+            if redact_capture("", "", text, "ocr").drop_frame:
+                continue
+        frames.append(frame)
+    return dataclasses.replace(job, frames=frames)
 
 
 def vlm_messages(job: EnrichJob) -> list[dict]:
@@ -263,13 +302,16 @@ async def backfill_page_fields(store: Store, *, limit: int = 500) -> dict[str, i
             return [im.convert("RGB")]
 
     async def one(r) -> None:
+        if denied(r["app"], r["bundle_id"], r["url"], window_title=r["window_title"]):
+            out["failed"] += 1
+            return
         frames = await asyncio.to_thread(load, r["frame_path"])
         out["with_frame"] += bool(frames)
         job = EnrichJob(frames=frames, app=r["app"], window_title=r["window_title"], url=r["url"],
                         screen_text=r["screen_text"], prior_caption=r["caption"],
-                        counts={k: r[k] for k in ("keys", "clicks", "scrolls", "clipboard")})
+                        counts={k: r[k] for k in ("keys", "clicks", "scrolls", "clipboard")}, bundle_id=r["bundle_id"])
         async with enricher._sem:
-            data = await enricher.vlm(job)
+            data = await enricher.vlm(job, oid=r["id"])
         if data is None:
             out["failed"] += 1
             return
