@@ -18,17 +18,17 @@ from ..config import T
 from ..llm import EXPECTED_ERRORS, NotConfigured, embed
 from ..perf import PERF, since_ms
 from ..store import Store
+from ..store.index import embedding_text
 
 log = logging.getLogger("discrete.process.embed")
 
 
 def observation_text(row) -> str:
-    parts = (row["window_title"], row["page_title"], row["site"], row["caption"], row["screen_text"])
-    return tk.truncate("\n".join(p for p in parts if p), T.EMBED_TEXT_CHARS)
+    return embedding_text("observation", row)
 
 
 def claim_text(text: str, context: str) -> str:
-    return tk.truncate(f"{text}\n{context}".strip(), T.EMBED_TEXT_CHARS)
+    return embedding_text("claim", {"text": text, "context": context})
 
 
 async def text_for(store: Store, kind: str, rid: int) -> str | None:
@@ -47,12 +47,12 @@ async def text_for(store: Store, kind: str, rid: int) -> str | None:
         r = await store.get_episode(rid)
         if not r or r["status"] != "closed":
             return None
-        return tk.truncate(f"{r['title']}\n{r['summary']}".strip(), T.EMBED_TEXT_CHARS)
+        return embedding_text(kind, r)
     if kind == "entity":
         r = await store.get_entity(rid)
         if not r or r["merged_into"] is not None:
             return None
-        return tk.truncate(f"{r['name']}\n{r['summary']}".strip(), T.EMBED_TEXT_CHARS)
+        return embedding_text(kind, r)
     return None
 
 
@@ -74,7 +74,8 @@ async def embed_row(store: Store, kind: str, rid: int, text: str) -> np.ndarray 
     except (NotConfigured, *EXPECTED_ERRORS) as exc:
         log.debug("embed %s:%s deferred to the outbox: %s", kind, rid, exc)
         return None
-    await store.save_embeddings([(kind, rid, vec, th)])
+    if not await store.save_embeddings([(kind, rid, vec, th)], current=True):
+        return None  # the row changed or went away while the call was out
     return _unit(vec)
 
 
@@ -99,7 +100,8 @@ async def drain_once(store: Store, *, limit: int | None = None) -> int:
         log.warning("embed batch failed: %s", exc)
         await store.outbox_failed(refs)
         return 0
-    await store.save_embeddings([(k, r, v, tk.content_hash(t)) for (k, r), v, t in zip(refs, vectors, texts, strict=True)])
+    await store.save_embeddings([(k, r, v, tk.content_hash(t)) for (k, r), v, t in zip(refs, vectors, texts, strict=True)],
+                                current=True)
     return len(vectors)
 
 
