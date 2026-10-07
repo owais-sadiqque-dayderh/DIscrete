@@ -510,6 +510,20 @@ This audit shows where each proposed feature starts from. Code paths are relativ
   - Stays **off**.
   - Follow-ups for the node walk: Hacker News returns 4.7k AX chars vs 2.4k visible (19% duplicate lines); tables
     lose their structure.
+- **Encryption at rest done** (Codex; `docs/encryption.md`; to be committed with the why work, since they share
+  `cli.py` / `config.py` / `db.py`):
+  - **SQLCipher** (the `sqlcipher3` wheel works on py3.13 arm64) + **AES-256-GCM per frame**.
+    - Rejected: SEE needs a licensed build; column-level encryption breaks FTS or leaks index terms.
+  - Keys: a random 256-bit Keychain master key with separate db/frame subkeys, and `rotate-key`.
+  - Migration: `discrete encrypt` / `decrypt` / `--recover`, staged and verified, with atomic swap; tested with real
+    process crashes in each direction.
+  - Behaviour: FTS and vector search still work; a missing or wrong key gives a clear error; exports need
+    `--allow-plaintext`.
+  - Opt-in `.[encryption]` + `DISCRETE_ENCRYPT_AT_REST`. Plaintext stores, including the bench dbs, are unchanged.
+  - Overhead (3,000 synthetic rows): claim insert 267→630 µs, FTS search 155→199 µs, frame read 40→187 µs; vectors
+    within noise.
+  - Follow-ups: validation against the real Keychain / a locked session; Touch ID via a signed helper; a key
+    recovery story.
 - **Re-run plan when muse is healthy:** a new frozen worktree at the final commit (retry policy + review fixes).
   Re-create `branch-v2` with the fixed `redraft.py`, then score everything in parallel, with fewer concurrent jobs
   (≤4) to avoid adding load.
