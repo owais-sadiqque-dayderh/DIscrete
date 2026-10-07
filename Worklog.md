@@ -938,3 +938,9 @@ Sources: Cognition "agent memory repo" (cognition.com/agent-memory-repo), Hindsi
 - g46: branch ≈ main (the old "0.652 -> 0.756" gain was a judge artifact). live1006: branch +0.157, driven by why (3/6 -> 5/6) and profile/recall.
 - why answers (r2) trace true origins: Kaustubh DM -> Omar/Agently, Cognition X post -> Agent Memory Repo, EmbeddingGemma 2 post -> OpenRouter. Miss: Helium starts at the Google search; the model-free chain finds Theo's post (obs 76, media_mention), but the support verifier rejects that record because it is not told which term linked it. Codex task why-edge-evidence-r1: persist the edge term (m015), self-explanatory chain records, verifier guidance.
 - Round 2 still running (branch2-driver.log): live-branch-v2-r2, g46-branch-geminiverify, g46-base+branchretrieval. Rejudge each with `bench/run_g46.py --rejudge NAME`.
+
+### ~14:45 IST — round 2 rejudged; Helium fix (0b7cac2); round 3 running
+- live-branch-v2-r2-rj (e7a1150, redrafted) 0.667, why 4/6. g46-branch-geminiverify-rj 0.913. g46-base+branchretrieval-rj 0.933 (1 infra): branch retrieval on main's drafts is the best g46 number.
+- Latency p50 / cost per run: g46-base 15.9 s $0.10; g46-branch 16.0 s $0.12; live-base 19.1 s $0.068; live-branch-r2 15.3 s $0.075. Supported: live-base 0.80 -> live-branch-r2 0.93.
+- 0b7cac2: m015 `attention_provenance.term`; chain records explain the link (term, kind in plain words, caption, matched line); verifier prompt guidance for provenance. 651 tests. Live check on a live1006 copy: all 6 why answers trace true origins, incl. **Helium -> Theo's X post** (media_mention).
+- Round 3 (`../exp_discrete_eval` @ 0b7cac2, `bench/private/eval_r3.sh` -> results/r3-driver.log): copies *-dream.db -> *-r3.db, model-free provenance re-backfill, scores live-branch-r3, live-branch-v2-r3, g46-branch-v2-r3, then rejudges (-rj). Ends "ALL DONE".
