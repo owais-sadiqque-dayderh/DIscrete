@@ -51,14 +51,53 @@ async def _session():
     try:
         yield store
     finally:
-        await flush_usage(store)
-        await store.close()
+        try:
+            await flush_usage(store)
+        finally:
+            await store.close()
 
 
 async def cmd_run(args) -> int:
+    from .config import validate
+
+    validate()
     from .app import run
 
     await run(bubble=not args.no_bubble)
+    return 0
+
+
+async def cmd_instance(args) -> int:
+    from .aio import daemon_status, daemon_stop
+
+    try:
+        if args.action == "stop":
+            await asyncio.to_thread(daemon_stop, timeout=args.timeout)
+            return 0
+        status = await asyncio.to_thread(daemon_status)
+        _print(json.dumps(status))
+        return 0 if status["running"] else 1
+    except RuntimeError as exc:
+        _err(str(exc))
+        return 2
+
+
+async def cmd_runtime_paths(_args) -> int:
+    _print(json.dumps({"data_dir": str(data_dir().resolve()), "db": str(db_path().resolve())}))
+    return 0
+
+
+async def cmd_read_sql(args) -> int:
+    from .store.db import connect
+
+    def read():
+        conn = connect(str(db_path()), read_only=True)
+        try:
+            return conn.execute(args.sql).fetchall()
+        finally:
+            conn.close()
+    for row in await asyncio.to_thread(read):
+        _print("\t".join("" if value is None else str(value) for value in row))
     return 0
 
 
@@ -172,6 +211,9 @@ async def cmd_stats(_args) -> int:
     async with _session() as store:
         _print(await store_card(store))
         _print(await usage_table(store))
+        unknown = sum(fields.get("unknown_cost_calls", 0) for fields in (await store.usage_by_component()).values())
+        if unknown:
+            _print(f"Reported cost is a lower bound: {int(unknown)} calls have unknown prices")
     return 0
 
 
@@ -266,7 +308,8 @@ async def cmd_eval(args) -> int:
         _print(json.dumps({"metrics": result.metrics(), "health": result.health, "snapshot": result.snapshot,
                            "stale": result.stale}, indent=2))
         if result.stale:
-            _print("WARNING: case file snapshot differs from the store; scores are not comparable")
+            _print("INVALID: case file snapshot differs from the store; scores are not comparable")
+            return 2
         if args.save_baseline:
             save_baseline(result, path)
             _print("baseline saved")
@@ -274,9 +317,9 @@ async def cmd_eval(args) -> int:
         cmp = compare(result, path)
         if cmp["baseline"] is not None:
             _print(json.dumps({k: v for k, v in cmp.items() if k != "baseline"}, indent=2))
-            if cmp["regressions"] and not result.stale:
+            if cmp.get("incomparable") or cmp["regressions"]:
                 return 2
-    return 1 if not result.stale and any(not case.correct for case in result.cases) else 0
+    return 1 if any(not case.correct for case in result.cases) else 0
 
 
 async def cmd_bench(args) -> int:
@@ -698,6 +741,15 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--kind", choices=PAGE_KINDS, default="")
     pp.add_argument("--top", type=int, default=20)
     pp.set_defaults(func=cmd_pages)
+    ip = sub.add_parser("instance", help="owned daemon status or waited shutdown")
+    ip.add_argument("action", choices=("status", "stop"))
+    ip.add_argument("--timeout", type=float, default=30.0)
+    ip.set_defaults(func=cmd_instance)
+    rp = sub.add_parser("runtime-paths", help="resolved runtime paths")
+    rp.set_defaults(func=cmd_runtime_paths)
+    sql = sub.add_parser("read-sql", help="read-only encrypted-aware wrapper query")
+    sql.add_argument("sql")
+    sql.set_defaults(func=cmd_read_sql)
     return p
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -10,7 +11,7 @@ from .base import StoreBase
 from .index import _LIVE
 
 USAGE_PREFIX = "llm."
-_USAGE_FIELDS = ("calls", "prompt_tokens", "completion_tokens", "cost")
+_USAGE_FIELDS = ("calls", "prompt_tokens", "completion_tokens", "cost", "unknown_cost_calls")
 HEALTH_COUNTERS = (
     "draft_window_dropped", "draft_chunks", "draft_observations", "draft_text_truncated",
     "draft_skipped_unconfigured", "text_truncated.4000", "capture_screen_text_cap_hits", "capture_ax_depth_limit",
@@ -120,13 +121,21 @@ class HealthMixin(StoreBase):
         return await self.q("SELECT app, COUNT(*) n FROM observations WHERE origin='user' AND app!='' "
                             "GROUP BY app ORDER BY n DESC LIMIT ?", (limit,))
 
+    async def snapshot_manifest(self) -> dict:
+        def read():
+            self.rconn.execute("BEGIN")
+            try:
+                result = content_manifest(self.rconn)
+                self.rconn.execute("COMMIT")
+                return result
+            except BaseException:
+                self.rconn.execute("ROLLBACK")
+                raise
+        return {**await self._read(read), "config": config_manifest()}
+
     async def snapshot_id(self) -> str:
-        row = await self.q1(
-            "SELECT (SELECT COUNT(*) FROM observations), (SELECT COALESCE(MAX(id),0) FROM observations), "
-            "(SELECT COUNT(*) FROM claims WHERE status='live')"
-        )
-        n, max_id, claims = tuple(row or (0, 0, 0))
-        return f"obs{n}-max{max_id}-claims{claims}"
+        manifest = await self.snapshot_manifest()
+        return "sha256:" + hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
 
     # ------------------------------------------------------------------ usage
 
@@ -154,3 +163,45 @@ class HealthMixin(StoreBase):
             if comp and fld in _USAGE_FIELDS:
                 out.setdefault(comp, dict.fromkeys(_USAGE_FIELDS, 0))[fld] = value if fld == "cost" else int(value)
         return out
+
+
+def config_manifest() -> dict:
+    """Resolved nonsecret settings; arbitrary provider bodies and URLs are hashed."""
+    from ..config import T, all_endpoints
+
+    models = {}
+    for ep in all_endpoints():
+        models[ep.name] = {"model": ep.model, "extra_tokens": ep.extra_tokens,
+                           "reasoning_effort": ep.reasoning_effort, "temperature": ep.temperature,
+                           "no_temperature": ep.no_temperature, "json_mode": ep.json_mode,
+                           "timeout_s": ep.timeout_s,
+                           "extra_body_sha256": hashlib.sha256(ep.extra_body.encode()).hexdigest(),
+                           "base_url_sha256": hashlib.sha256((ep.base_url or "").encode()).hexdigest()}
+    return {"tunables": {name: value for name, value in vars(T).items() if name.isupper()}, "models": models}
+
+
+def content_manifest(conn) -> dict:
+    """Hash retrieval inputs from a consistent snapshot, including vectors and policy.
+
+    Measurements and query diagnostics are excluded so measuring a run does not
+    change its own identity. No source text or credential appears in the manifest.
+    """
+    digest = hashlib.sha256()
+    excluded = {"metrics", "perf_calls", "perf_samples", "gaps", "retrieval_misses"}
+    tables = conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+    for name, schema in tables:
+        if name in excluded or name.startswith("sqlite_") or "_fts" in name:
+            continue
+        quoted = '"' + name.replace('"', '""') + '"'
+        columns = [r[1] for r in conn.execute(f"PRAGMA table_info({quoted})")]
+        order = ','.join('"' + c.replace('"', '""') + '"' for c in columns)
+        digest.update(json.dumps([name, schema]).encode())
+        for row in conn.execute(f"SELECT * FROM {quoted} ORDER BY {order}"):
+            if name == "meta" and (str(row[0]).startswith(("telemetry:", "last_", "draft_coverage:"))):
+                continue
+            values = [value.hex() if isinstance(value, bytes) else value for value in row]
+            payload = json.dumps(values, ensure_ascii=False).encode()
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+    return {"format": 1, "schema_version": conn.execute("PRAGMA user_version").fetchone()[0],
+            "content_sha256": digest.hexdigest()}

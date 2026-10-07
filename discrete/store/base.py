@@ -85,11 +85,25 @@ class StoreBase:
         # Cancelling to_thread does not stop SQLite. Keep the connection lock
         # until the worker finishes, including a transaction already committing.
         task = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            await task
-            raise
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                cancelled = True
+                if task.done():
+                    break
+            except BaseException:
+                if cancelled:
+                    raise asyncio.CancelledError from None
+                raise
+        if cancelled:
+            # Retrieve a worker exception too, without releasing ownership early.
+            if not task.cancelled():
+                task.exception()
+            raise asyncio.CancelledError
+        return result
 
     @contextmanager
     def _tx(self):
@@ -99,11 +113,13 @@ class StoreBase:
             from .pages import sync_pages
 
             sync_pages(self.conn)
+            self.conn.execute("COMMIT")
         except BaseException:
-            self.conn.execute("ROLLBACK")
-            self._dirty_kinds.clear()
+            try:
+                self.conn.execute("ROLLBACK")
+            finally:
+                self._dirty_kinds.clear()
             raise
-        self.conn.execute("COMMIT")
         self._publish_vectors()
 
     def _publish_vectors(self) -> None:

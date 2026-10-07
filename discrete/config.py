@@ -14,6 +14,7 @@ is a `.env` change, not a code change. See `.env.example`.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,22 +45,62 @@ def first(*names: str) -> str | None:
 V = TypeVar("V", bool, int, float, str, list[str])
 
 
+class ConfigError(ValueError):
+    """A malformed setting, named so it can be fixed."""
+
+
+def _boolean(raw: str) -> bool:
+    value = raw.lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError("expected true/false, yes/no, on/off or 1/0")
+
+
+_ZERO_ALLOWED = {
+    "FRAME_PHASH_MAX_DIST", "AX_TEXT_MIN_CHARS", "LLM_PROVIDER_RETRIES", "CHROME_SHARE",
+    "CONSOLIDATION_INTERVAL_MIN", "DREAM_INTERVAL_MIN", "FRAME_TTL_DAYS", "SCREEN_TEXT_TTL_DAYS",
+    "PERF_TTL_DAYS", "CONFLICT_MIN_GAP_S", "EPISODE_MERGE_GAP_S", "HEARTBEAT_MIN_GAP_S",
+    "DWELL_LAST_S", "BUBBLE_CONTEXT_CHARS", "DREAM_MIN_NEW_EPISODES",
+}
+_UNIT_RANGE = {
+    "HEARTBEAT_TEXT_CHANGE", "DEDUP_JACCARD_THRESHOLD", "EPISODE_SHIFT_SIM", "EPISODE_MERGE_SIM",
+    "TASK_MATCH_SIM", "TASK_ENTITY_OVERLAP", "CHROME_SHARE", "ACTION_DEDUP_JACCARD",
+    "EVIDENCE_MIN_OVERLAP", "DREAM_DUPLICATE_SIM", "CONFLICT_SIM", "CONSOLIDATE_SIM",
+    "SUPPRESS_SIM", "SUPPRESS_JACCARD", "ENTITY_EMBED_SIM", "DENSE_HIT_THRESHOLD",
+    "ECHO_THRESHOLD", "COVERAGE_FLOOR", "COVERAGE_STRONG", "MMR_LAMBDA",
+    "ENTITY_PROP_OVERLAP_THRESHOLD", "RERANK_STRONG", "WHY_CHAIN_MIN_CONFIDENCE",
+    "EVAL_REGRESSION_ALPHA", "EVAL_TOLERANCE",
+}
+
+
 def _typed(name: str, default: V) -> V:
-    """`DISCRETE_<name>` parsed to the type of `default`; the default if unset or invalid."""
+    """Parse a tunable strictly; invalid values stop startup instead of changing policy."""
     raw = env(f"DISCRETE_{name}")
     if raw is None:
         return default
     try:
         if isinstance(default, bool):
-            return cast(V, raw.lower() in ("1", "true", "yes", "on"))
-        if isinstance(default, int):
-            return cast(V, int(raw))
-        if isinstance(default, float):
-            return cast(V, float(raw))
+            return cast(V, _boolean(raw))
+        if isinstance(default, int | float):
+            value = int(raw) if isinstance(default, int) else float(raw)
+            if not math.isfinite(value):
+                raise ValueError("must be finite")
+            if name in _UNIT_RANGE:
+                if not 0 <= value <= 1:
+                    raise ValueError("must be between 0 and 1")
+            elif value < 0 or value == 0 and name not in _ZERO_ALLOWED:
+                raise ValueError("must be nonnegative" if name in _ZERO_ALLOWED else "must be positive")
+            if name in {"FRAME_JPEG_QUALITY", "FUZZY_AUTO", "FUZZY_ADJUDICATE"} and value > 100:
+                raise ValueError("must be at most 100")
+            if name == "FRAME_PHASH_MAX_DIST" and value > 64:
+                raise ValueError("must be at most 64")
+            return cast(V, value)
         if isinstance(default, list):
             return cast(V, [p.strip() for p in raw.split(",") if p.strip()])
-    except ValueError:
-        return default
+    except ValueError as exc:
+        raise ConfigError(f"DISCRETE_{name}: {exc}") from None
     return cast(V, raw)
 
 
@@ -131,10 +172,6 @@ _TAIL_KEY = ("CORE_LM_API_KEY", "OPENAI_API_KEY")
 _TAIL_MODEL = ("CORE_LM_MODEL_NAME",)
 
 
-class ConfigError(ValueError):
-    """A malformed setting in .env, named so it can be fixed."""
-
-
 def _setting(prefixes: list[str], field: str) -> tuple[str, str] | None:
     """(env name, value) of the first `<prefix>_<field>` that is set."""
     for p in prefixes:
@@ -155,6 +192,8 @@ def _ep(name: str, *prefixes: str, model_fallback: bool = True) -> Endpoint:
     try:
         if got := _setting(chain, "EXTRA_TOKENS"):
             opts["extra_tokens"] = int(got[1])
+            if opts["extra_tokens"] < 0:
+                raise ValueError("must be nonnegative")
         if got := _setting(chain, "REASONING_EFFORT"):
             if got[1].lower() not in ("none", "default"):
                 opts["reasoning_effort"] = got[1].lower()
@@ -163,10 +202,14 @@ def _ep(name: str, *prefixes: str, model_fallback: bool = True) -> Endpoint:
                 opts["no_temperature"] = True
             else:
                 opts["temperature"] = float(got[1])
+                if not math.isfinite(opts["temperature"]) or not 0 <= opts["temperature"] <= 2:
+                    raise ValueError("must be finite and between 0 and 2")
         if got := _setting(chain, "JSON_MODE"):
-            opts["json_mode"] = got[1].lower() in ("1", "true", "yes", "on")
+            opts["json_mode"] = _boolean(got[1])
         if got := _setting(chain, "TIMEOUT_S"):
             opts["timeout_s"] = float(got[1])
+            if not math.isfinite(opts["timeout_s"]) or opts["timeout_s"] <= 0:
+                raise ValueError("must be finite and positive")
         if got := _setting(chain, "EXTRA_BODY"):
             if not isinstance(json.loads(got[1]), dict):
                 raise ValueError("must be a JSON object")
@@ -332,6 +375,8 @@ class T:
     LLM_INTERACTIVE_RETRY_MAX_S = _typed("LLM_INTERACTIVE_RETRY_MAX_S", 8.0)
     # Vision calls in flight at once; captures never wait for them (capture/enrich.py).
     ENRICH_CONCURRENCY = _typed("ENRICH_CONCURRENCY", 2)
+    CAPTURE_QUEUE_MAX = _typed("CAPTURE_QUEUE_MAX", 16)
+    CAPTURE_MAX_PENDING = _typed("CAPTURE_MAX_PENDING", 8)
     # Rows holding a caption task (and their images) at once; the rest wait on disk.
     ENRICH_MAX_PENDING = _typed("ENRICH_MAX_PENDING", 8)
     # Windows remembered for the frame-duplicate check.
@@ -528,3 +573,15 @@ class T:
     BUBBLE_FOCUS_POLL_S = _typed("BUBBLE_FOCUS_POLL_S", 0.15)
     BUBBLE_OVERLAY = _typed("BUBBLE_OVERLAY", True)
     BUBBLE_CANCEL_ON_TYPE = _typed("BUBBLE_CANCEL_ON_TYPE", True)
+
+
+def validate() -> None:
+    """Validate coupled limits and every endpoint before starting capture."""
+    for lower, upper in (("ENRICH_CONCURRENCY", "ENRICH_MAX_PENDING"),
+                         ("HEARTBEAT_MIN_GAP_S", "HEARTBEAT_MAX_GAP_S"),
+                         ("DRAFT_MAX_EVENTS", "DRAFT_MAX_EVENTS_CAP"),
+                         ("COVERAGE_FLOOR", "COVERAGE_STRONG")):
+        if getattr(T, lower) > getattr(T, upper):
+            raise ConfigError(f"DISCRETE_{lower} must be <= DISCRETE_{upper}")
+    encrypt_at_rest()
+    all_endpoints()

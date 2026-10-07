@@ -21,7 +21,7 @@ import logging
 import signal
 import time
 
-from .aio import spawn
+from .aio import daemon_lease, spawn
 from .capture.enrich import Capture, Enricher
 from .capture.events import EventTriggers
 from .capture.retention import run_retention
@@ -45,6 +45,17 @@ from .timeutil import now
 log = logging.getLogger("discrete.app")
 
 
+class CaptureQueue(asyncio.Queue):
+    async def put(self, item) -> None:
+        # Overload drops the new capture explicitly rather than retaining waiting
+        # producers and their decoded frames outside the bounded queue.
+        try:
+            self.put_nowait(item)
+        except asyncio.QueueFull:
+            PERF.count("health.capture_queue_dropped")
+            raise
+
+
 class Runtime:
     def __init__(self, store: Store, *, bubble: bool = True):
         self.store = store
@@ -53,7 +64,7 @@ class Runtime:
             from .bubble.service import BubbleService  # AppKit/Quartz: only when Bubble is on
 
             self.bubble = BubbleService(store)
-        self.queue: asyncio.Queue[Capture] = asyncio.Queue()
+        self.queue: asyncio.Queue[Capture] = CaptureQueue(maxsize=T.CAPTURE_QUEUE_MAX)
         # Set when a row is stored or a caption finishes: segmentation may advance.
         self._wake = asyncio.Event()
         self.session = SessionTracker()
@@ -89,7 +100,29 @@ class Runtime:
         ]
         log.info("discrete runtime started")
 
+    async def wait(self) -> None:
+        """Any essential loop ending is fatal; the caller shuts down and exits loudly."""
+        tasks = list(self._tasks)
+        tasks += [t for t in (self.observer._frame_task, self.events._task) if t is not None]
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        task = next(iter(done))
+        if not task.cancelled() and task.exception() is not None:
+            raise RuntimeError(f"Essential worker {task.get_name()} failed") from task.exception()
+        raise RuntimeError(f"Essential worker {task.get_name()} stopped unexpectedly")
+
     async def stop(self) -> None:
+        try:
+            await self._stop()
+        finally:
+            for task in (*self._tasks, *self._bg):
+                task.cancel()
+            await asyncio.gather(*self._tasks, *self._bg, return_exceptions=True)
+            try:
+                await self.enricher.cancel_all()
+            finally:
+                await self.store.close()
+
+    async def _stop(self) -> None:
         if self.bubble:
             await self.bubble.stop()
         await self.events.stop()
@@ -107,7 +140,7 @@ class Runtime:
                 await self._ingest(self.queue.get_nowait())
             except Exception:
                 log.exception("final ingest failed")
-        for row in await self.store.unsegmented_observations(limit=100_000):
+        for row in await self.store.unsegmented_observations(limit=T.CAPTURE_QUEUE_MAX):
             if row["enrich_state"] == "pending":
                 break
             try:
@@ -125,13 +158,13 @@ class Runtime:
         await flush_usage(self.store)
         log.info("capture stats: %s; captions: %s", self.observer.stats, self.enricher.stats)
         log.info("open work is drafted on the next `discrete run` or `discrete process`")
-        await self.store.close()
 
     def _on_idle(self, away: bool) -> None:
         self.observer.away = away
         self.session.new_session()
         if away:
-            spawn(self._close_episode(), name="discrete-idle-close", owner=self._bg)
+            if not self._bg:
+                spawn(self._close_episode(), name="discrete-idle-close", owner=self._bg)
 
     async def _close_episode(self) -> None:
         async with self._ep_lock:
@@ -146,14 +179,31 @@ class Runtime:
             self.enricher.submit(oid, cap.job)  # over the pool limit: resumed from its saved frame
         self._wake.set()
 
+    async def _report_error(self, name: str) -> None:
+        try:
+            await self.store.bump_metric(name)
+        except Exception:
+            PERF.count(f"health.{name}")
+            log.warning("could not persist runtime error counter %s", name)
+
     async def _ingest_loop(self) -> None:
         while True:
             cap = await self.queue.get()
             try:
-                await self._ingest(cap)
-            except Exception:
-                log.exception("ingest failed")
-                await self.store.bump_metric("ingest_errors")
+                # Keep ownership of the dequeued capture across transient failures.
+                # Persistent failures exit through essential-worker supervision.
+                for attempt in range(3):
+                    try:
+                        await self._ingest(cap)
+                        break
+                    except Exception:
+                        log.exception("ingest failed")
+                        await self._report_error("ingest_errors")
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(0.5 * 2 ** attempt)
+            finally:
+                self.queue.task_done()
 
     async def _segment_loop(self) -> None:
         while True:
@@ -170,7 +220,7 @@ class Runtime:
                     await self.enricher.fill_pending()  # the oldest row waits; keep the pool busy
             except Exception:
                 log.exception("segmentation failed")
-                await self.store.bump_metric("segment_errors")
+                await self._report_error("segment_errors")
                 if rows:
                     # A row that keeps failing is left unassigned for this run instead of
                     # blocking every later capture.
@@ -212,7 +262,7 @@ class Runtime:
                              res.reinforced, res.invalidated, res.rejected)
             except Exception:
                 log.exception("draft loop failed")
-                await self.store.bump_metric("draft_loop_errors")
+                await self._report_error("draft_loop_errors")
             await asyncio.sleep(5.0)
 
     async def _maint_loop(self) -> None:
@@ -260,7 +310,7 @@ class Runtime:
                     await step()
                 except Exception:
                     log.exception("maintenance step %s failed", step.__name__)
-                    await self.store.bump_metric(f"maint_errors_{step.__name__}")
+                    await self._report_error(f"maint_errors_{step.__name__}")
             try:
                 self._flush_counters()
                 await flush_usage(self.store)
@@ -278,6 +328,11 @@ class Runtime:
 
 
 async def run(*, bubble: bool = True) -> None:
+    with daemon_lease():
+        await _run(bubble=bubble)
+
+
+async def _run(*, bubble: bool = True) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     PERF.source = "live"
@@ -289,6 +344,15 @@ async def run(*, bubble: bool = True) -> None:
     asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop.set)
     try:
         await rt.start()
-        await stop.wait()
+        waiter = asyncio.create_task(rt.wait(), name="discrete-supervisor")
+        stopper = asyncio.create_task(stop.wait())
+        try:
+            done, _ = await asyncio.wait((waiter, stopper), return_when=asyncio.FIRST_COMPLETED)
+            if waiter in done:
+                await waiter
+        finally:
+            waiter.cancel()
+            stopper.cancel()
+            await asyncio.gather(waiter, stopper, return_exceptions=True)
     finally:
         await rt.stop()

@@ -581,21 +581,25 @@ def _statements(script: str) -> list[str]:
 
 def migrate(conn: sqlite3.Connection) -> int:
     """Apply pending migrations; returns how many ran."""
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
     ran = 0
-    for n, step in enumerate(MIGRATIONS[version:], start=version + 1):
-        conn.execute("BEGIN IMMEDIATE")
-        try:
+    # The version decision and all migrations share one write lock: another opener
+    # cannot decide from a stale version while this connection upgrades the schema.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise ValueError(f"Database schema {version} is newer than supported schema {SCHEMA_VERSION}")
+        for n, step in enumerate(MIGRATIONS[version:], start=version + 1):
             step(conn)
             conn.execute(f"PRAGMA user_version = {n}")
             conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
                          "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(n),))
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
+            log.info("applied migration %d (%s)", n, step.__name__)
+            ran += 1
         conn.execute("COMMIT")
-        log.info("applied migration %d (%s)", n, step.__name__)
-        ran += 1
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
     return ran
 
 
@@ -605,6 +609,9 @@ def connect(path: str, *, read_only: bool = False) -> sqlite3.Connection:
     conn = open_database(path, read_only=read_only)
     try:
         if read_only:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version > SCHEMA_VERSION:
+                raise ValueError(f"Database schema {version} is newer than supported schema {SCHEMA_VERSION}")
             # A second connection for retrieval: WAL lets it read while the writer writes.
             conn.execute("PRAGMA query_only=ON")
             return conn
@@ -616,3 +623,33 @@ def connect(path: str, *, read_only: bool = False) -> sqlite3.Connection:
     except BaseException:
         conn.close()
         raise
+
+
+def clone_database(source, target) -> None:
+    """Consistent benchmark copy, preserving encryption and its key-id sidecar."""
+    import json
+    from dataclasses import asdict
+    from pathlib import Path
+
+    from ..encryption import atomic_write, open_database, raw_database, state_path
+
+    target = Path(target).expanduser().resolve()
+    if target.exists() or state_path(target).exists():
+        raise FileExistsError(f"Clone destination already exists: {target}")
+    src = open_database(str(source), read_only=True)
+    try:
+        state = getattr(src, "_discrete_encryption_state", None)
+        dst = raw_database(target, state.key_id if state else None)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+        if state:
+            atomic_write(state_path(target), json.dumps(asdict(state)).encode())
+        target.chmod(0o600)
+    except BaseException:
+        target.unlink(missing_ok=True)
+        state_path(target).unlink(missing_ok=True)
+        raise
+    finally:
+        src.close()

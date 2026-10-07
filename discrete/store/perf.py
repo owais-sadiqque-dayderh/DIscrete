@@ -13,30 +13,48 @@ from .health import HEALTH_EVENT_PREFIX
 
 
 def _window(since: float | None, until: float | None, sources: Sequence[str] | None) -> tuple[str, list]:
-    where, args = ["at >= ?", "at < ?"], [since or 0.0, until or float("inf")]
-    if sources:
+    where, args = ["at >= ?", "at < ?"], [0.0 if since is None else since, float("inf") if until is None else until]
+    if sources == []:
+        where.append("0")
+    elif sources:
         where.append(f"src IN ({','.join('?' * len(sources))})")
         args += list(sources)
     return " AND ".join(where), args
 
 
 class PerfMixin(StoreBase):
-    async def record_perf(self, calls: Sequence[Call], samples: Sequence[Sample]) -> None:
-        def _run():
-            with self._tx() as conn:
-                conn.executemany(
-                    "INSERT INTO perf_calls(at, src, component, model, status, ms, first_ms, prompt_tokens, "
-                    "completion_tokens, cost) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                    [(c.at, c.source, c.component, c.model, c.status, c.ms, c.first_ms, c.prompt_tokens,
-                      c.completion_tokens, c.cost) for c in calls])
-                conn.executemany(
-                    "INSERT INTO perf_samples(at, src, stage, ms, n, ref_id) VALUES (?,?,?,?,?,?)",
-                    [(s.at, s.source, s.stage, s.ms, s.n, s.ref_id) for s in samples])
-                for sample in samples:
-                    if sample.ms is None and sample.stage.startswith(HEALTH_EVENT_PREFIX) and sample.n:
-                        self._metric(conn, sample.stage.removeprefix(HEALTH_EVENT_PREFIX), sample.n)
+    def _record_perf(self, conn, calls, samples) -> None:
+        conn.executemany(
+            "INSERT INTO perf_calls(at, src, component, model, status, ms, first_ms, prompt_tokens, "
+            "completion_tokens, cost) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [(c.at, c.source, c.component, c.model, c.status, c.ms, c.first_ms, c.prompt_tokens,
+              c.completion_tokens, c.cost) for c in calls])
+        conn.executemany(
+            "INSERT INTO perf_samples(at, src, stage, ms, n, ref_id) VALUES (?,?,?,?,?,?)",
+            [(s.at, s.source, s.stage, s.ms, s.n, s.ref_id) for s in samples])
+        for sample in samples:
+            if sample.ms is None and sample.stage.startswith(HEALTH_EVENT_PREFIX) and sample.n:
+                self._metric(conn, sample.stage.removeprefix(HEALTH_EVENT_PREFIX), sample.n)
 
-        await self._call(_run)
+    async def record_perf(self, calls: Sequence[Call], samples: Sequence[Sample]) -> None:
+        def run():
+            with self._tx() as conn:
+                self._record_perf(conn, calls, samples)
+        await self._call(run)
+
+    async def record_telemetry(self, batch_id: str, usage: dict, calls: Sequence[Call], samples: Sequence[Sample]) -> None:
+        def run():
+            with self._tx() as conn:
+                inserted = conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES (?,?)",
+                                        (f"telemetry:{batch_id}", str(now()))).rowcount
+                if not inserted:
+                    return
+                for component, fields in usage.items():
+                    for field, delta in fields.items():
+                        if delta:
+                            self._metric(conn, f"llm.{component}.{field}", float(delta))
+                self._record_perf(conn, calls, samples)
+        await self._call(run)
 
     async def perf_calls(self, since: float | None = None, until: float | None = None,
                          sources: Sequence[str] | None = None) -> list[sqlite3.Row]:
@@ -61,6 +79,7 @@ class PerfMixin(StoreBase):
             with self._tx() as conn:
                 a = conn.execute("DELETE FROM perf_calls WHERE at < ?", (cutoff,)).rowcount
                 b = conn.execute("DELETE FROM perf_samples WHERE at < ?", (cutoff,)).rowcount
+                conn.execute("DELETE FROM meta WHERE key LIKE 'telemetry:%' AND CAST(value AS REAL) < ?", (cutoff,))
             return a + b
 
         return await self._call(_run)

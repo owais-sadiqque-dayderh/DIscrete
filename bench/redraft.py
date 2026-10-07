@@ -21,11 +21,13 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 from discrete import textkit as tk
+from discrete.encryption import open_database
 from discrete.process.entities import structural_candidates
-from discrete.store.db import migrate
+from discrete.store.db import clone_database, migrate
 
 #: Tables cleared except for rows required by preserved user directives.
 DERIVED = (
@@ -88,21 +90,21 @@ def _rebuild_candidates(conn: sqlite3.Connection) -> None:
 def redraft(src: Path, out: Path) -> dict[str, int]:
     if out.exists():
         raise SystemExit(f"{out} exists; remove it first")
-    with sqlite3.connect(src) as a:
+    with closing(open_database(str(src), read_only=True)) as a:
         tables = {r[0] for r in a.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if 'memory_events' in tables:
             unsupported = a.execute("SELECT id,op FROM memory_events WHERE actor='user' "
                                     "AND (op NOT IN ('add','forget','correct') OR undone_by IS NOT NULL)").fetchall()
             if unsupported:
-                raise SystemExit(f"cannot redraft user directives with undo/unsupported operations: {unsupported}")
-        with sqlite3.connect(out) as b:
-            a.backup(b)
-    conn = sqlite3.connect(out)
+                raise SystemExit(f"cannot redraft user directives with undo/unsupported operations: {[tuple(r) for r in unsupported]}")
+    clone_database(src, out)
+    conn = open_database(str(out))
     # Upgrade only the copy before using the episode state columns.
     migrate(conn)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     counts: dict[str, int] = {}
     with conn:
+        conn.execute("BEGIN")
         _preserve_directives(conn, tables)
         retained = {
             'claims': 'id IN (SELECT id FROM kept_claims)',
@@ -140,6 +142,7 @@ def redraft(src: Path, out: Path) -> dict[str, int]:
     for fts in ("claims_fts", "episodes_fts"):
         if fts in tables:
             with conn:
+                conn.execute("BEGIN")
                 conn.execute(f"INSERT INTO {fts}({fts}) VALUES ('rebuild')")
     conn.execute("VACUUM")
     conn.close()
