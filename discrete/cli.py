@@ -130,38 +130,42 @@ async def cmd_overlay_demo(args) -> int:
 
 
 async def cmd_doctor(args) -> int:
+    """Endpoints and permissions. Real screen content never leaves this function: the
+    front window is grabbed only to see that pixels arrive, and nothing of it (app,
+    title, text, image) is printed or sent. `--models` uses synthetic fixtures."""
     from .capture import accessibility as ax
     from .capture.frames import FrameGrabber, is_blank
-    from .capture.ocr import ocr_image
+    from .capture.privacy import denied
 
     for ep in all_endpoints():
         _print(ep.describe())
     _print(f"db: {db_path()}")
     ok = True
     ctx = ax.window_context()
-    _print(f"front window: app={ctx.app!r} title={ctx.window_title!r} bounds={ctx.bounds}")
-    if not ctx.app:
+    if not (ctx.app or ctx.bundle_id):
         ok = False
         _print("ISSUE: no front window detected")
-    g = FrameGrabber()
-    img = g.grab(ctx.bounds, max_width=1600, window_id=ctx.window_id)
-    g.close()
-    if img is None or is_blank(img):
-        ok = False
-        _print("ISSUE: captured frame is blank — grant Screen Recording to this terminal/app")
+    elif denied(ctx.app, ctx.bundle_id, ctx.url, window_title=ctx.window_title, window_id=ctx.window_id):
+        _print("screen capture: not checked (the front window is excluded); rerun from another window")
     else:
-        _print(f"screen capture: OK ({img.width}x{img.height}); OCR sample: {tk.truncate(ocr_image(img), 80)!r}")
+        g = FrameGrabber()
+        img = g.grab(ctx.bounds, max_width=400, window_id=ctx.window_id)
+        g.close()
+        # The OS preflight is unreliable for terminal-launched Python; a frame is the real test.
+        if img is None or is_blank(img):
+            ok = False
+            _print("ISSUE: captured frame is blank — grant Screen Recording to this terminal/app "
+                   "(or the front window is a single flat colour)")
+        else:
+            _print("screen capture: OK")
     ax_ok = ax.accessibility_granted()
     _print(f"accessibility: {'OK (AX text walk active)' if ax_ok else 'NOT granted — OCR-only screen text'}")
-    txt = ""
-    if ax_ok and ctx.pid:
-        txt = ax.read_screen_text(ctx.pid, max_nodes=2000, timeout_ms=250, max_chars=4000)
-        _print(f"AX text sample: {txt[:80]!r}")
     if args.models:
         from .evaluation.model_check import check_models, render
 
-        _print("\nmodels (one real request each, same prompts, limits and .env settings as the pipeline):")
-        results = await check_models(img, app=ctx.app, title=ctx.window_title, screen_text=txt)
+        _print("\nmodels (one real request each with synthetic content, same prompts, limits and .env settings "
+               "as the pipeline):")
+        results = await check_models()
         _print(render(results))
         ok = ok and all(r.ok for r in results)
     _print("OK" if ok else "issues found")
