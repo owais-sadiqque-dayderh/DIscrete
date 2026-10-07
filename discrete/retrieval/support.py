@@ -113,8 +113,8 @@ async def verify_support(result: RetrievalResult) -> None:
     timeout = T.SUPPORT_TIMEOUT_WHY_S if why else T.SUPPORT_TIMEOUT_S
     try:
         # Bounded request size even for a long page list; the batches run together.
-        found = await asyncio.wait_for(asyncio.gather(*(_supported(result, r) for r in records)),
-                                       timeout=timeout)
+        found = await asyncio.wait_for(asyncio.gather(*(_supported(result, r) for r in records),
+                                                      return_exceptions=True), timeout=timeout)
     except TimeoutError:
         log.warning("retrieval support verification timed out; results left unverified")
         PERF.count("retrieve.support_timeout")
@@ -132,23 +132,30 @@ async def verify_support(result: RetrievalResult) -> None:
         result.hits = [h for h in result.hits if not h.via.startswith("attention provenance")]
         result.why_chain = None
         return
-    except (*EXPECTED_ERRORS, ValueError) as exc:
-        log.warning("retrieval support verification failed: %s", exc)
-        for h in checked:
-            h.verification = "unverified"
+    for exc in found:
+        if isinstance(exc, BaseException) and not isinstance(exc, (*EXPECTED_ERRORS, ValueError)):
+            raise exc
+    if all(isinstance(ok, BaseException) for ok in found):
+        log.warning("retrieval support verification failed: %s", type(found[0]).__name__)
         result.hits, result.digest = [], ""
         result.why_chain = None
         return
     for h in checked:
         h.verification = "rejected"
     kept = []
+    # A failed batch fails closed for its own records only (left "unverified").
     for batch, ok in zip(batches, found, strict=True):
+        if isinstance(ok, BaseException):
+            log.warning("retrieval support verification failed for one batch: %s", type(ok).__name__)
+            for h in batch:
+                h.verification = "unverified"
+            continue
         for i in sorted(ok):
             if i < len(batch):
                 batch[i].verification = "verified"
                 batch[i].strong = True
                 kept.append(batch[i])
-    if result.digest and len(batches[0]) not in found[0]:
+    if result.digest and (isinstance(found[0], BaseException) or len(batches[0]) not in found[0]):
         result.digest = ""
     if result.digest:
         result.digest_verification = "verified"

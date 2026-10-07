@@ -69,3 +69,19 @@ async def test_disabled_check_is_unchecked_not_empty(fake, monkeypatch):
     await verify_support(result)
     assert evaluate(result).mode == 'grounded'
     assert result.digest_verification == 'unchecked'
+
+
+async def test_one_failed_batch_keeps_the_others(fake, monkeypatch):
+    from discrete.retrieval import support
+
+    async def flaky(result, records):
+        if records[0]['text'].startswith('bad'):
+            raise ValueError('synthetic malformed batch')
+        return set(range(len(records)))
+
+    monkeypatch.setattr(support, '_supported', flaky)
+    hits = [Hit('observation', i, 'good' if i < 16 else 'bad', 'x') for i in range(20)]
+    result = RetrievalResult('q', QueryPlan('q'), hits)
+    await verify_support(result)
+    assert [h.ref_id for h in result.hits] == list(range(16))
+    assert all(h.verification == 'unverified' for h in hits[16:])
