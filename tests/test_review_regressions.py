@@ -214,7 +214,7 @@ async def test_open_successor_hold_expires_without_blocking_other_ready_episodes
     first, _ = await ready(store)
     successor = await store.open_episode('s1', (await store.get_episode(first))['ended_at'] + 5)
     other, _ = await ready(store, dt=1000, session='other')
-    since = float(await store.get_meta(f'episode_ready_since:{first}'))
+    since = (await store.get_episode(first))['ready_since']
     monkeypatch.setattr(episodes, 'now', lambda: since + episodes.EPISODE_DRAFT_GRACE_S - 0.1)
     assert [r['id'] for r in await store.episodes_ready_for_draft(limit=1)] == [other]
     assert not await store.begin_draft(first)
@@ -230,9 +230,26 @@ async def test_merging_ready_neighbors_does_not_restart_grace(store, monkeypatch
     first, _ = await ready(store)
     await ready(store, dt=20)
     await store.open_episode('s1', (await store.get_episode(first))['ended_at'] + 40)
-    since = float(await store.get_meta(f'episode_ready_since:{first}'))
+    since = (await store.get_episode(first))['ready_since']
     monkeypatch.setattr(episodes, 'now', lambda: since + episodes.EPISODE_DRAFT_GRACE_S)
     assert await store.begin_draft(first)
+
+
+@pytest.mark.parametrize(('first_since', 'other_since', 'expected'), [
+    (100., 200., 100.), (None, 200., 200.), (100., None, 100.), (None, None, 70.),
+])
+async def test_merge_preserves_ready_timer_and_legacy_fallback(store, first_since, other_since, expected):
+    first, _ = await ready(store)
+    other, _ = await ready(store, dt=20)
+    await store.execute("UPDATE episodes SET ready_since=?,updated_at=70 WHERE id=?", (first_since, first))
+    await store.execute("UPDATE episodes SET ready_since=?,updated_at=80 WHERE id=?", (other_since, other))
+    await store.mark_episode_ready(first)  # Already ready: don't restart the timer.
+    assert (await store.get_episode(first))['ready_since'] == first_since
+    assert await store.begin_draft(first)
+    assert (await store.get_episode(first))['ready_since'] == expected
+    assert (await store.get_episode(other))['status'] == 'merged'
+    assert await store.q("SELECT key FROM meta WHERE key GLOB 'episode_ready_since:*' "
+                         "OR key GLOB 'episode_boundary_locked:*'") == []
 
 
 @pytest.mark.parametrize('difference', ['entities', 'window'])

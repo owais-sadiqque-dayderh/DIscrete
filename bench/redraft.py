@@ -25,6 +25,7 @@ from pathlib import Path
 
 from discrete import textkit as tk
 from discrete.process.entities import structural_candidates
+from discrete.store.db import migrate
 
 #: Tables cleared except for rows required by preserved user directives.
 DERIVED = (
@@ -97,6 +98,8 @@ def redraft(src: Path, out: Path) -> dict[str, int]:
         with sqlite3.connect(out) as b:
             a.backup(b)
     conn = sqlite3.connect(out)
+    # Upgrade only the copy before using the episode state columns.
+    migrate(conn)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     counts: dict[str, int] = {}
     with conn:
@@ -128,11 +131,9 @@ def redraft(src: Path, out: Path) -> dict[str, int]:
         conn.execute("DELETE FROM meta WHERE key LIKE 'draft_coverage:%'")
         # Resetting attempts removes the merger's usual prior-draft guard. Lock
         # every retained boundary so a redraft remains a drafting-only rebuild.
-        conn.execute("INSERT OR IGNORE INTO meta(key,value) "
-                     "SELECT 'episode_boundary_locked:' || id, '1' FROM episodes WHERE status!='merged'")
         counts["episodes"] = conn.execute(
             "UPDATE episodes SET status='ready', title='', summary='', apps='[]', sites='[]', "
-            "engaged_fraction=0, draft_attempts=0 WHERE status!='merged'"
+            "engaged_fraction=0, draft_attempts=0, boundary_locked=1 WHERE status!='merged'"
         ).rowcount
     # Entity FTS owns its content (no delete triggers): clear it above. Only the
     # external-content indexes can rebuild from their emptied/reset source rows.

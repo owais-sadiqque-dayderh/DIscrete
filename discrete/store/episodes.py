@@ -18,9 +18,8 @@ from .tasks import cosine
 # A module constant keeps the hold independent of model/retry configuration.
 EPISODE_DRAFT_GRACE_S = 30.0
 _WAITING_SUCCESSOR = """
-    e.draft_attempts=0 AND COALESCE((SELECT CAST(value AS REAL) FROM meta
-      WHERE key='episode_ready_since:' || e.id), e.updated_at) > ?
-    AND NOT EXISTS (SELECT 1 FROM meta WHERE key='episode_boundary_locked:' || e.id)
+    e.draft_attempts=0 AND COALESCE(e.ready_since, e.updated_at) > ?
+    AND e.boundary_locked=0
     AND EXISTS (
       SELECT 1 FROM episodes successor WHERE successor.id=(
         SELECT id FROM episodes WHERE status!='merged' AND (started_at,id)>(e.started_at,e.id)
@@ -59,19 +58,16 @@ class EpisodesMixin(StoreBase):
 
     async def mark_episode_ready(self, episode_id: int) -> None:
         """Close an episode for drafting; its interval is its observations' span."""
-        def _ready():
+        def _ready() -> None:
             with self._tx() as conn:
                 ts = now()
-                cur = conn.execute(
-                    """UPDATE episodes SET status='ready', updated_at=?,
+                conn.execute(
+                    """UPDATE episodes SET status='ready', updated_at=?, ready_since=?,
                  started_at=COALESCE((SELECT MIN(started_at) FROM observations WHERE episode_id=episodes.id), started_at),
                  ended_at=COALESCE((SELECT MAX(ended_at) FROM observations WHERE episode_id=episodes.id), ended_at)
                WHERE id=? AND status='open'""",
-                    (ts, episode_id),
+                    (ts, ts, episode_id),
                 )
-                if cur.rowcount:
-                    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
-                                 (f"episode_ready_since:{episode_id}", str(ts)))
         await self._call(_ready)
 
     async def recover_open_episodes(self, *, older_than_s: float = 0.0) -> list[int]:
@@ -113,8 +109,7 @@ class EpisodesMixin(StoreBase):
         def eligible(ep: sqlite3.Row | None) -> bool:
             return (ep is not None and ep['status'] == 'ready' and ep['draft_attempts'] == 0
                     and not ep['title'] and not ep['summary']
-                    and not conn.execute("SELECT 1 FROM meta WHERE key=?",
-                                         (f"episode_boundary_locked:{ep['id']}",)).fetchone()
+                    and not ep['boundary_locked']
                     and not conn.execute("SELECT 1 FROM episode_draft_chunks WHERE episode_id=?", (ep['id'],)).fetchone()
                     and not conn.execute("SELECT 1 FROM claims WHERE episode_id=?", (ep['id'],)).fetchone()
                     and not conn.execute("SELECT 1 FROM episode_tasks WHERE episode_id=?", (ep['id'],)).fetchone())
@@ -163,15 +158,11 @@ class EpisodesMixin(StoreBase):
                 if cosine(own.vector, candidate.vector) < T.EPISODE_MERGE_SIM:
                     continue
                 # Merging updates updated_at, but must not restart the grace timer.
-                ready_since = conn.execute(
-                    "SELECT MIN(CAST(value AS REAL)) FROM meta WHERE key IN (?,?)",
-                    (f"episode_ready_since:{episode_id}", f"episode_ready_since:{other['id']}")).fetchone()[0]
-                conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
-                             (f"episode_ready_since:{episode_id}",
-                              str(ready_since if ready_since is not None else min(ep['updated_at'], other['updated_at']))))
+                timers = [ts for ts in (ep['ready_since'], other['ready_since']) if ts is not None]
+                ready_since = min(timers) if timers else min(ep['updated_at'], other['updated_at'])
                 conn.execute("UPDATE observations SET episode_id=? WHERE episode_id=?", (episode_id, other['id']))
-                conn.execute("UPDATE episodes SET started_at=?, ended_at=?, updated_at=? WHERE id=?",
-                             (start, end, now(), episode_id))
+                conn.execute("UPDATE episodes SET started_at=?, ended_at=?, ready_since=?, updated_at=? WHERE id=?",
+                             (start, end, ready_since, now(), episode_id))
                 conn.execute("UPDATE episodes SET status='merged', updated_at=? WHERE id=?", (now(), other['id']))
                 self._drop_vector(conn, 'episode', other['id'])
                 self._metric(conn, 'episodes_merged')

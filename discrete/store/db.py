@@ -441,6 +441,21 @@ def m011_tasks(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX ix_episode_tasks_task ON episode_tasks(task_id)")
 
 
+def m012_episode_draft_state(conn: sqlite3.Connection) -> None:
+    """Keep per-episode grace timers and boundary locks with their owning rows."""
+    _add_column(conn, "episodes", "ready_since", "REAL")
+    _add_column(conn, "episodes", "boundary_locked", "INTEGER NOT NULL DEFAULT 0")
+    conn.execute("UPDATE episodes SET ready_since=(SELECT CAST(value AS REAL) FROM meta "
+                 "WHERE key='episode_ready_since:' || episodes.id), "
+                 "boundary_locked=EXISTS(SELECT 1 FROM meta WHERE key='episode_boundary_locked:' || episodes.id)")
+    # Locks previously depended on key presence, even with a NULL or '0' value.
+    # Drop orphaned state too; deleting an episode now deletes its state with it.
+    conn.execute("DELETE FROM meta WHERE key GLOB 'episode_ready_since:*' "
+                 "OR key GLOB 'episode_boundary_locked:*'")
+    conn.execute("CREATE INDEX ix_ep_status_time ON episodes(status, started_at, id)")
+    conn.execute("CREATE INDEX ix_ep_unmerged ON episodes(started_at, id) WHERE status!='merged'")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_base,
     m002_draft_attempts_and_digest_counts,
@@ -453,6 +468,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m009_evidence_field,
     m010_episode_draft_chunks,
     m011_tasks,
+    m012_episode_draft_state,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

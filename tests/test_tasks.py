@@ -232,7 +232,7 @@ async def test_m011_upgrades_populated_v10_store_and_backfills_without_calls(tmp
     conn.close()
     s = await Store.open(path)
     try:
-        assert await s.scalar('PRAGMA user_version') == 11
+        assert await s.scalar('PRAGMA user_version') == db.SCHEMA_VERSION
         assert (await s.get_episode(7))['summary'] == 'Old summary'
         before = list(fake.calls), list(fake.embedded)
         assert await s.backfill_tasks() == 1

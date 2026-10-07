@@ -134,6 +134,47 @@ async def test_numbered_migrations_upgrade_a_pre_c6_store(tmp_path):
     await again.close()
 
 
+async def test_episode_draft_state_migration_moves_meta_to_columns(tmp_path, monkeypatch):
+    from discrete.store import db
+
+    path = str(tmp_path / "episode-meta.db")
+    with monkeypatch.context() as legacy:
+        legacy.setattr(db, "MIGRATIONS", db.MIGRATIONS[:-1])
+        conn = db.connect(path)
+    try:
+        conn.executemany(
+            "INSERT INTO episodes(id,session_id,started_at,ended_at,status,created_at,updated_at) "
+            "VALUES (?,'s',1,2,?,3,4)", [(1, 'ready'), (2, 'ready'), (3, 'merged'), (4, 'open')])
+        conn.executemany("INSERT INTO meta(key,value) VALUES (?,?)", [
+            ('episode_ready_since:1', '123.25'),
+            ('episode_ready_since:2', None),
+            ('episode_ready_since:3', '12.5'),
+            ('episode_boundary_locked:1', '0'),  # Key presence was the lock, not its value.
+            ('episode_boundary_locked:3', None),
+            ('episode_ready_since:999', '100'),  # Orphans must be removed too.
+            ('episode_boundary_locked:999', '1'),
+            ('unrelated', 'keep'),
+            ('episodeXreadyXsince:1', 'keep'),
+        ])
+    finally:
+        conn.close()
+
+    for _ in range(2):  # Reopening must not overwrite the migrated state.
+        store = await Store.open(path)
+        try:
+            assert (await store.q1("PRAGMA user_version"))[0] == db.SCHEMA_VERSION
+            assert await store.get_meta("schema_version") == str(db.SCHEMA_VERSION)
+            assert [tuple(r) for r in await store.q(
+                "SELECT id,ready_since,boundary_locked,updated_at FROM episodes ORDER BY id")] == [
+                (1, 123.25, 1, 4), (2, None, 0, 4), (3, 12.5, 1, 4), (4, None, 0, 4)]
+            assert await store.q("SELECT key FROM meta WHERE key GLOB 'episode_ready_since:*' "
+                                 "OR key GLOB 'episode_boundary_locked:*'") == []
+            assert await store.get_meta('unrelated') == 'keep'
+            assert await store.get_meta('episodeXreadyXsince:1') == 'keep'
+        finally:
+            await store.close()
+
+
 async def test_model_usage_is_recorded_per_component(tmp_db):
     from discrete.llm import METER, flush_usage
     from discrete.retrieval.store_card import usage_table

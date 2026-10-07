@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -62,6 +63,8 @@ async def test_redraft_clears_tasks_and_preserves_merged_episode_boundaries(stor
             "SELECT id,session_id,started_at,ended_at FROM episodes ORDER BY id")] == boundaries
         assert [(r["status"], r["draft_attempts"]) for r in await copied.q(
             "SELECT * FROM episodes ORDER BY id")] == [("ready", 0), ("merged", 0), ("ready", 0)]
+        assert [r['boundary_locked'] for r in await copied.q(
+            "SELECT * FROM episodes ORDER BY id")] == [1, 0, 1]
         assert {r[0] for r in await copied.q("SELECT DISTINCT ref_kind FROM embeddings")} == {"observation"}
         assert {r[0] for r in await copied.q("SELECT DISTINCT ref_kind FROM index_outbox")} == {"observation"}
         assert int(await copied.get_meta("vectors:episode")) == vectors_version + 1
@@ -94,13 +97,27 @@ async def test_redraft_clears_tasks_and_preserves_merged_episode_boundaries(stor
     assert await store.fts_ids("entity", "Stale") == [entity]
 
 
-def test_redraft_handles_pre_task_migrations_and_refuses_existing_output(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "MIGRATIONS", db.MIGRATIONS[:-1])
+@pytest.mark.parametrize('version', [10, 11])
+def test_redraft_handles_legacy_migrations_and_refuses_existing_output(tmp_path, monkeypatch, version):
     source = tmp_path / "legacy.db"
-    conn = db.connect(str(source))
+    with monkeypatch.context() as legacy:
+        legacy.setattr(db, "MIGRATIONS", db.MIGRATIONS[:version])
+        conn = db.connect(str(source))
+    conn.execute("INSERT INTO episodes(id,session_id,started_at,ended_at,created_at,updated_at) "
+                 "VALUES (1,'s',1,2,3,4)")
+    conn.execute("INSERT INTO meta(key,value) VALUES ('episode_ready_since:1','3.5')")
     conn.close()
     output = tmp_path / "redrafted.db"
-    assert redraft(source, output)["episodes"] == 0
+    assert redraft(source, output)["episodes"] == 1
+    with sqlite3.connect(output) as copied:
+        assert copied.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+        assert copied.execute("SELECT status,ready_since,boundary_locked FROM episodes").fetchone() == ('ready', 3.5, 1)
+        assert copied.execute("SELECT key FROM meta WHERE key GLOB 'episode_ready_since:*' "
+                              "OR key GLOB 'episode_boundary_locked:*'").fetchall() == []
+    with sqlite3.connect(source) as original:
+        assert original.execute("PRAGMA user_version").fetchone()[0] == version
+        assert original.execute("SELECT status FROM episodes").fetchone()[0] == 'open'
+        assert original.execute("SELECT value FROM meta WHERE key='episode_ready_since:1'").fetchone()[0] == '3.5'
     before = output.read_bytes()
     with pytest.raises(SystemExit, match="exists"):
         redraft(source, output)
