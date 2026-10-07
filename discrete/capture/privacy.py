@@ -11,6 +11,7 @@ from __future__ import annotations
 from urllib.parse import urlsplit
 
 from ..config import T
+from .browser import private_window
 
 #: Never watched whatever .env says: their whole window is secrets. DENIED_APPS adds
 #: to this list; it cannot remove from it.
@@ -36,41 +37,50 @@ DEFAULT_DENIED_APPS: tuple[str, ...] = (
 )
 
 _APPS = frozenset(a.lower() for a in (*DEFAULT_DENIED_APPS, *T.DENIED_APPS))
-_SITES = tuple(s.lower().removeprefix("www.").strip(".") for s in T.DENIED_SITES)
 
 
 def _host(url: str) -> str:
+    """Canonical host: lower case, no trailing dot, no "www.", IDNA-encoded."""
     try:
         return (urlsplit(url).hostname or "").lower().rstrip(".").removeprefix("www.").encode("idna").decode("ascii")
     except (ValueError, UnicodeError):
         return ""
 
 
-def denied(app: str = "", bundle_id: str = "", url: str = "", *, window_title: str = "") -> str:
-    """Why this window must not be watched ("app" or "site"), or "" when it may be.
+_SITES = tuple(filter(None, (_host("https://" + s.strip().strip(".")) for s in T.DENIED_SITES)))
+#: Browsers whose tab URL decides a site match. Without a URL, a denied site
+#: cannot be ruled out.
+_BROWSERS = frozenset((
+    "safari", "google chrome", "chromium", "arc", "microsoft edge", "brave browser", "firefox", "opera",
+    "vivaldi", "orion", "com.apple.safari", "com.google.chrome", "org.chromium.chromium",
+    "company.thebrowser.browser", "com.microsoft.edgemac", "com.brave.browser", "org.mozilla.firefox",
+    "com.operasoftware.opera", "com.vivaldi.vivaldi", "com.kagi.kagimacos",
+))
+# English title markers of private windows (Firefox, Edge, some Arc/Chrome builds).
+_PRIVATE_TITLES = ("incognito", "private browsing", "inprivate")
+
+
+def denied(app: str = "", bundle_id: str = "", url: str = "", *, window_title: str = "", window_id: int = 0) -> str:
+    """Why this window must not be watched ("app", "private", "unknown_url" or "site"), or ""
+    when it may be.
 
     An app matches by its name or bundle id (case-insensitive, whole value). A site
-    Unknown browser URLs and recognizable private-window titles are excluded.
-    Title detection covers English incognito/private markers only; it cannot prove
-    that an unmarked window is public. Browser/version validation remains necessary.
-    A site matches its host and every subdomain: "google.com" covers mail.google.com, while
-    "mail.google.com" covers only Gmail.
+    matches its host and every subdomain: "google.com" covers mail.google.com, while
+    "mail.google.com" covers only Gmail. Hosts compare case-insensitively, without a
+    trailing dot or "www.". When sites are denied, a browser window whose web URL is
+    unknown is excluded too. A private browser window is excluded when detectable:
+    Chromium-family incognito via Apple Events (browser.py), else a title marker; an
+    unmarked Safari or Arc private window cannot be told apart.
     """
     if (app or "").lower() in _APPS or (bundle_id or "").lower() in _APPS:
         return "app"
-    browser = (app or "").lower() in {
-        "arc", "google chrome", "chrome", "safari", "firefox", "microsoft edge", "brave browser",
-    } or (bundle_id or "").lower() in {
-        "company.thebrowser.browser", "com.google.chrome", "com.apple.safari", "org.mozilla.firefox",
-    }
-    # Simple detectable-title policy, not a claim of universal private-mode detection.
-    if browser and any(marker in window_title.lower() for marker in (
-        "incognito", "private browsing", "private window", "inprivate",
-    )):
-        return "private"
     host = _host(url)
-    if browser and not host:
-        return "unknown_url"
-    if host and any(host == _host("https://" + site) or host.endswith("." + _host("https://" + site)) for site in _SITES):
+    if (app or "").lower() in _BROWSERS or (bundle_id or "").lower() in _BROWSERS:
+        if (window_id and private_window(window_id)) or any(m in window_title.lower() for m in _PRIVATE_TITLES):
+            return "private"
+        # An internal page (about:, file:, chrome:) is no site; a missing or unparsable web URL may be one.
+        if _SITES and not host and (not url or url.lower().startswith("http")):
+            return "unknown_url"
+    if host and any(host == site or host.endswith("." + site) for site in _SITES):
         return "site"
     return ""
