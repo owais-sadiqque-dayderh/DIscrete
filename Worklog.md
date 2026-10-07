@@ -1154,3 +1154,4 @@ user's running app in `exp_discrete` is untouched. Brief: `../hardening_2026-10-
   argument the other lacks (recipient, amount, file, URL); trade-off documented (an identical verbatim repeat within 3 h
   reads as one action). **Suite: 930 passed, 0 failed; ruff clean.** (The provenance timing test fails only under heavy
   machine load; passes alone.) Next: independent review of d8847a5..HEAD.
+- ~02:55 IST: independent report-only review r1 of d8847a5..HEAD launched (kaustubh Opus medium) → `../hardening_2026-10-08/REVIEW-r1.md`.
