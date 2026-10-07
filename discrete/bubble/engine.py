@@ -70,6 +70,14 @@ def field_query(text: str, max_chars: int | None = None) -> str:
     return para.strip()
 
 
+#: The draft the writer sees: the text just before the caret, not a whole long document.
+_FIELD_CONTEXT_CHARS = 4000
+
+
+def _field_context(text: str) -> str:
+    return text if len(text) <= _FIELD_CONTEXT_CHARS else "…" + text[-_FIELD_CONTEXT_CHARS:]
+
+
 def needs_space(field_text: str, first: str) -> bool:
     return bool(field_text) and not field_text[-1].isspace() and bool(first) and first[0] not in _NO_SPACE_BEFORE
 
@@ -223,7 +231,7 @@ class BubbleEngine:
             {"role": "system", "content": WRITER_SYSTEM.format(user_name=self.user_name)},
             {"role": "user", "content": WRITER_USER.format(
                 user_name=self.user_name, app=p.app, field=p.field_desc, now=f"{to_local(now()):%a %b %d %Y %H:%M}",
-                text=p.field_text, records=records, instruction=instruction)},
+                text=_field_context(p.field_text), records=records, instruction=instruction)},
         ]
 
     async def write(self, p: Prepared, emit: Callable[[str], bool],
