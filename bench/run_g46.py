@@ -22,22 +22,26 @@ lack retrieval expectations), answer metrics and string checks; only verdicts ch
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import signal
-import sqlite3
 import statistics
 import subprocess
 import sys
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
 import yaml
+
+from discrete.encryption import open_database, state_path
+from discrete.store.db import clone_database
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -428,9 +432,45 @@ def summarize(results: list[CaseResult]) -> dict:
 
 
 def eval_cost(db: Path, since: float) -> float:
-    with sqlite3.connect(db) as conn:
+    with closing(open_database(str(db), read_only=True)) as conn:
         row = conn.execute("SELECT COALESCE(SUM(cost), 0) FROM perf_calls WHERE at >= ?", (since,)).fetchone()
     return round(float(row[0]), 4)
+
+
+def eval_cost_coverage(db: Path, since: float) -> dict:
+    with closing(open_database(str(db), read_only=True)) as conn:
+        priced, unknown = conn.execute("SELECT COUNT(cost), COUNT(*) - COUNT(cost) FROM perf_calls WHERE at >= ?",
+                                       (since,)).fetchone()
+    return {"priced_calls": priced, "unknown_calls": unknown, "is_lower_bound": bool(unknown)}
+
+
+def input_manifest(db: Path, code: Path, cases: Path) -> dict:
+    from discrete.store.health import content_manifest
+
+    with closing(open_database(str(db), read_only=True)) as conn:
+        conn.execute("BEGIN")
+        content = content_manifest(conn)
+    # Read answering settings in its own checkout, using the same environment as ask.
+    script = """
+import hashlib, json
+from discrete.config import T, all_endpoints
+models = {}
+for ep in all_endpoints():
+    settings = dict(ep.settings())
+    settings['extra_body'] = hashlib.sha256(ep.extra_body.encode()).hexdigest()
+    models[ep.name] = {'model': ep.model, 'settings': settings,
+                      'base_url_sha256': hashlib.sha256((ep.base_url or '').encode()).hexdigest()}
+print(json.dumps({'tunables': {k:v for k,v in vars(T).items() if k.isupper()}, 'models': models}))
+"""
+    proc = subprocess.run([str(code / '.venv/bin/python'), '-c', script], cwd=code,
+                          env=os.environ | {"PYTHONPATH": str(code)}, capture_output=True, text=True, timeout=30)
+    if proc.returncode:
+        raise RuntimeError("cannot fingerprint answering configuration")
+    revision = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=code, capture_output=True, text=True, check=True)
+    dirty = subprocess.run(['git', 'status', '--porcelain'], cwd=code, capture_output=True, text=True, check=True)
+    return {**content, "answering_config": json.loads(proc.stdout), "answering_revision": revision.stdout.strip(),
+            "answering_dirty": bool(dirty.stdout), "cases_sha256": hashlib.sha256(cases.read_bytes()).hexdigest(),
+            "judge_prompt_sha256": hashlib.sha256(JUDGE_PROMPT.encode()).hexdigest()}
 
 
 def compare(names: list[str]) -> None:
@@ -525,12 +565,13 @@ def main() -> int:
     except Exception as error:  # noqa: BLE001 - no scoring or output-store writes if preflight fails
         print(f"Preflight failed; scoring aborted: {error}", file=sys.stderr, flush=True)
         return 1
+    manifest = input_manifest(args.db, args.code.resolve(), args.cases)
     # Asking writes to the store (perf rows, gaps, misses): score a copy, keep the input pristine.
     RESULTS.mkdir(parents=True, exist_ok=True)
     work = RESULTS / f"{args.name}.db"
     work.unlink(missing_ok=True)
-    with sqlite3.connect(args.db) as src, sqlite3.connect(work) as dst:
-        src.backup(dst)
+    state_path(work).unlink(missing_ok=True)
+    clone_database(args.db, work)
     started = time.time()
     with ThreadPoolExecutor(args.jobs) as pool:
         results = list(pool.map(lambda c: ask(c, work.resolve(), args.code.resolve(), args.infra_retries), cases))
@@ -547,7 +588,10 @@ def main() -> int:
     valid = infra_rate <= args.max_infra_errors and any(not r.infra_error for r in results)
     out = {"name": args.name, "db": str(args.db), "code": str(args.code.resolve()), "judge_model": args.judge_model,
            "jobs": args.jobs, "infra_retries": args.infra_retries, "max_infra_errors": args.max_infra_errors,
-           "valid": valid, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "summary": summary,
+           "valid": valid, "manifest": manifest, "answer_cost_coverage": eval_cost_coverage(work, started),
+           "evaluation_limits": "Returned-evidence support and string matching; independent source truth, complete sets, "
+                                "and session-disjoint generalization are unmeasured.",
+           "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "summary": summary,
            "cases": [asdict(r) | {"correct": r.correct} for r in results]}
     (RESULTS / f"{args.name}.json").write_text(json.dumps(out, indent=1, ensure_ascii=False))
     print_summary(args.name, summary)

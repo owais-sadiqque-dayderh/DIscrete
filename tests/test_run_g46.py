@@ -22,6 +22,7 @@ def no_network(monkeypatch):
         raise AssertionError("tests must not call a provider")
 
     monkeypatch.setattr(run.urllib.request, "urlopen", forbidden)
+    monkeypatch.setattr(run, "input_manifest", lambda *args: {"test": True})
     resolver = run._endpoint
     resolver.cache_clear()
     yield
