@@ -166,18 +166,10 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
     return "\n\n".join(blocks) or "(no records)"
 
 
-def extractive_fallback(p: Prepared) -> str:
-    """Quote the strongest matching line without inventing an answer."""
-    if p.mode not in ("grounded", "thin") or not p.result.hits:
-        return "(nothing on file about that)"
-    hit = p.result.hits[0]
-    terms = set(tk.tokens(p.query)) | set(p.result.plan.terms)
-    lines = [line.strip() for line in re.split(r"\n|(?<=[.!?])\s+", hit.body) if line.strip()]
-    line = max(lines, key=lambda line: len(terms & set(tk.tokens(line))), default=hit.title)
-    snippet = tk.best_window(line, terms, width=80)[0] or line
-    when = _when_short(hit)
-    source = hit.title or f"{hit.ref_kind} {hit.ref_id}"
-    return f"From {source}{f' ({when})' if when else ''}: {tk.truncate(snippet, 600)}"
+#: A writer that stays silent twice had nothing it could support: muse returns an empty
+#: completion exactly when the records lack the answer, so quoting the top record would
+#: put an unrelated line in the field (seen live: "From xa11y: xa11y" for a salary question).
+EMPTY_WRITER_ANSWER = "(nothing on file about that)"
 
 
 class BubbleEngine:
@@ -270,10 +262,10 @@ class BubbleEngine:
                         return out
         except EmptyCompletion:
             if not out.strip():
-                buf = extractive_fallback(p)
+                buf = EMPTY_WRITER_ANSWER
         # Also cover custom stream adapters that silently finish without content.
         if not out.strip() and not buf.strip():
-            buf = extractive_fallback(p)
+            buf = EMPTY_WRITER_ANSWER
         tail = buf.rstrip()
         if tail and should_continue():
             push(tail)

@@ -308,9 +308,6 @@ async def test_empty_writer_retries_then_answers_or_quotes_record(store, fake, m
     assert p.timings["first_chunk_s"] == 4.0
     if recover:
         assert out.strip() == "300M and 1B."
-    elif mode == "empty":
-        assert out.strip() == "(nothing on file about that)"
     else:
-        assert out.strip().startswith("From X post (")
-        assert out.endswith(": EmbeddingGemma 2 comes in 300M and 1B sizes.")
-        assert "Menu" not in out
+        # Silence twice means nothing supportable, with or without hits.
+        assert out.strip() == "(nothing on file about that)"
