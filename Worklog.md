@@ -407,6 +407,31 @@ This audit shows where each proposed feature starts from. Code paths are relativ
   - `bench/private/eval_driver.sh` (log `results/driver.log`, ends `ALL DONE`) runs the live re-draft, the matrix
     and the v2 scores, all from the frozen code.
   - Score future branch states the same way: a new worktree per evaluated commit.
+- **Codex results (reviewed, not yet committed):**
+  - **#8 episodes by task** (33 tests):
+    - time away from an episode's context now counts across any detour;
+    - topic-shift splits work across app/site;
+    - adjacent undrafted episodes are merged before drafting (embedding centroids, with adjacency, session, time and
+      size guards);
+    - migration m011 adds `tasks` + episode mapping and assignment without model calls (embeddings, token cosine,
+      entity/time guards), `discrete tasks`, and retrieval adds bounded sibling episodes of a strong match (still
+      checked by the support verifier).
+    - Episode boundaries change, so it needs a **full replay** to evaluate; `redraft.py` keeps old boundaries.
+  - **#12 hygiene:** `discrete check [--expect FILE] [--slo]` (store invariants, expected claims), SLOs in
+    `discrete bench`, draft coverage/truncation flags, silent-loss health counters in `stats`.
+    - On the current dbs: every store passes "no claim cites a self row" and "every quote is on screen".
+    - The typed `downloaded` action (Helium/ChatGPT.dmg) exists **only in branch stores**: the baselines describe the
+      download but never record it as an action.
+    - Legacy stores lack the new telemetry, so those checks fail. They are being changed to report `n/a`.
+    - `enrich.total` p90 of 205–378 s in the branch rebuilds is queueing from parallel replay, not live latency.
+  - **#11 caption reuse — not shipped.**
+    - Offline it would have reused **0/130** (g46) and **0/222** (live1006) captions: capture's pHash dedup already
+      collapses near-identical frames, so every stored row differs enough to need its own caption. The nearest miss
+      was FotMob at 22% text change.
+    - Being removed (dead weight); report kept at `docs/caption_reuse_report.md`.
+- **Integration task** (Codex, `…exp-discrete-integrate-r1`): remove #11 cleanly from shared files; `n/a` for
+  missing telemetry; `redraft.py` clears tasks and respects merged-episode tombstones; whole-suite interaction
+  fixes. Next: an independent Codex review of the combined diff, then commits.
 
 ---
 
