@@ -1354,3 +1354,10 @@ regression is eliminated or that two repeats establish general parity. Returned-
 means rise from live hret **88.4% → 98.4%** and g46 hret **94.5% → 97.8%**. The benchmark still measures
 returned-evidence support/string checks, not independent source truth. Answer-cost values exclude judge
 spend and are lower bounds: fix unpriced-call counts a/b are live **3/1**, g46 **3/4**.
+
+### 2026-10-08 — orchestrator: regression fixes integrated
+- Reviewed 471b44f and fast-forwarded `feat/production-hardening` to it; Worklog commit cherry-picked (e97ac03). 941 passed.
+- Note: the clock-recall failure was date-dependent (questions like "around 22:20" resolved against yesterday's date;
+  the Oct 7 runs happened to be one day after the session), so the earlier "final" numbers were not hurt by it.
+- Known UX trade-off: on a verifier timeout the Bubble types "Support check timed out; this answer is not verified." first.
+- Live daemon restarted on the fixed code; `COMP_001/Discrete` branch `feat/production-hardening` refreshed.
