@@ -1375,3 +1375,13 @@ spend and are lower bounds: fix unpriced-call counts a/b are live **3/1**, g46 *
   check hits its 8 s cap on ~25% of questions, so those answers are hedged ("not verified"); `SUPPORT_TIMEOUT_S` trades this for latency.
 - Setup: `.venv` rebuilt with uv (Python 3.13, `.[dev,encryption]`), 945 passed, ruff clean. `jarvis` now runs this checkout;
   the live data dir is `~/.cache/exp_discrete` (Oct 6 onwards); `~/.cache/discrete` keeps the Sep 30 – Oct 1 store untouched.
+
+### 2026-10-08 — launcher renamed `jarvis` → `discrete`
+- `jarvis` moved to `bin/discrete` (a file named `discrete` can't sit next to the `discrete/` package). `jarvis` is
+  reserved for the merged stack (DIscrete + Comma), so everything in this repo is now called `discrete`.
+- The launcher keeps its own commands (start/stop/status, memories, episodes, captured, search, cost, block…) and now
+  execs the Python CLI for everything else, so one `discrete` command covers both. `ask`, `profile`, `dream` and
+  `changes` keep their friendly defaults (`--records`, `--ids`, `--force`, `--since all`) unless an option is given,
+  in which case the arguments go to the Python CLI unchanged.
+- Self-output suppression still recognises `jarvis …` commands, since older captures show them.
+- Install: `ln -sfn "$PWD/bin/discrete" ~/.local/bin/discrete` (replaces the old `~/.local/bin/jarvis` link).

@@ -64,10 +64,16 @@ async def test_read_sql_uses_resolver_and_rejects_writes(store, tmp_db, monkeypa
         await cmd_read_sql(args)
 
 
-def test_jarvis_has_no_broad_process_or_sqlite_patterns():
-    script = Path('jarvis').read_text()
+def test_launcher_has_no_broad_process_or_sqlite_patterns():
+    script = Path('bin/discrete').read_text()
     assert 'pgrep' not in script and 'pkill' not in script
     assert 'q() { sqlite3' not in script
+
+
+def test_launcher_is_named_discrete_and_hands_other_commands_to_the_cli():
+    script = Path('bin/discrete').read_text()
+    assert 'jarvis' not in script.lower()
+    assert 'exec "$BIN" "$cmd" "$@"' in script
 
 
 def test_encrypted_benchmark_clone_and_reads_use_fake_keychain(tmp_path, monkeypatch, capsys):

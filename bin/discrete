@@ -1,42 +1,46 @@
 #!/bin/bash
-# jarvis — one command for DIscrete (this checkout; install as jarvis-exp to test a branch).
+# discrete — one command for DIscrete (this checkout; link it under another name to test a branch).
 #
-#   jarvis start              start watching + Bubble (Option+Tab) in the background
-#   jarvis stop               stop it
-#   jarvis restart            stop, then start (after editing .env)
-#   jarvis status             running or not, what's stored, blocked apps/sites, credit left
+#   discrete start                   start watching + Bubble (Option+Tab) in the background
+#   discrete stop                    stop it
+#   discrete restart                 stop, then start (after editing .env)
+#   discrete status                  running or not, what's stored, blocked apps/sites, credit left
 #
-#   jarvis memories [N]       the last N memories DIscrete wrote about you (default 20)
-#   jarvis episodes [N]       the last N episodes: what you were doing, summarised (default 10)
-#   jarvis captured [N]       the last N raw captures: app, window, caption (default 20)
-#   jarvis ask "question"     ask from the terminal, with the records behind the answer
-#   jarvis search "question"  what search finds for a question (debugging a wrong answer)
-#   jarvis process            turn waiting episodes into memories now
-#   jarvis consolidate        run the hourly merge (entity pages, day digests) now
-#   jarvis cost               model calls, tokens and cost per component
+#   discrete memories [N]            the last N memories DIscrete wrote about you (default 20)
+#   discrete episodes [N]            the last N episodes: what you were doing, summarised (default 10)
+#   discrete captured [N]            the last N raw captures: app, window, caption (default 20)
+#   discrete ask "question"          ask from the terminal, with the records behind the answer
+#   discrete search "question"       what search finds for a question (debugging a wrong answer)
+#   discrete process                 turn waiting episodes into memories now
+#   discrete consolidate             run the hourly merge (entity pages, day digests) now
+#   discrete cost                    model calls, tokens and cost per component
 #
-#   jarvis profile            what it has learned about you, with the memories behind each point
-#   jarvis patterns           patterns learned across sessions, with how firmly each is held
-#   jarvis dream              learn patterns, resolve conflicts, refresh the profile now
-#   jarvis changes [SINCE]    the memory change log (e.g. jarvis changes 2h)
-#   jarvis history ID         every version of memory ID and why it changed
-#   jarvis forget ID          forget memory ID and never re-learn it (undo: jarvis revert)
-#   jarvis correct ID "text"  replace memory ID's wording with yours
-#   jarvis revert EVENT       undo one change from the change log
-#   jarvis graph [NAME]       people/projects/tools and how they connect
-#   jarvis export             write your memory as Markdown (a git folder; opens in Obsidian)
+#   discrete profile                 what it has learned about you, with the memories behind each point
+#   discrete patterns                patterns learned across sessions, with how firmly each is held
+#   discrete dream                   learn patterns, resolve conflicts, refresh the profile now
+#   discrete changes [SINCE]         the memory change log (e.g. discrete changes 2h)
+#   discrete history ID              every version of memory ID and why it changed
+#   discrete forget ID               forget memory ID and never re-learn it (undo: discrete revert)
+#   discrete correct ID "text"       replace memory ID's wording with yours
+#   discrete revert EVENT            undo one change from the change log
+#   discrete graph [NAME]            people/projects/tools and how they connect
+#   discrete export                  write your memory as Markdown (a git folder; opens in Obsidian)
 #
-#   jarvis block app NAME     never watch an app      (e.g. jarvis block app WhatsApp)
-#   jarvis block site DOMAIN  never watch a website   (e.g. jarvis block site hdfcbank.com)
-#   jarvis unblock app|site X stop blocking it
-#   jarvis blocked            list what is blocked
+#   discrete block app NAME          never watch an app      (e.g. discrete block app WhatsApp)
+#   discrete block site DOMAIN       never watch a website   (e.g. discrete block site hdfcbank.com)
+#   discrete unblock app|site X      stop blocking it
+#   discrete blocked                 list what is blocked
 #
-#   jarvis setup              check permissions and models (no screen content shown or sent)
-#   jarvis logs               follow the log
+#   discrete setup                   check permissions and models (no screen content shown or sent)
+#   discrete logs                    follow the log
+#
+#   discrete COMMAND …               any other command (run, why, query, eval, bench, attention, pages,
+#                                    encrypt, …) goes to the Python CLI; `discrete COMMAND -h` shows its options
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# The script lives in bin/; the checkout is its parent.
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 DIS="$ROOT"
 BIN="$DIS/.venv/bin/discrete"
 ENV_FILE="$DIS/.env"
@@ -71,18 +75,18 @@ credit() {
 start() {
   [ -x "$BIN" ] || die "DIscrete is not installed: cd $DIS && uv venv .venv && VIRTUAL_ENV=.venv uv pip install -e '.[dev]'"
   if running; then ok "DIscrete is already running"; return; fi
-  [ -z "$(legacy_pids)" ] || die "an older DIscrete from this checkout is still running without the data-dir lock; run: jarvis stop"
+  [ -z "$(legacy_pids)" ] || die "an older DIscrete from this checkout is still running without the data-dir lock; run: discrete stop"
   local others; others="$(daemons | awk -v bin="$BIN" '$2 != bin {print $1}')"
   [ -z "$others" ] || warn "another DIscrete checkout is running (pid $(echo $others)); both use Option+Tab — stop it from its own checkout"
   (cd "$DIS" && exec nohup "$BIN" run >>"$LOG" 2>&1 </dev/null) >/dev/null 2>&1 &
   sleep 5
-  running || die "DIscrete stopped right away; see: jarvis logs   (or: jarvis setup)"
+  running || die "DIscrete stopped right away; see: discrete logs   (or: discrete setup)"
   ok "DIscrete is watching; Bubble is on Option+Tab"
 }
 
 stop() {
   dis instance stop || die "shutdown incomplete; restart aborted"
-  # A daemon started by an older jarvis holds no lease; stop it by this checkout's exact binary path.
+  # A daemon started by an older launcher holds no lease; stop it by this checkout's exact binary path.
   local pids; pids="$(legacy_pids)"
   if [ -n "$pids" ]; then
     kill $pids 2>/dev/null || true
@@ -120,13 +124,19 @@ PY
 }
 
 cmd="${1:-help}"; shift || true
+# Shortcuts below add friendly defaults; with any option they hand over to the Python CLI unchanged.
+for arg in "$@"; do
+  case "$arg" in -*) case "$cmd" in ask | profile | dream | changes) exec_cli=1 ;; esac ;; esac
+done
+[ -z "${exec_cli:-}" ] || { cd "$DIS" && exec "$BIN" "$cmd" "$@"; }
+
 case "$cmd" in
   start) bold "Starting DIscrete"; start; credit ;;
   stop) stop ;;
   restart) stop; start ;;
   status)
     bold "DIscrete"
-    running && ok "running (Bubble on Option+Tab)" || warn "stopped (jarvis start)"
+    running && ok "running (Bubble on Option+Tab)" || warn "stopped (discrete start)"
     if [ -f "$(db)" ]; then
       q "select (select count(*) from observations), (select count(*) from episodes),
          (select count(*) from claims where status='live'),
@@ -154,14 +164,12 @@ case "$cmd" in
        order by id desc limit ${1:-20};" |
       awk -F'\t' '{printf "  %s  %-14s %-30s %s\n", substr($1,6,11), substr($2,1,14), substr($3,1,30), substr($4,1,100)}'
     ;;
-  ask) [ $# -gt 0 ] || die 'usage: jarvis ask "question"'; dis ask "$*" --records ;;
-  search) [ $# -gt 0 ] || die 'usage: jarvis search "question"'; dis query "$*" ;;
-  process) dis process ;;
-  consolidate) dis consolidate ;;
+  ask) [ $# -gt 0 ] || die 'usage: discrete ask "question"'; dis ask "$*" --records ;;
+  search) [ $# -gt 0 ] || die 'usage: discrete search "question"'; dis query "$*" ;;
   cost) dis stats ;;
   block | unblock)
     kind="${1:-}"; value="${2:-}"
-    [ -n "$value" ] && { [ "$kind" = app ] || [ "$kind" = site ]; } || die "usage: jarvis $cmd app NAME | jarvis $cmd site DOMAIN"
+    [ -n "$value" ] && { [ "$kind" = app ] || [ "$kind" = site ]; } || die "usage: discrete $cmd app NAME | discrete $cmd site DOMAIN"
     var=$([ "$kind" = app ] && echo DISCRETE_DENIED_APPS || echo DISCRETE_DENIED_SITES)
     edit_list "$var" "$([ "$cmd" = block ] && echo add || echo remove)" "$value"
     if running; then echo "  restarting DIscrete so it takes effect…"; stop; start; fi
@@ -178,13 +186,10 @@ case "$cmd" in
     ;;
   dream) dis dream --force ;;
   changes) dis changes --since "${1:-all}" ;;
-  history) [ $# -gt 0 ] || die "usage: jarvis history ID"; dis history "$1" ;;
-  forget) [ $# -gt 0 ] || die "usage: jarvis forget ID"; dis forget "$1" ;;
-  correct) [ $# -gt 1 ] || die 'usage: jarvis correct ID "new wording"'; dis correct "$1" "$2" ;;
-  revert) [ $# -gt 0 ] || die "usage: jarvis revert EVENT"; dis revert "$1" ;;
-  graph) dis graph "${1:-}" ;;
-  export) dis export ;;
   setup) dis doctor --models ;;  # one pass: permissions, then synthetic model checks
   logs) tail -f "$LOG" ;;
-  help | -h | --help | *) sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  help | -h | --help) sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//' ;;
+  # Everything else (process, history, forget, run, why, eval, …) is the Python CLI itself.
+  *) [ -x "$BIN" ] || die "DIscrete is not installed: cd $DIS && uv venv .venv && VIRTUAL_ENV=.venv uv pip install -e '.[dev]'"
+     cd "$DIS" && exec "$BIN" "$cmd" "$@" ;;
 esac
