@@ -33,11 +33,12 @@ import logging
 
 from .. import textkit as tk
 from ..config import T, insight_endpoint, verifier_endpoint
-from ..llm import EXPECTED_ERRORS, NotConfigured, complete_obj
+from ..llm import EXPECTED_ERRORS, LLMError, NotConfigured, complete_obj
 from ..perf import PERF
 from ..store import Store
 from ..timeutil import now, to_local
 from .pipeline import ACTION_VERBS
+from .verification import supported
 
 log = logging.getLogger("discrete.process.trails")
 
@@ -172,11 +173,12 @@ async def _verify(claim, links: list[dict]) -> list[dict]:
     payload = {"action": {"text": claim["text"], "at": f"{to_local(claim['occurred_from']):%H:%M:%S}"},
                "links": [{"index": i, "role": lk["relation"], "at": f"{to_local(lk['at']):%H:%M:%S}",
                           "quote": lk["quote"], "explanation": lk["explanation"]} for i, lk in enumerate(links)]}
+    # The claim verifier's budget: 60 + 30 per link left a reasoning model no room to
+    # think before answering. VERIFY_LM_EXTRA_TOKENS still adds to it (llm.py).
     data = await complete_obj(ep, [{"role": "user", "content": VERIFY_TRAIL_PROMPT.format(
-        payload=json.dumps(payload, ensure_ascii=False))}], max_tokens=60 + 30 * len(links))
-    ok = {d.get("index") for d in data.get("decisions") or []
-          if isinstance(d, dict) and d.get("supported") is True}
-    return [lk for i, lk in enumerate(links) if i in ok]
+        payload=json.dumps(payload, ensure_ascii=False))}], max_tokens=400 + 200 * len(links))
+    decisions = supported(data, len(links), "trail verifier")
+    return [lk for lk, ok in zip(links, decisions, strict=True) if ok]
 
 
 async def trail_for(store: Store, claim) -> list[dict]:
@@ -189,6 +191,8 @@ async def trail_for(store: Store, claim) -> list[dict]:
                                  minutes=int(T.TRAIL_WINDOW_MIN), moments="\n\n".join(_moment(r, terms) for r in rows))
     data = await complete_obj(insight_endpoint(), [{"role": "user", "content": prompt}], max_tokens=900)
     by_id = {r["id"]: r for r in rows}
+    if not isinstance(data.get("links", []), list):
+        raise LLMError("trail: links is not a list")  # retried, not recorded as "no trail"
     proposed = [x for x in data.get("links") or [] if isinstance(x, dict)]
     checked = [lk for lk in (check_link(x, by_id, claim, terms) for x in proposed) if lk]
     triggers = sorted([lk for lk in checked if lk["relation"] == "led_to"], key=lambda x: -x["confidence"])[:2]

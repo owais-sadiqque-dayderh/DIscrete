@@ -124,7 +124,7 @@ async def test_draft_decisions_are_logged_and_reinforcement_is_undoable(store):
     assert (await store.get_claim(cid))["confidence"] == pytest.approx(before)
 
 
-async def test_reverting_a_reinforce_restores_evidence_the_cap_evicted(store, monkeypatch):
+async def test_reverting_a_reinforce_preserves_full_support_membership(store, monkeypatch):
     """Review #3: the cap's evicted rows were lost for good on revert."""
     from discrete.config import T
 
@@ -141,7 +141,8 @@ async def test_reverting_a_reinforce_restores_evidence_the_cap_evicted(store, mo
             return store._log_event(conn, "reinforce", "draft", claim_id=cid, changes=[change])
 
     eid = await store._call(_go)
-    assert [r["observation_id"] for r in await store.evidence_for_claim(cid)] == [new]  # old one evicted
+    assert [r["observation_id"] for r in await store.evidence_for_claim(cid)] == [new]  # quote sample
+    assert {r[0] for r in await store.q("SELECT observation_id FROM evidence WHERE claim_id=?", (cid,))} == {*old, new}
     await store.revert_event(eid)
     assert [r["observation_id"] for r in await store.evidence_for_claim(cid)] == old
 
@@ -195,3 +196,114 @@ async def test_a_forgotten_memory_leaves_the_profile_at_once(store):
     await store.forget_claim(a)
     profile = await store.get_profile()
     assert [s["heading"] for s in profile["sections"]] == ["Tools"]
+
+
+async def test_older_evidence_cannot_invalidate_newer_claim(store):
+    old = await store.create_claim(ClaimDraft(kind="fact", text="The user used the old editor", occurred_from=10, occurred_to=20))
+    new = await store.create_claim(ClaimDraft(kind="fact", text="The user uses the new editor", occurred_from=30, occurred_to=40))
+
+    def invalidate():
+        with store._tx() as conn:
+            return store._invalidate_claim(conn, new, by_id=old, at=10)
+
+    assert await store._call(invalidate) is None
+    assert (await store.get_claim(new))["status"] == "live"
+    assert (await store.get_claim(new))["invalidates_id"] is None
+
+
+async def test_checked_verdict_expires_when_claim_revision_changes(store):
+    a = await _claim(store, "The user prefers tea", n=1)
+    b = await _claim(store, "The user prefers coffee", n=2)
+    await store.mark_pair_checked(a, b, "compatible", "different settings")
+    assert (a, b) in await store.checked_pairs()
+    await store.execute("UPDATE claims SET occurred_to=occurred_to+1, updated_at=updated_at+1 WHERE id=?", (a,))
+    assert (a, b) not in await store.checked_pairs()
+    await store.mark_pair_checked(a, b, "nonsense", "invalid model output")
+    assert (a, b) not in await store.checked_pairs()
+
+
+async def test_merge_preserves_stated_authority_only_for_its_proposition(store):
+    a = await _claim(store, "The user likes the editor", n=1)
+    b = await store.create_claim(ClaimDraft(kind="preference", text="The user prefers the editor", modality="stated"))
+    [same] = await store.consolidate_cluster(await store.get_claims([a, b]), [{
+        "text": "The user prefers the editor", "input_ids": [a, b]}])
+    assert (await store.get_claim(same))["modality"] == "stated"
+    [general] = await store.consolidate_cluster(await store.get_claims([same]), [{
+        "text": "The user likes software tools", "input_ids": [same]}])
+    assert (await store.get_claim(general))["modality"] != "stated"
+    assert (await store.get_claim(same))["status"] == "live"
+
+
+async def test_profile_redo_refuses_after_newer_profile(store):
+    first = await store.save_profile({"written_at": 1, "sections": []}, run_id="r")
+    undo = await store.revert_event(first)
+    await store.save_profile({"written_at": 2, "sections": []}, run_id="r")
+    with pytest.raises(RevertConflict):
+        await store.revert_event(undo)
+    assert (await store.get_profile())["written_at"] == 2
+
+
+async def test_evidence_update_restores_predecessor_quote_on_undo_and_redo(store):
+    cid = await _claim(store, "The user likes tea", n=1)
+    [before] = await store.evidence_for_claim(cid)
+
+    def reinforce():
+        with store._tx() as conn:
+            change = store._reinforce_claim(conn, cid, ClaimDraft(kind="preference", text="The user likes tea",
+                evidence=[{"observation_id": before["observation_id"], "quote": "updated quote", "field": "caption"}]))
+            return store._log_event(conn, "reinforce", "draft", claim_id=cid, changes=[change])
+
+    event = await store._call(reinforce)
+    undo = await store.revert_event(event)
+    assert dict((await store.evidence_for_claim(cid))[0]) == dict(before)
+    await store.revert_event(undo)
+    assert (await store.evidence_for_claim(cid))[0]["quote"] == "updated quote"
+
+
+async def test_overwritten_trail_restores_predecessor_row_on_undo_and_redo(store):
+    cid = await _claim(store, "The user downloaded a tool")
+    oid = await _obs(store, "tool page", 8)
+    link = {"observation_id": oid, "relation": "led_to", "confidence": 0.8, "explanation": "first", "quote": "old"}
+    await store.record_trail(cid, [link], reason="first")
+    [before] = await store.links_into("claim", [cid])
+    second = await store.record_trail(cid, [{**link, "explanation": "second", "quote": "new"}], reason="second")
+    [after] = await store.links_into("claim", [cid])
+    undo = await store.revert_event(second)
+    assert [dict(r) for r in await store.links_into("claim", [cid])] == [dict(before)]
+    await store.revert_event(undo)
+    assert [dict(r) for r in await store.links_into("claim", [cid])] == [dict(after)]
+
+
+async def test_forget_clears_entity_page_quoting_it_and_marks_it_for_rebuild(store):
+    a = await _claim(store, "The user edits notes in Zed", n=1)
+    b = await _claim(store, "The user reads docs in Zed", n=2)
+    eid = await store.create_entity("Zed", "app", "zed")
+    await store.record_mentions([(eid, "claim", a), (eid, "claim", b)])
+    await store.update_entity_page(eid, "Zed: used for notes and docs.")
+    assert not await store.entities_needing_pages(10)
+    await store.forget_claim(a)
+    page = await store.get_entity(eid)
+    assert page["summary"] == ""
+    assert [r["id"] for r in await store.entities_needing_pages(10)] == [eid]
+    assert not await store.q("SELECT 1 FROM entities_fts WHERE entities_fts MATCH 'notes'")
+
+
+async def test_erase_removes_content_everywhere_and_blocks_relearning(store):
+    cid = await _claim(store, "The user keeps zebrafish secretly", n=3)
+    other = await _claim(store, "The user likes tea", n=4)
+    await store.save_profile({"written_at": 1, "sections": [{"heading": "h", "points": [
+        {"text": "They keep zebrafish.", "claims": [cid]}, {"text": "They like tea.", "claims": [other]}]}]}, run_id="r")
+    await store.forget_claim(cid)
+    assert await store.erase_claim(cid) == 1
+    blob = ""
+    for table in ("claims", "evidence", "memory_events", "suppressions", "meta", "links"):
+        blob += "".join(str(tuple(r)) for r in await store.q(f"SELECT * FROM {table}"))
+    assert "zebrafish" not in blob and "tea" in blob
+    assert not await store.q("SELECT 1 FROM claims_fts WHERE claims_fts MATCH 'zebrafish'")
+    assert await store.suppressed("preference", "The user keeps zebrafish secretly")
+    assert [r[0] for r in await store.q("SELECT vector FROM suppressions WHERE claim_id=?", (cid,))] == [None]
+    assert not await store.q("SELECT 1 FROM embeddings WHERE ref_kind='claim' AND ref_id=?", (cid,))
+    event = (await store.recent_events(op="forget"))[0]
+    with pytest.raises(RevertConflict):
+        await store.revert_event(event["id"])
+    assert [p["text"] for s in (await store.get_profile())["sections"] for p in s["points"]] == ["They like tea."]

@@ -188,7 +188,8 @@ async def test_model_usage_is_recorded_per_component(tmp_db):
         await flush_usage(store)
         await flush_usage(store)  # drained: nothing is counted twice
         usage = await store.usage_by_component()
-        assert usage["caption"] == {"calls": 2, "prompt_tokens": 1200, "completion_tokens": 80, "cost": 0.0003}
+        assert usage["caption"] == {"calls": 2, "prompt_tokens": 1200, "completion_tokens": 80, "cost": 0.0003,
+                                    "unknown_cost_calls": 0}
         table = await usage_table(store)
         assert "caption" in table and "1,200" in table and "total" in table and "0.0003" in table
     finally:

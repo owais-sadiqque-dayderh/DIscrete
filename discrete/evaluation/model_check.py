@@ -14,7 +14,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from ..bubble.prompts import FIELD_READ_PROMPT
 from ..capture.enrich import VLM_MAX_TOKENS, EnrichJob, jpeg, vlm_messages
@@ -49,13 +49,14 @@ class Check:
     cost: float | None = None
 
 
-async def check_models(img: Image.Image | None, *, app: str = "", title: str = "", screen_text: str = "") -> list[Check]:
-    """Run every check concurrently; `img` is a real screenshot for the vision models."""
-    frame = img if img is not None else Image.new("RGB", (800, 500), (250, 250, 250))
+async def check_models() -> list[Check]:
+    """Run checks concurrently using only a synthetic, nonpersonal fixture."""
+    frame = Image.new("RGB", (800, 500), (250, 250, 250))
+    ImageDraw.Draw(frame).text((40, 40), "Synthetic test page: quarterly report", fill="black")
 
     async def caption() -> str:
-        job = EnrichJob(frames=[frame], app=app or "Test", window_title=title or "Test window", url="",
-                        screen_text=screen_text or "A test page.", counts=dict.fromkeys(("keys", "clicks", "scrolls",
+        job = EnrichJob(frames=[frame], app="Test", window_title="Test window", url="",
+                        screen_text="A synthetic test page.", counts=dict.fromkeys(("keys", "clicks", "scrolls",
                                                                                         "clipboard"), 0))
         data = await complete_json(caption_endpoint(), vlm_messages(job), max_tokens=VLM_MAX_TOKENS)
         return _need(data, "caption")

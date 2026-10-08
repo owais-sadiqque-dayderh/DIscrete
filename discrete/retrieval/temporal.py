@@ -6,11 +6,11 @@ import re
 from dataclasses import dataclass
 
 from .. import textkit as tk
-from ..config import _typed
+from ..config import T, _typed
 from ..models import AttentionMoment, Hit, RetrievalResult
 from ..page_identity import canonical_url
 from ..store import Store
-from ..timeutil import to_local
+from ..timeutil import from_local, now, to_local
 from .query import EventQueryPlan, RelativeEvent
 
 _ANCHOR = "relative event anchor"
@@ -71,15 +71,18 @@ def _url(raw: str) -> str:
                                  if re.match(r"^[a-z][a-z0-9+.-]*://", raw, re.I) else "")
 
 
-def _hit(moment: AttentionMoment, *, via: str) -> Hit:
+def _hit(moment: AttentionMoment, *, via: str, terms: list[str] | None = None) -> Hit:
+    from .hybrid import source_windows
+
     fields = moment.fields
     title = f"{moment.app} — {moment.title}" if moment.title != moment.app else moment.app
-    # Keep actual command lines, including lines beyond materialize's normal
-    # screen-text truncation, so the verifier can see the anchor evidence.
-    body = "\n".join(p for p in (fields.get("caption", ""), fields.get("screen_text", "")) if p)
+    # The event's own lines, wherever they are on the screen, so the verifier can see
+    # the anchor evidence; not the whole screen (it goes to a remote verifier).
+    screen, spans = source_windows(fields.get("screen_text", "") or "", terms or [])
+    body = "\n".join(p for p in (fields.get("caption", ""), screen) if p)
     return Hit("observation", moment.observation_id, title[:120], body, strong=True,
                occurred_at=moment.at, occurred_to=moment.ended_at, untrusted=True,
-               url=fields.get("url", ""), via=via)
+               url=fields.get("url", ""), via=via, source_spans=spans)
 
 
 def _moment_score(moment: AttentionMoment, event: RelativeEvent) -> float:
@@ -146,7 +149,8 @@ async def resolve_anchor(store: Store, plan: EventQueryPlan) -> EventAnchor | No
                 ids.update(r["observation_id"] for r in await store.evidence_for_claim(row["id"]))
             summaries += list((await materialize(store, kind, [row["id"]])).values())
     moments = await store.effect_moments(terms, observation_ids=ids, interval=plan.interval, limit=1000)
-    candidates = [EventAnchor(_hit(m, via=_ANCHOR), score, m.session_id, _identity(m))
+    words = list(dict.fromkeys(terms + tk.content_tokens(event.phrase)))  # stems and the words as typed
+    candidates = [EventAnchor(_hit(m, via=_ANCHOR, terms=words), score, m.session_id, _identity(m))
                   for m in moments if (score := _moment_score(m, event)) > 0]
     if candidates:
         best = max(a.score for a in candidates)
@@ -220,10 +224,73 @@ def temporal_answer(result: RetrievalResult) -> None:
     """Build plain output only after support verification kept the anchor and visits."""
     if not isinstance(result.plan, EventQueryPlan) or not result.hits:
         return
-    if result.hits[0].via != _ANCHOR:
+    if any(h.verification == "timed_out" for h in result.hits):
+        return  # The writer must hedge, rather than emit an unverified plain list.
+    if result.hits[0].via != _ANCHOR or not result.hits[0].eligible:
         # A verified neighbor without the event does not establish this boundary.
         result.hits = []
         return
-    neighbors = [h for h in result.hits[1:] if h.via.startswith("right ") and h.strong]
+    neighbors = [h for h in result.hits[1:] if h.via.startswith("right ") and h.eligible]
     if neighbors:
         result.page_answer = "\n".join(f"- {h.title} ({to_local(h.occurred_at):%H:%M:%S})" for h in neighbors)
+
+
+async def clock_timeline(store: Store, result: RetrievalResult) -> bool:
+    """Clock-only recall uses the latest captured day with visits near that clock."""
+    plan = result.plan
+    match = re.search(r"\b(\d{1,2}):(\d{2})\s*(am|pm)?\b", result.query, re.I)
+    if plan.intent not in ("recall", "temporal"):
+        return False
+    midnight = bool(re.search(r"\baround midnight\b", result.query, re.I) and plan.interval)
+    if midnight:
+        center = sum(plan.interval) / 2
+    elif plan.interval is not None or not match:
+        return False
+    if not midnight:
+        return await _clock_only(store, result, match)
+    return await _clock_hits(store, result, center)
+
+
+async def _clock_only(store: Store, result: RetrievalResult, match) -> bool:
+    hour, minute = int(match[1]), int(match[2])
+    if hour > 23 or minute > 59 or (match[3] and not 1 <= hour <= 12):
+        return False
+    if match[3]:
+        hour = hour % 12 + (12 if match[3].lower() == "pm" else 0)
+    target = hour * 60 + minute
+    rows = await store.q(
+        "WITH clocks AS (SELECT s.started_at, "
+        "CAST(strftime('%H',s.started_at,'unixepoch','localtime') AS INTEGER)*60 + "
+        "CAST(strftime('%M',s.started_at,'unixepoch','localtime') AS INTEGER) AS minute "
+        "FROM sightings s JOIN observations o ON o.id=s.obs_id WHERE o.origin='user' AND s.started_at<=?) "
+        "SELECT started_at FROM clocks WHERE MIN(ABS(minute-?),1440-ABS(minute-?))<=5 "
+        "ORDER BY started_at DESC LIMIT 1", (now(), target, target))
+    if not rows:
+        return False
+    visit = rows[0]["started_at"]
+    center = from_local(to_local(visit).replace(hour=hour, minute=minute, second=0, microsecond=0))
+    if center - visit > 43200:
+        center -= 86400
+    elif visit - center > 43200:
+        center += 86400
+    return await _clock_hits(store, result, center)
+
+
+async def _clock_hits(store: Store, result: RetrievalResult, center: float) -> bool:
+    plan = result.plan
+    plan.intent = "temporal"
+    plan.interval = plan.interval or (center - 180, center + 180)
+    moments = await store.attention_moments(*plan.interval)
+    moments.sort(key=lambda m: abs(m.at - center))
+    seen = set()
+    for moment in moments:
+        identity = _identity(moment)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.hits.append(_hit(moment, via="captured near requested clock time"))
+        if len(result.hits) >= T.TOP_K:
+            break
+    result.hits.sort(key=lambda h: h.occurred_at)
+    result.exhaustive = True
+    return bool(result.hits)

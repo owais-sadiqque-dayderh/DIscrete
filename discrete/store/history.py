@@ -74,6 +74,14 @@ class HistoryMixin(StoreBase):
                    created: Sequence[int] = (), changes: Sequence[dict | None] = (), reason: str = "",
                    run_id: str = "", data: dict | None = None) -> int:
         changes = [c for c in changes if c]
+        withdrawn = {c["id"] for c in changes if c.get("after", {}).get("status") in DEAD
+                     or c.get("after", {}).get("flag") == "contested"}
+        if withdrawn:
+            changes += self._withdraw_dependents(conn, withdrawn)
+            if op != "merge":  # a merge only rewords; everything else may leave a page quoting a withdrawn claim
+                self._dirty_entity_pages(conn, {c["id"] for c in changes
+                                                if c.get("after", {}).get("status") in DEAD
+                                                or c.get("after", {}).get("flag") == "contested"})
         cur = conn.execute(
             "INSERT INTO memory_events(at, op, actor, claim_id, created, changes, reason, run_id, data) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
@@ -85,6 +93,17 @@ class HistoryMixin(StoreBase):
         conn.executemany("INSERT OR IGNORE INTO memory_event_refs(event_id, claim_id) VALUES (?, ?)",
                          [(eid, cid) for cid in refs])
         return eid
+
+    def _dirty_entity_pages(self, conn, claim_ids: set[int]) -> None:
+        """Generated entity pages are not authority: clear any page that may quote a withdrawn claim
+        (and its search rows), so it is rebuilt from the claims that remain."""
+        for (eid,) in conn.execute(
+                f"SELECT DISTINCT m.entity_id FROM mentions m JOIN entities e ON e.id=m.entity_id "
+                f"WHERE m.ref_kind='claim' AND m.ref_id IN ({_ph(sorted(claim_ids))}) AND e.summary != ''",
+                sorted(claim_ids)).fetchall():
+            conn.execute("UPDATE entities SET summary='', page_updated_at=0, updated_at=? WHERE id=?", (now(), eid))
+            self._refresh_entity_fts(conn, eid)
+            self._enqueue(conn, "entity", eid)
 
     # ------------------------------------------------------------------ reading
 
@@ -128,9 +147,11 @@ class HistoryMixin(StoreBase):
         """The evidence rows a change added and evicted (in full, so a revert can put them
         back), plus untracked columns it changed (occurred_to, derived_from, flag)."""
         after = self._evidence_rows(conn, claim_id)
+        # A row updated in place is both removed (its old form) and added (its new one).
+        changed = {o for o in set(after) & set(before) if after[o] != before[o]}
         change: dict = {"id": claim_id,
-                        "evidence_added_rows": [after[o] for o in sorted(set(after) - set(before))],
-                        "evidence_removed_rows": [before[o] for o in sorted(set(before) - set(after))]}
+                        "evidence_added_rows": [after[o] for o in sorted((set(after) - set(before)) | changed)],
+                        "evidence_removed_rows": [before[o] for o in sorted((set(before) - set(after)) | changed)]}
         if fields_before is not None:
             change["fields_before"], change["fields_after"] = fields_before, fields_after or {}
         return change
@@ -191,6 +212,8 @@ class HistoryMixin(StoreBase):
                 if ev["undone_by"] is not None:
                     raise RevertConflict(f"event {event_id} was already reverted by event {ev['undone_by']}")
                 data = json.loads(ev["data"] or "{}")
+                if data.get("erased"):
+                    raise RevertConflict(f"event {event_id} was erased with the memory it changed")
                 if ev["op"] == "redo":
                     raise RevertConflict(f"#{event_id} re-applied #{data.get('reapplies')}; revert that event instead")
                 changes = json.loads(ev["changes"])
@@ -203,7 +226,7 @@ class HistoryMixin(StoreBase):
                         f"AND NOT (e.op = 'redo' AND json_extract(e.data, '$.reapplies') = ?) "
                         f"AND r.claim_id IN ({_ph(touched)})", (event_id, event_id, *touched)).fetchall() \
                         if touched else []
-                    if ev["op"] == "profile":
+                    if ev["op"] == "profile" or "profile_before" in data:
                         later += conn.execute("SELECT id, op FROM memory_events WHERE id > ? AND op='profile' "
                                               "AND undone_by IS NULL", (event_id,)).fetchall()
                     if later:
@@ -223,7 +246,11 @@ class HistoryMixin(StoreBase):
                     if data.get("links"):
                         conn.execute(f"UPDATE links SET status='live' WHERE id IN ({_ph(data['links'])})",
                                      data["links"])
+                    for r in data.get("links_overwritten", []):
+                        self._restore_link(conn, r["id"], r["after"])
                     if "profile_was" in data:
+                        if not force and self._current_profile(conn) != data["profile_was"]:
+                            raise RevertConflict("the profile was rewritten after the undo; redo would discard it")
                         self._set_profile(conn, data["profile_set"])
                     rid = self._log_event(conn, "redo", "user", claim_id=ev["claim_id"], changes=out,
                                           reason=reason or f"re-applied #{original} (reverted by #{event_id})",
@@ -238,18 +265,33 @@ class HistoryMixin(StoreBase):
                 conn.execute("DELETE FROM suppressions WHERE event_id=?", (event_id,))
                 links = [r[0] for r in conn.execute("SELECT id FROM links WHERE event_id=? AND status='live'",
                                                     (event_id,))]
+                # A link this event overwrote goes back to its predecessor rather than being retired.
+                before_rows = {r["id"]: r for r in data.get("links_before", [])}
+                side["links_overwritten"] = []
+                for lid in [x for x in links if x in before_rows]:
+                    current = conn.execute("SELECT * FROM links WHERE id=?", (lid,)).fetchone()
+                    side["links_overwritten"].append({"id": lid, "after": dict(current)})
+                    self._restore_link(conn, lid, before_rows[lid])
+                links = [x for x in links if x not in before_rows]
                 side["links"] = links
                 if links:
                     conn.execute(f"UPDATE links SET status='reverted' WHERE id IN ({_ph(links)})", links)
-                if ev["op"] == "profile":
-                    side["profile_was"], side["profile_set"] = data.get("previous"), self._current_profile(conn)
-                    self._set_profile(conn, data.get("previous"))
+                if ev["op"] == "profile" or "profile_before" in data:
+                    previous = data.get("previous") if ev["op"] == "profile" else data["profile_before"]
+                    side["profile_was"], side["profile_set"] = previous, self._current_profile(conn)
+                    self._set_profile(conn, previous)
                 rid = self._log_event(conn, "revert", "user", claim_id=ev["claim_id"], changes=out,
                                       reason=reason or f"revert of #{event_id} ({ev['op']})", data=side)
                 conn.execute("UPDATE memory_events SET undone_by=? WHERE id=?", (rid, event_id))
                 return rid
 
         return await self._call(_run)
+
+    @staticmethod
+    def _restore_link(conn, link_id: int, row: dict) -> None:
+        cols = ("confidence", "reason", "evidence", "status", "event_id", "created_at")
+        conn.execute(f"UPDATE links SET {', '.join(f'{c}=?' for c in cols)} WHERE id=?",
+                     (*(row[c] for c in cols), link_id))
 
     def _recompute_after_revert(self, conn, claim_id: int) -> None:
         """Hook for ClaimsMixin: confidence follows evidence."""

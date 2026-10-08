@@ -16,16 +16,18 @@ from .invariants import check_store
 
 async def cmd_check(args: argparse.Namespace) -> int:
     try:
-        report = await asyncio.to_thread(check_store, args.db or db_path(), expect=args.expect, slo=args.slo)
+        report = await asyncio.to_thread(check_store, args.db or db_path(), expect=args.expect, slo=args.slo,
+                                         release=getattr(args, "release", False))
     except (OSError, ValueError, sqlite3.Error, yaml.YAMLError) as exc:
         print(f"check: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(report.to_dict(), indent=2))
-    return 0 if report.passed else 1
+    return 0 if (report.release_passed if getattr(args, "release", False) else report.passed) else 1
 
 
 def register_check(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("check", help="read-only store invariants and optional latency SLOs")
     parser.add_argument("--expect", metavar="FILE", help="YAML expected claims and capture/chrome thresholds")
     parser.add_argument("--slo", action="store_true", help="check per-stage latency SLOs; unmeasured stages report n/a")
+    parser.add_argument("--release", action="store_true", help="require measured checks, live SLOs and full index readiness")
     parser.set_defaults(func=cmd_check)

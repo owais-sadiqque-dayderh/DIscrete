@@ -14,21 +14,44 @@ import time
 import numpy as np
 
 from .. import textkit as tk
+from ..capture import privacy
 from ..config import T
 from ..llm import EXPECTED_ERRORS, NotConfigured, embed
 from ..perf import PERF, since_ms
 from ..store import Store
+from ..store.index import embedding_text
 
 log = logging.getLogger("discrete.process.embed")
 
 
+def source_denied(row) -> str:
+    """Today's privacy policy for a stored observation, as pages apply it: capture
+    applied the policy of its own day, and a newly denied app or site must not leave
+    the machine from history (drafting, embedding)."""
+    return privacy.denied(row["app"], row["bundle_id"], row["url"]) or \
+        (privacy.denied(url="https://" + row["site"]) if row["site"] else "")
+
+
+async def policy_blocked(store: Store, kind: str, rid: int) -> bool:
+    """Whether a row's text comes from an observation today's policy denies."""
+    if kind == "observation":
+        rows = await store.q("SELECT * FROM observations WHERE id=?", (rid,))
+    elif kind == "claim":
+        rows = await store.q("SELECT o.* FROM observations o JOIN evidence e ON e.observation_id=o.id "
+                             "WHERE e.claim_id=?", (rid,))
+    elif kind == "episode":
+        rows = await store.observations_for_episode(rid)
+    else:
+        return False  # entity names and pages are filtered where they are built (store/pages.py)
+    return any(source_denied(r) for r in rows)
+
+
 def observation_text(row) -> str:
-    parts = (row["window_title"], row["page_title"], row["site"], row["caption"], row["screen_text"])
-    return tk.truncate("\n".join(p for p in parts if p), T.EMBED_TEXT_CHARS)
+    return embedding_text("observation", row)
 
 
 def claim_text(text: str, context: str) -> str:
-    return tk.truncate(f"{text}\n{context}".strip(), T.EMBED_TEXT_CHARS)
+    return embedding_text("claim", {"text": text, "context": context})
 
 
 async def text_for(store: Store, kind: str, rid: int) -> str | None:
@@ -47,12 +70,12 @@ async def text_for(store: Store, kind: str, rid: int) -> str | None:
         r = await store.get_episode(rid)
         if not r or r["status"] != "closed":
             return None
-        return tk.truncate(f"{r['title']}\n{r['summary']}".strip(), T.EMBED_TEXT_CHARS)
+        return embedding_text(kind, r)
     if kind == "entity":
         r = await store.get_entity(rid)
         if not r or r["merged_into"] is not None:
             return None
-        return tk.truncate(f"{r['name']}\n{r['summary']}".strip(), T.EMBED_TEXT_CHARS)
+        return embedding_text(kind, r)
     return None
 
 
@@ -66,6 +89,10 @@ async def embed_row(store: Store, kind: str, rid: int, text: str) -> np.ndarray 
     text; on failure returns None and leaves the row in the outbox for a retry."""
     if not text.strip():
         return None
+    if await policy_blocked(store, kind, rid):
+        await store.outbox_discard(kind, rid)
+        await store.bump_metric("embed_policy_blocked")
+        return None
     th = tk.content_hash(text)
     if (have := await store.get_vector(kind, rid, th)) is not None:
         return _unit(have)
@@ -74,7 +101,8 @@ async def embed_row(store: Store, kind: str, rid: int, text: str) -> np.ndarray 
     except (NotConfigured, *EXPECTED_ERRORS) as exc:
         log.debug("embed %s:%s deferred to the outbox: %s", kind, rid, exc)
         return None
-    await store.save_embeddings([(kind, rid, vec, th)])
+    if not await store.save_embeddings([(kind, rid, vec, th)], current=True):
+        return None  # the row changed or went away while the call was out
     return _unit(vec)
 
 
@@ -89,6 +117,10 @@ async def drain_once(store: Store, *, limit: int | None = None) -> int:
         if not text or not text.strip():
             await store.outbox_discard(kind, rid)
             continue
+        if await policy_blocked(store, kind, rid):
+            await store.outbox_discard(kind, rid)
+            await store.bump_metric("embed_policy_blocked")
+            continue
         texts.append(text)
         refs.append((kind, rid))
     if not texts:
@@ -99,7 +131,8 @@ async def drain_once(store: Store, *, limit: int | None = None) -> int:
         log.warning("embed batch failed: %s", exc)
         await store.outbox_failed(refs)
         return 0
-    await store.save_embeddings([(k, r, v, tk.content_hash(t)) for (k, r), v, t in zip(refs, vectors, texts, strict=True)])
+    await store.save_embeddings([(k, r, v, tk.content_hash(t)) for (k, r), v, t in zip(refs, vectors, texts, strict=True)],
+                                current=True)
     return len(vectors)
 
 

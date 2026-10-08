@@ -96,7 +96,7 @@ def interactive() -> Iterator[None]:
 class UsageMeter:
     """In-memory per-component running totals, drained into the store."""
 
-    FIELDS = ("calls", "prompt_tokens", "completion_tokens", "cost")
+    FIELDS = ("calls", "prompt_tokens", "completion_tokens", "cost", "unknown_cost_calls")
 
     def __init__(self) -> None:
         self._data: dict[str, dict[str, float]] = {}
@@ -118,6 +118,8 @@ class UsageMeter:
         prompt, completion = int(get("prompt_tokens", 0) or 0), int(get("completion_tokens", 0) or 0)
         cost = get("cost", None)
         cost = float(cost) if isinstance(cost, int | float) else None
+        if cost is not None and (not math.isfinite(cost) or cost < 0):
+            cost = None
         self.add(component, prompt_tokens=prompt, completion_tokens=completion, cost=cost or 0.0)
         rec = _CURRENT.get()
         if rec is not None and rec.component == component:
@@ -137,14 +139,29 @@ class UsageMeter:
 METER = UsageMeter()
 
 
+_PENDING_BATCH = None
+_FLUSH_LOCK = asyncio.Lock()
+
+
 async def flush_usage(store: Any) -> None:
-    """Move usage totals and per-call/per-stage measurements into `store`."""
-    usage = METER.drain()
-    if usage:
-        await store.record_usage(usage)
-    calls, samples = PERF.drain()
-    if calls or samples:
-        await store.record_perf(calls, samples)
+    """Atomically persist usage/perf; retain one idempotent batch until acknowledged.
+
+    A cancellation can arrive after SQL committed. Retrying the same batch id
+    avoids both losing that batch and counting it twice.
+    """
+    import uuid
+
+    global _PENDING_BATCH
+    async with _FLUSH_LOCK:
+        for _ in range(2):  # a retained batch, then newly buffered measurements
+            if _PENDING_BATCH is None:
+                usage = METER.drain()
+                calls, samples = PERF.drain()
+                if not (usage or calls or samples):
+                    return
+                _PENDING_BATCH = (uuid.uuid4().hex, usage, calls, samples)
+            await store.record_telemetry(*_PENDING_BATCH)
+            _PENDING_BATCH = None
 
 
 def _status(exc: BaseException) -> str:
@@ -166,6 +183,9 @@ def _metered(ep: Endpoint) -> Iterator[Call]:
     finally:
         rec.ms = (time.perf_counter() - t0) * 1000
         _CURRENT.reset(token)
+        if rec.cost is None:
+            d = METER._data.setdefault(ep.name, dict.fromkeys(METER.FIELDS, 0))
+            d["unknown_cost_calls"] += 1
         PERF.call(rec)
 
 

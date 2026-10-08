@@ -235,7 +235,7 @@ async def test_chain_records_require_support_and_adjacent_rejection_fails_closed
 async def test_non_why_unchanged_and_effect_alone_cannot_answer_why(store, fake):
     await obs(store, 0, "Quartz report")
     assert (await resolve_why(store, "what did I read?")).reason == "not a why question"
-    hit = Hit("observation", 1, "Quartz", "", strong=True)
+    hit = Hit("observation", 1, "Quartz", "", strong=True, verification="verified")
     assert evaluate(RetrievalResult("what did I read?", QueryPlan("", intent="recall"), [hit])).mode == "grounded"
     assert evaluate(RetrievalResult("why did I open Quartz?", QueryPlan("", intent="why"), [hit])).mode == "thin"
     assert fake.calls == []
@@ -416,7 +416,6 @@ async def test_debug_cli_backfill_does_not_call_models(store, tmp_db, fake, monk
 async def test_cancelled_graph_pass_does_not_reopen_committed_episode(store, fake, monkeypatch):
     import asyncio
 
-    from discrete.config import Endpoint
     from discrete.process import provenance
     from discrete.process.pipeline import ProcessPipeline
 
@@ -425,7 +424,6 @@ async def test_cancelled_graph_pass_does_not_reopen_committed_episode(store, fak
     await store.execute("UPDATE observations SET episode_id=? WHERE id=?", (ep, oid))
     await store.mark_episode_ready(ep)
     pipe = ProcessPipeline(store)
-    pipe.ep = Endpoint("insight", "", "", "")
 
     async def cancel(*args):
         raise asyncio.CancelledError

@@ -6,6 +6,7 @@ import asyncio
 import threading
 
 import pytest
+from PIL import Image
 
 from discrete import llm
 from discrete.capture.enrich import Enricher
@@ -156,7 +157,7 @@ def test_ocr_reads_document_even_when_ax_chrome_exceeds_threshold(tmp_path, monk
     monkeypatch.setattr(ax, "read_screen_text", lambda *args, **kw: "Window chrome " * 30)
     monkeypatch.setattr(ocr, "ocr_image", lambda image: "Scanned document content")
     observer = ScreenObserver(queue=asyncio.Queue())
-    text, source = observer._screen_text(ax.WindowContext(), None)
+    text, source = observer._screen_text(ax.WindowContext(), Image.new("RGB", (64, 64), "white"))
     assert text.startswith("Scanned document content") and source == "ax+ocr"
     observer.grabber.close()
 
@@ -274,8 +275,9 @@ async def test_incomplete_merge_decisions_do_not_silently_add_conflicting_prefer
     import discrete.process.pipeline as pipeline
     from discrete.models import ClaimDraft
     from discrete.process.pipeline import _Durable
+    candidate = {"id": 7, "text": "The user prefers concise notes.", "context": "", "occurred_from": 0, "occurred_to": 0}
     durable = _Durable(ClaimDraft(kind="preference", text="The user prefers detailed notes."),
-                       text="The user prefers detailed notes.", candidates=[{"id": 7, "text": "The user prefers concise notes."}])
+                       text="The user prefers detailed notes.", candidates=[candidate])
 
     async def incomplete(*args, **kwargs):
         return {"relations": []}

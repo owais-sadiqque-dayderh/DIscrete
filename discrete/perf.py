@@ -61,6 +61,8 @@ class _Timer:
 class PerfLog:
     def __init__(self) -> None:
         self.source = "live"
+        self._dropped_calls = 0
+        self._dropped_samples = 0
         # AX/text helpers emit health events from worker threads while the runtime
         # flushes. Keep snapshot-and-clear atomic so those events cannot disappear.
         self._lock = threading.Lock()
@@ -70,15 +72,21 @@ class PerfLog:
     def call(self, rec: Call) -> None:
         rec.source = rec.source or self.source
         with self._lock:
+            if len(self._calls) == self._calls.maxlen:
+                self._dropped_calls += 1
             self._calls.append(rec)
 
     def sample(self, stage: str, ms: float, *, n: int | None = None, ref_id: int | None = None) -> None:
         with self._lock:
+            if len(self._samples) == self._samples.maxlen:
+                self._dropped_samples += 1
             self._samples.append(Sample(stage, float(ms), time.time(), n, ref_id, self.source))
 
     def count(self, name: str, n: int = 1) -> None:
         if n:
             with self._lock:
+                if len(self._samples) == self._samples.maxlen:
+                    self._dropped_samples += 1
                 self._samples.append(Sample(name, None, time.time(), int(n), None, self.source))
 
     @contextmanager
@@ -94,6 +102,10 @@ class PerfLog:
             calls, samples = list(self._calls), list(self._samples)
             self._calls.clear()
             self._samples.clear()
+            for name, n in (("calls", self._dropped_calls), ("samples", self._dropped_samples)):
+                if n:
+                    samples.append(Sample(f"telemetry.dropped_{name}", None, time.time(), n, None, self.source))
+            self._dropped_calls = self._dropped_samples = 0
         return calls, samples
 
 

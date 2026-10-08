@@ -510,30 +510,39 @@ def _web_visible_text(web_area, viewport: tuple[float, float, float, float], dea
     return text if text.count("\n") >= 2 or len(text) < 200 else ""
 
 
-def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: int,
+class AXText(str):
+    """Text plus extraction state; still usable by existing string readers."""
+
+    def __new__(cls, text: str, *, complete: bool = True):
+        value = super().__new__(cls, text)
+        value.complete = complete
+        return value
+
+
+def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: int | None,
                      viewport: tuple[float, float, float, float] | None = None) -> str:
     """AX text walk of the focused window of `pid`. Empty when AX is not trusted."""
     if not _HAS_QUARTZ:
         PERF.count("health.capture_ax_empty.unavailable")
-        return ""
+        return AXText("", complete=False)
     if not pid:
         PERF.count("health.capture_ax_empty.no_pid")
-        return ""
+        return AXText("", complete=False)
     if not accessibility_granted():
         PERF.count("health.capture_ax_empty.untrusted")
-        return ""
+        return AXText("", complete=False)
     try:
         app_el = AXUIElementCreateApplication(pid)
         _enable_full_tree(app_el, pid)
         win = _ax_get(app_el, "AXFocusedWindow")
         if win is None:
             PERF.count("health.capture_ax_empty.no_window")
-            return ""
+            return AXText("", complete=False)
         if viewport:
             p, s = _node_frame(win)
             if p is not None and s is not None and any(abs(a - b) > 2 for a, b in zip((*p, *s), viewport, strict=True)):
                 PERF.count("health.capture_ax_empty.viewport_mismatch")
-                return ""  # another window of the same app gained focus; trust captured pixels
+                return AXText("", complete=False)  # another window of the same app gained focus; trust captured pixels
         if viewport is None:
             p, s = _node_frame(win)
             if p is not None and s is not None:
@@ -548,9 +557,9 @@ def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: in
             if web_area is not None:
                 visible_text = _web_visible_text(web_area, viewport, deadline)
                 if visible_text:
-                    if len(visible_text) >= max_chars:
+                    if max_chars is not None and len(visible_text) >= max_chars:
                         PERF.count("health.capture_ax_text_truncated")
-                    return visible_text[:max_chars]
+                    return AXText(visible_text[:max_chars], complete=max_chars is None or len(visible_text) < max_chars)
         parts: list[str] = []
         deferred: list[str] = []
         meta: list[tuple] = []
@@ -574,13 +583,13 @@ def read_screen_text(pid: int, *, max_nodes: int, timeout_ms: int, max_chars: in
         if not text:
             reason = "deadline" if expired else "node_limit" if exhausted else "no_text"
             PERF.count(f"health.capture_ax_empty.{reason}")
-        if len(text) >= max_chars:
+        if max_chars is not None and len(text) >= max_chars:
             PERF.count("health.capture_ax_text_truncated")
-        return text[:max_chars]
+        return AXText(text[:max_chars], complete=not (expired or exhausted) and (max_chars is None or len(text) < max_chars))
     except Exception as exc:
         log.debug("read_screen_text failed: %s", exc)
         PERF.count("health.capture_ax_empty.error")
-        return ""
+        return AXText("", complete=False)
 
 
 # ------------------------------------------------------------ focused field (Bubble)

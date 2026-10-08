@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
+import re
 import time
 
 import numpy as np
@@ -21,9 +23,9 @@ from ..timeutil import age_days, day_key, now, to_local
 from .enumerate import enumerate_pages
 from .page_activity import page_activity
 from .query import EventQueryPlan, build_plan, fallback_plan, page_request, relative_event
-from .rerank import llm_rerank
+from .rerank import llm_rerank, valid_order
 from .support import verify_support
-from .temporal import relative_timeline, temporal_answer
+from .temporal import clock_timeline, relative_timeline, temporal_answer
 from .why import chain_hits, resolve_why
 
 log = logging.getLogger("discrete.retrieval.hybrid")
@@ -33,7 +35,7 @@ def is_dense_hit(h: Hit) -> bool:
     return h.dense_sim >= T.DENSE_HIT_THRESHOLD
 
 
-async def materialize(store: Store, kind: str, ids: list[int]) -> dict[int, Hit]:
+async def materialize(store: Store, kind: str, ids: list[int], *, terms: list[str] | None = None) -> dict[int, Hit]:
     """Live rows as Hits; one query per kind (plus one for claim quotes)."""
     out: dict[int, Hit] = {}
     rows = await store.live_rows(kind, ids)
@@ -53,10 +55,11 @@ async def materialize(store: Store, kind: str, ids: list[int]) -> dict[int, Hit]
         for r in rows:
             name = r["page_title"] or r["window_title"]
             title = f"{r['app']} — {name}".strip(" —") or r["caption"][:80]
-            body = "\n".join(p for p in (r["caption"], tk.truncate(r["screen_text"], 1500)) if p)
+            screen, spans = source_windows(r["screen_text"] or "", terms or [])
+            body = "\n".join(p for p in (tk.truncate(r["caption"], 400), screen) if p)
             out[r["id"]] = Hit("observation", r["id"], title[:120], body, occurred_at=r["started_at"],
                                occurred_to=r["ended_at"], untrusted=True, url=r["url"] or "",
-                               is_listing=bool(r["is_listing"]), navigated_from=r["navigated_from"])
+                               is_listing=bool(r["is_listing"]), navigated_from=r["navigated_from"], source_spans=spans)
     elif kind == "episode":
         for r in rows:
             out[r["id"]] = Hit("episode", r["id"], r["title"] or "episode", r["summary"],
@@ -66,6 +69,68 @@ async def materialize(store: Store, kind: str, ids: list[int]) -> dict[int, Hit]
             out[r["id"]] = Hit("entity", r["id"], r["name"], r["summary"] or r["name"])
     return out
 
+
+
+def source_windows(text: str, terms: list[str]) -> tuple[str, list[tuple[int, int]]]:
+    """Verbatim query windows with offsets into the full stored screen text."""
+    remaining = set(terms)
+    spans: list[tuple[int, int]] = []
+    for _ in range(3):
+        snippet, overlap = tk.best_window(text, remaining, width=30)
+        if not overlap:
+            break
+        offset = text.find(snippet)
+        matches = [m for m in re.finditer(r"\w+", snippet) if m[0].lower() in remaining]
+        if not matches:
+            break
+        center = offset + matches[0].start()
+        start, end = max(0, center - 100), min(len(text), center + 200)
+        remaining -= set(tk.tokens(text[start:end]))
+        if not any(a <= start and end <= b for a, b in spans):
+            spans.append((start, end))
+        if not remaining:
+            break
+    if not spans and text:
+        spans = [(0, min(len(text), 900))]
+    spans.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    return "\n[… ]\n".join(text[a:b] for a, b in merged), merged
+
+
+def wants_details(plan: QueryPlan) -> bool:
+    overview = {"today", "yesterday", "morning", "afternoon", "evening", "week", "last", "activity", "activities",
+                "summary", "summarize", "summarise", "work", "worked", "happened", "everything"}
+    return bool(set(plan.terms) - overview)
+
+
+async def expand_details(store: Store, plan: QueryPlan, hits: list[Hit]) -> None:
+    """Search detailed evidence of relevant episodes before reranking the pack."""
+    if not wants_details(plan):
+        return
+    have = {h.ref_id for h in hits if h.ref_kind == "observation"}
+    ids = []
+    for ep in [h for h in hits if h.ref_kind == "episode"]:
+        for row in await store.observations_for_episode(ep.ref_id):
+            if row["id"] in have:
+                continue
+            text = " ".join((row["window_title"], row["caption"], row["screen_text"]))
+            if set(plan.terms) & set(tk.tokens(text)):
+                ids.append(row["id"])
+                have.add(row["id"])
+            if len(ids) >= T.CANDIDATE_POOL:
+                break
+        if len(ids) >= T.CANDIDATE_POOL:
+            break
+    details = await materialize(store, "observation", ids, terms=plan.terms)
+    for h in details.values():
+        if h.in_interval(plan.interval):
+            h.score = max((ep.score for ep in hits if ep.ref_kind == "episode"), default=0.0)
+            hits.append(h)
 
 def coverage(terms: list[str], text: str, df_info: tuple[dict[str, int], int]) -> float:
     """IDF-weighted share of query terms present (token match, prefix for plurals)."""
@@ -99,12 +164,29 @@ async def retrieve(store: Store, query: str, *, field_text: str = "", progress=N
         result = await _retrieve(store, query, field_text=field_text, progress=progress or _noop)
         with PERF.timer("retrieve.support", n=len(result.hits)):
             await verify_support(result)
+        if result.plan.intent == "enumerate" and not result.plan.page_operation and not result.hits:
+            # A list that found no pages must never answer worse than an ordinary
+            # search on the same subject: the items may be inside pages, not pages.
+            PERF.count("retrieve.enumerate_fallback")
+            plan = dataclasses.replace(result.plan, intent="recall")
+            result = await _retrieve(store, query, field_text=field_text, progress=progress or _noop, plan=plan)
+            await verify_support(result)
         temporal_answer(result)
         t.n = len(result.hits)
     return result
 
 
-async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> RetrievalResult:
+async def _retrieve(store: Store, query: str, *, field_text: str, progress,
+                    plan: QueryPlan | None = None) -> RetrievalResult:
+    if plan is not None:
+        result = RetrievalResult(query=query, plan=plan)
+        if await _short_interval(store, plan, result):
+            return result
+        return await _search(store, plan, result, field_text=field_text, progress=progress,
+                             qvec=await try_embed(query))
+    clock_result = RetrievalResult(query=query, plan=fallback_plan(query))
+    if await clock_timeline(store, clock_result):
+        return clock_result
     unresolved_event = False
     structural = fallback_plan(query) if relative_event(query) else None
     if isinstance(structural, EventQueryPlan):
@@ -140,16 +222,25 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> R
             await enumerate_pages(store, plan, result, await qvec_task)
         return result
 
+    if await _short_interval(store, plan, result):
+        qvec_task.cancel()
+        return result
+    return await _search(store, plan, result, field_text=field_text, progress=progress, qvec=await qvec_task)
+
+
+async def _short_interval(store: Store, plan: QueryPlan, result: RetrievalResult) -> bool:
+    """Every episode of a short interval, when there are any (planS3 §4.4)."""
     if plan.interval and plan.interval[1] - plan.interval[0] <= T.EXHAUSTIVE_MAX_SPAN_S and plan.intent in ("temporal", "recall"):
         await _exhaustive(store, plan, result)
-        if result.hits:
-            qvec_task.cancel()
-            return result
+        return bool(result.hits)
+    return False
 
+
+async def _search(store: Store, plan: QueryPlan, result: RetrievalResult, *, field_text: str, progress,
+                  qvec) -> RetrievalResult:
     t_search = time.perf_counter()
     cold = await store.observation_count() < T.COLD_START_ROWS
     df_info = await store.df_lookup(plan.terms)
-    qvec = await qvec_task
     pool: list[Hit] = []
 
     if plan.intent == "aggregate":
@@ -170,7 +261,7 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> R
             rankings.append(list(dense))
         fused = tk.rrf([r for r in rankings if r], k=T.RRF_K)
         ids = [i for i, _ in sorted(fused.items(), key=lambda x: -x[1])[: T.CANDIDATE_POOL]]
-        hits = await materialize(store, kind, ids)
+        hits = await materialize(store, kind, ids, terms=plan.terms)
         for rid in ids:
             h = hits.get(rid)
             if h is None or (kind, rid) in seen or not h.in_interval(plan.interval):
@@ -186,11 +277,12 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> R
             h.strong = is_dense_hit(h) or (not cold and h.coverage >= T.COVERAGE_STRONG)
             pool.append(h)
 
+    await expand_details(store, plan, pool)
     pool.sort(key=lambda h: -h.score)
     PERF.sample("retrieve.search", since_ms(t_search), n=len(pool))  # BM25 ‖ dense → fused, gated pool
     progress("ranking", len(pool))
     with PERF.timer("retrieve.rerank", n=len(pool)):
-        pool = await _rerank(query, pool, cold)
+        pool = await _rerank(result.query, pool, cold)
     with PERF.timer("retrieve.mmr"):
         result.hits = await _mmr(store, pool, T.TOP_K)
     await expand_tasks(store, result)
@@ -386,10 +478,14 @@ async def _rerank(query: str, pool: list[Hit], cold: bool) -> list[Hit]:
     docs = [tk.truncate(h.text, T.RERANK_MAX_TOKENS * 4) for h in head]
     try:
         order = await rerank(query, docs, len(docs))
-    except (NotConfigured, *EXPECTED_ERRORS) as exc:
-        log.debug("rerank unavailable: %s", exc)
+    except (NotConfigured, *EXPECTED_ERRORS, KeyError, TypeError, ValueError) as exc:
+        # The last three: a malformed provider payload (llm.py parses it unchecked).
+        log.debug("rerank unavailable: %s", type(exc).__name__)
         order = await llm_rerank(query, docs) or []
+    order = valid_order(order, len(head))
     if not order:
+        if order is None:
+            log.debug("rerank returned a malformed order; keeping the fused ranking")
         return pool
     ranked = []
     for idx, score in order:
@@ -450,6 +546,9 @@ async def _exhaustive(store: Store, plan: QueryPlan, result: RetrievalResult) ->
         when = f"{to_local(ep['started_at']):%H:%M}–{to_local(ep['ended_at']):%H:%M}"
         result.hits.append(Hit("episode", ep["id"], f"{when} {title}", body, score=1.0, strong=True,
                                occurred_at=ep["started_at"], occurred_to=ep["ended_at"]))
+    if wants_details(plan):
+        await expand_details(store, plan, result.hits)
+        result.hits.sort(key=lambda h: h.ref_kind != "observation")
     digest = await store.get_digest(day_key(start))
     if digest:
         result.digest = digest["text"]
@@ -467,7 +566,7 @@ async def brute_verify(store: Store, plan: QueryPlan, exclude: set[tuple[str, in
         if qvec is not None:
             dense = dict(await store.dense_search(kind, qvec, limit=10_000, min_sim=T.DENSE_HIT_THRESHOLD))
         ids = list(dict.fromkeys(ids + list(dense)))
-        hits = await materialize(store, kind, [i for i in ids if (kind, i) not in exclude])
+        hits = await materialize(store, kind, [i for i in ids if (kind, i) not in exclude], terms=plan.terms)
         for rid, h in hits.items():
             if dense.get(rid, 0.0) >= T.DENSE_HIT_THRESHOLD or coverage(plan.terms, h.text, df_info) >= T.COVERAGE_STRONG:
                 return f"{kind}:{rid}"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Sequence
 from typing import Any
@@ -60,7 +61,7 @@ class ClaimsMixin(HistoryMixin):
         )
 
     def _cap_evidence(self, conn, claim_id: int) -> None:
-        """planS2 §9: ≤ EVIDENCE_MAX_SUPPORTS supports; cooccurs dropped once ≥3 supports."""
+        """Keep full support membership; only model-facing quote samples are capped."""
         sup = conn.execute(
             "SELECT observation_id, created_at FROM evidence WHERE claim_id=? AND relation='supports' "
             "ORDER BY created_at DESC",
@@ -68,20 +69,21 @@ class ClaimsMixin(HistoryMixin):
         ).fetchall()
         if len(sup) >= 3:
             conn.execute("DELETE FROM evidence WHERE claim_id=? AND relation='cooccurs'", (claim_id,))
-        if len(sup) > T.EVIDENCE_MAX_SUPPORTS:
-            for r in sup[T.EVIDENCE_MAX_SUPPORTS:]:
-                conn.execute("DELETE FROM evidence WHERE claim_id=? AND observation_id=?", (claim_id, r[0]))
 
     def _insert_claim(self, conn, draft: ClaimDraft, *, lineage_id: str, version: int,
                       refines_id: int | None = None, invalidates_id: int | None = None,
-                      derived_from: list[int] | None = None, vector: Vector | None = None) -> int:
+                      derived_from: list[int] | None = None, vector: Vector | None = None,
+                      allow_suppressed: bool = False) -> int:
+        text = tk.truncate(draft.text, T.CLAIM_MAX_CHARS)
+        if not allow_suppressed and self._suppressed(conn, draft.kind, text, vector[0] if vector else None):
+            raise ValueError("claim is suppressed")
         ts = now()
         cur = conn.execute(
             """INSERT INTO claims(lineage_id, version, kind, text, context, reasoning, modality,
                  occurred_from, occurred_to, valid_from, status, episode_id, refines_id, invalidates_id,
                  confidence, derived_from, action, created_at, updated_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,'live',?,?,?,0,?,?,?,?)""",
-            (lineage_id, version, draft.kind, tk.truncate(draft.text, T.CLAIM_MAX_CHARS), draft.context,
+            (lineage_id, version, draft.kind, text, draft.context,
              draft.reasoning, draft.modality, draft.occurred_from or ts, draft.occurred_to or ts,
              draft.occurred_from or ts, draft.episode_id, refines_id, invalidates_id,
              json.dumps(derived_from or []), draft.action, ts, ts),
@@ -134,6 +136,9 @@ class ClaimsMixin(HistoryMixin):
     def _reinforce_claim(self, conn, claim_id: int, draft: ClaimDraft) -> dict:
         """REINFORCE: add verified evidence, extend occurred_to; text untouched (planS2 §6.2).
         Returns the change for the event log: evidence added and evicted by the cap, in full."""
+        current = conn.execute("SELECT kind, text, status FROM claims WHERE id=?", (claim_id,)).fetchone()
+        if current is None or current["status"] != "live" or self._suppressed(conn, current["kind"], current["text"]):
+            raise ValueError("reinforcement target is withdrawn or suppressed")
         before = self._evidence_rows(conn, claim_id)
         old_to = conn.execute("SELECT occurred_to FROM claims WHERE id=?", (claim_id,)).fetchone()[0]
         for ev in draft.evidence:
@@ -151,9 +156,65 @@ class ClaimsMixin(HistoryMixin):
         self._recompute_confidence(conn, claim_id)
 
     def _invalidate_claim(self, conn, claim_id: int, *, by_id: int, at: float) -> dict | None:
+        target = conn.execute("SELECT occurred_to FROM claims WHERE id=?", (claim_id,)).fetchone()
+        incoming = conn.execute("SELECT occurred_to FROM claims WHERE id=?", (by_id,)).fetchone()
+        if target is None or incoming is None or max(at, incoming[0]) < target[0]:
+            return None  # arrival order cannot turn older evidence into a newer truth
         change = self._set_state(conn, claim_id, only_if_live=True, status="invalidated", valid_to=at)
+        if change is None:
+            return None
         conn.execute("UPDATE claims SET invalidates_id=? WHERE id=?", (claim_id, by_id))
         return change
+
+    def _pattern_support_valid(self, conn, category: str, text: str, support: Sequence[int]) -> bool:
+        if not support:
+            return False
+        rows = conn.execute(
+            f"SELECT o.episode_id, o.started_at FROM evidence e JOIN observations o ON o.id=e.observation_id "
+            f"WHERE e.relation='supports' AND e.claim_id IN ({_ph(support)})", list(support)).fetchall()
+        eps = {r[0] for r in rows if r[0] is not None}
+        times = sorted({r[1] for r in rows})
+        days = {day_key(t) for t in times}
+        occasions = (1 + sum(b - a >= T.DREAM_OCCASION_GAP_MIN * 60
+                             for a, b in zip(times, times[1:], strict=False))) if times else 0
+        frequency = re.search(r"\b(?:always|daily|every ?day|each day|every (?:morning|evening|night|week)|"
+                              r"regularly|routinely|usually|habitually|constantly|never)\b", text, re.I)
+        return (len(eps) >= T.DREAM_MIN_EPISODES and occasions >= T.DREAM_MIN_OCCASIONS
+                and (category not in {"habit", "preference"} or len(days) >= T.DREAM_MIN_DAYS)
+                and (not frequency or len(days) >= T.DREAM_FREQUENCY_DAYS))
+
+    def _withdraw_dependents(self, conn, withdrawn: set[int]) -> list[dict]:
+        """Remove copied support immediately, keeping only sufficiently backed inductions.
+        Record the evidence and dependency changes in the triggering event for undo."""
+        changes = []
+        while withdrawn:
+            next_withdrawn = set()
+            for p in conn.execute("SELECT * FROM claims WHERE status='live' AND kind='pattern'").fetchall():
+                support = json.loads(p["derived_from"] or "[]")
+                if not withdrawn.intersection(support):
+                    continue
+                live = [r[0] for r in conn.execute(
+                    f"SELECT id FROM claims WHERE id IN ({_ph(support)}) AND status='live' AND flag!='contested'",
+                    support)]
+                before = self._evidence_rows(conn, p["id"])
+                conn.execute("DELETE FROM evidence WHERE claim_id=?", (p["id"],))
+                if live:
+                    for ev in conn.execute(f"SELECT * FROM evidence WHERE relation='supports' "
+                                           f"AND claim_id IN ({_ph(live)})", live).fetchall():
+                        self._link(conn, p["id"], ev["observation_id"], "supports", ev["quote"], ev["field"])
+                conn.execute("UPDATE claims SET derived_from=?, updated_at=? WHERE id=?",
+                             (json.dumps(sorted(live)), now(), p["id"]))
+                self._recompute_confidence(conn, p["id"])
+                change = self._evidence_change(conn, p["id"], before,
+                    fields_before={"derived_from": p["derived_from"]}, fields_after={"derived_from": json.dumps(sorted(live))})
+                if not self._pattern_support_valid(conn, p["context"], p["text"], live):
+                    state = self._set_state(conn, p["id"], status="retired", valid_to=now())
+                    if state:
+                        change.update(before=state["before"], after=state["after"])
+                    next_withdrawn.add(p["id"])
+                changes.append(change)
+            withdrawn = next_withdrawn
+        return changes
 
     async def live_claims(self, *, kind: str | None = None, limit: int | None = None) -> list[sqlite3.Row]:
         sql, args = "SELECT * FROM claims WHERE status='live'", []
@@ -180,7 +241,8 @@ class ClaimsMixin(HistoryMixin):
 
     async def evidence_for_claim(self, claim_id: int) -> list[sqlite3.Row]:
         return await self.q(
-            "SELECT * FROM evidence WHERE claim_id=? ORDER BY relation='supports' DESC, created_at", (claim_id,)
+            "SELECT * FROM evidence WHERE claim_id=? ORDER BY relation='supports' DESC, created_at DESC LIMIT ?",
+            (claim_id, T.EVIDENCE_MAX_SUPPORTS)
         )
 
     async def consolidate_cluster(self, cluster: list[sqlite3.Row], outputs: list[dict], *,
@@ -199,6 +261,11 @@ class ClaimsMixin(HistoryMixin):
                         r["text"] != by_id[r["id"]]["text"] for r in current):
                     return []  # another draft/refinement already replaced the inputs
                 replaced: dict[int, int] = {}
+                profile_before = self._current_profile(conn)
+                cited = {c for sec in (profile_before or {}).get("sections", []) for point in sec["points"]
+                         for c in point["claims"]}
+                for row in conn.execute("SELECT derived_from FROM claims WHERE status='live' AND kind='pattern'"):
+                    cited.update(json.loads(row[0] or "[]"))
                 for out in outputs[: len(cluster) + 2]:
                     inputs = [int(x) for x in (out.get("input_ids") or []) if int(x) in cluster_ids]
                     text = str(out.get("text") or "").strip()
@@ -214,7 +281,10 @@ class ClaimsMixin(HistoryMixin):
                     ).fetchone()[0] or 1
                     draft = ClaimDraft(
                         kind=primary["kind"], text=text, context=primary["context"],
-                        reasoning="consolidated", modality=primary["modality"], episode_id=primary["episode_id"],
+                        reasoning="consolidated", modality=("stated" if any(by_id[i]["modality"] == "stated"
+                            and tk.norm_key(by_id[i]["text"]) == tk.norm_key(text) for i in inputs)
+                            else "engaged" if any(by_id[i]["modality"] in {"engaged", "stated"} for i in inputs)
+                            else "passive"), episode_id=primary["episode_id"],
                         occurred_from=min(by_id[i]["occurred_from"] for i in inputs),
                         occurred_to=max(by_id[i]["occurred_to"] for i in inputs),
                         evidence=[{"observation_id": r[0], "quote": r[1] if r[2] == "supports" else ""} for r in ev],
@@ -224,17 +294,46 @@ class ClaimsMixin(HistoryMixin):
                     self._carry_mentions(conn, inputs, nid)
                     new_ids.append(nid)
                     for i in inputs:
-                        replaced.setdefault(i, nid)
+                        equivalent = tk.norm_key(by_id[i]["text"]) == tk.norm_key(text)
+                        # input_ids prove support for the output, not entailment of each premise.
+                        # Keep cited or user-stated premises unless equivalence is established.
+                        if equivalent or (i not in cited and by_id[i]["modality"] != "stated"):
+                            replaced.setdefault(i, nid)
                 ts = now()
+                dependencies = self._remap_dependencies(conn, {old: nid for old, nid in replaced.items()
+                    if tk.norm_key(by_id[old]["text"]) == tk.norm_key(
+                        conn.execute("SELECT text FROM claims WHERE id=?", (nid,)).fetchone()[0])})
                 changes = [self._set_state(conn, old, status="superseded", valid_to=ts, superseded_by=nid)
-                           for old, nid in replaced.items()]
+                           for old, nid in replaced.items()] + dependencies
                 if new_ids:
                     self._log_event(conn, "merge", "consolidate", claim_id=new_ids[0], created=new_ids,
                                     changes=changes, run_id=run_id,
-                                    reason=f"merged {len(replaced)} overlapping claims into {len(new_ids)}")
+                                    reason=f"merged {len(replaced)} overlapping claims into {len(new_ids)}",
+                                    data={"profile_before": profile_before, "profile_after": self._current_profile(conn)}
+                                    if profile_before != self._current_profile(conn) else None)
             return new_ids
 
         return await self._call(_run)
+
+    def _remap_dependencies(self, conn, replaced: dict[int, int]) -> list[dict]:
+        changes = []
+        if not replaced:
+            return changes
+        for p in conn.execute("SELECT id, derived_from FROM claims WHERE status='live' AND kind='pattern'").fetchall():
+            ids = json.loads(p["derived_from"] or "[]")
+            if not set(ids) & replaced.keys():
+                continue
+            updated = json.dumps(sorted({replaced.get(i, i) for i in ids}))
+            conn.execute("UPDATE claims SET derived_from=?, updated_at=? WHERE id=?", (updated, now(), p["id"]))
+            changes.append({"id": p["id"], "fields_before": {"derived_from": p["derived_from"]},
+                            "fields_after": {"derived_from": updated}})
+        profile = self._current_profile(conn)
+        if profile:
+            for sec in profile.get("sections", []):
+                for point in sec["points"]:
+                    point["claims"] = sorted({replaced.get(i, i) for i in point["claims"]})
+            self._set_profile(conn, profile)
+        return changes
 
     def _carry_mentions(self, conn, old_ids: list[int], new_id: int) -> None:
         for (eid,) in conn.execute(

@@ -29,8 +29,8 @@ from ..perf import PERF, since_ms
 from ..store import Store
 from . import accessibility as ax
 from . import ocr
-from .browser import browser_url
-from .enrich import Capture, EnrichJob
+from .browser import browser_url, note_private
+from .enrich import APPROVED, Capture, EnrichJob
 from .frames import FrameGrabber, is_blank
 from .privacy import denied
 from .redact import SecretMemory, redact_capture
@@ -42,15 +42,40 @@ log = logging.getLogger("discrete.capture.screen")
 _COUNTED = {"click": "clicks", "scroll": "scrolls", "keyboard": "keys", "clipboard": "clipboard"}
 
 
+def _denied(ctx: ax.WindowContext, url: str | None = None) -> str:
+    return denied(ctx.app, ctx.bundle_id, ctx.url if url is None else url,
+                  window_title=ctx.window_title, window_id=ctx.window_id)
+
+
+def _same_window(a: ax.WindowContext, b: ax.WindowContext) -> bool:
+    """Same page, tolerating a URL known to only one side: frames are cached with the
+    Apple Events tab URL, while a navigation trigger's context has only the AX URL."""
+    return a.pid == b.pid and a.window_title == b.window_title and (
+        not a.url or not b.url or a.url.split("#")[0] == b.url.split("#")[0])
+
+
 def _novel_lines(ocr_text: str, ax_text: str) -> list[str]:
     """OCR lines carrying words the AX text does not already have."""
     known = set(tk.content_tokens(ax_text))
     out: list[str] = []
     for line in dict.fromkeys(x.strip() for x in ocr_text.splitlines()):
         toks = set(tk.content_tokens(line))
-        if toks and len(toks - known) / len(toks) >= 0.5:
+        # A changed number is new information even when the words around it are not.
+        if toks and (len(toks - known) / len(toks) >= 0.5 or any(t.isdigit() for t in toks - known)):
             out.append(line)
     return out
+
+
+@dataclasses.dataclass
+class ScreenText:
+    text: str
+    source: str
+    privacy_text: str
+    pixels_read: bool
+
+    def __iter__(self):
+        # Keep the existing text/source interface for local readers.
+        return iter((self.text, self.source))
 
 
 class ScreenObserver:
@@ -74,13 +99,13 @@ class ScreenObserver:
         # next page (insights.md §7.37).
         self._recent: collections.deque = collections.deque(maxlen=6)
         self._last_event_mono = time.monotonic()
-        # (app, title, url) -> phash of the last kept frame; least recently used evicted.
-        self._last_kept: collections.OrderedDict[tuple, str] = collections.OrderedDict()
         self._last_full_capture = 0.0
         self._last_full_text = ""
         self._warned_blank = False
+        self._capture_proven = False  # a frame with content arrived: the permission works
+        self._blank_windows: set[tuple] = set()
         self.away = False
-        self.stats = {k: 0 for k in ("captured", "light", "frame_dup", "dropped_failed", "degraded",
+        self.stats = {k: 0 for k in ("captured", "light", "frame_dup", "missing_frame", "degraded",
                                      "suppressed", "aborted_drift", "self", "denied", "redacted")}
         # Fragments of recently redacted secrets, so an OCR copy split differently goes too.
         self._secrets = SecretMemory()
@@ -154,9 +179,9 @@ class ScreenObserver:
                 self._rotate()
         if self._pending is None:
             before = self._latest
-            if before is not None and denied(before[1].app, before[1].bundle_id, before[1].url):
+            if before is not None and _denied(before[1]):
                 before = None
-            if cur is not None and before is not None and before[1].key != cur.key:
+            if cur is not None and before is not None and not _same_window(before[1], cur):
                 before = None  # the cached frame shows the page we just left, not this one
             self._pending = {
                 "kind": kind,
@@ -179,7 +204,7 @@ class ScreenObserver:
         self._timer = self._loop.call_later(delay, self._flush_soon)
 
     def _flush_soon(self) -> None:
-        spawn(self._flush(), name="discrete-flush", owner=self._tasks)
+        spawn(self._flush(), name="discrete-flush", owner=self._tasks, max_pending=T.CAPTURE_MAX_PENDING)
 
     # ---------------------------------------------------------------- frames
 
@@ -189,14 +214,15 @@ class ScreenObserver:
                 ctx = await asyncio.to_thread(ax.window_context)
                 url = ctx.url or await asyncio.to_thread(browser_url, ctx.app)
                 ctx = dataclasses.replace(ctx, url=url)
-                if denied(ctx.app, ctx.bundle_id, url):
+                await asyncio.to_thread(note_private, ctx.app, ctx.window_id)
+                if not (ctx.app or ctx.bundle_id) or _denied(ctx):
                     self._latest = None
                     self._recent.clear()
                     img = None
                 else:
                     img = await asyncio.to_thread(self.grabber.grab, ctx.bounds,
                                                   max_width=T.FRAME_MAX_WIDTH, window_id=ctx.window_id)
-                if img is not None and not denied(ctx.app, ctx.bundle_id, ctx.url):
+                if img is not None and not _denied(ctx):
                     # Only the newest frame keeps its native-resolution copy for OCR (a 5K
                     # window is ~44 MB): an older one, used by a rotated capture, is OCR'd at
                     # storage resolution.
@@ -204,12 +230,25 @@ class ScreenObserver:
                         self._latest[0].info.pop("_ocr_native", None)
                     self._latest = (img, ctx)
                     self._recent.append((img, ctx))
-                    if not self._warned_blank and is_blank(img):
-                        self._warned_blank = True
-                        log.warning("near-flat frame — check Screen Recording permission")
+                    self._check_blank(img, ctx)
             except Exception as exc:
                 log.debug("frame loop: %s", exc)
             await asyncio.sleep(T.FRAME_CACHE_S)
+
+    def _check_blank(self, img: Image.Image, ctx: ax.WindowContext) -> None:
+        """Without Screen Recording every window comes back flat; one flat window (a blank
+        tab, a video's black frame) is no evidence. Warn once, only when three different
+        windows were flat before any frame showed content."""
+        if self._capture_proven or self._warned_blank:
+            return
+        if not is_blank(img):
+            self._capture_proven = True
+            return
+        self._blank_windows.add((ctx.pid, ctx.window_id))
+        if len(self._blank_windows) >= 3:
+            self._warned_blank = True
+            log.warning("frames of %d windows are all flat — check Screen Recording permission",
+                        len(self._blank_windows))
 
     def _save(self, img: Image.Image | None, tag: str) -> str:
         if img is None:
@@ -234,12 +273,14 @@ class ScreenObserver:
         if not pending:
             return
         ctx: ax.WindowContext = pending["before_ctx"]
-        own = next((img for img, c in reversed(self._recent)
-                    if c.key == ctx.key and not denied(c.app, c.bundle_id, c.url)), None)
-        after = own if own is not None else pending["before_img"]
-        if after is None:
-            self.stats["dropped_failed"] += 1  # degraded: no frame, but still segment the boundary
-        spawn(self._finalize(pending, ctx, after, stale=True), name="discrete-rotate", owner=self._tasks)
+        own = next(((img, c) for img, c in reversed(self._recent)
+                    if _same_window(c, ctx) and not _denied(c)), None)
+        if own is not None:
+            after, ctx = own  # the cached context also carries the tab URL
+        else:
+            after = pending["before_img"]  # None when no frame of this page was cached in time
+        spawn(self._finalize(pending, ctx, after, stale=True), name="discrete-rotate",
+              owner=self._tasks, max_pending=T.CAPTURE_MAX_PENDING)
 
     async def _flush(self) -> None:
         pending, self._pending = self._pending, None
@@ -266,44 +307,42 @@ class ScreenObserver:
         # The tab URL comes from the web view (window_context); AppleScript is a slow fallback.
         t0 = time.perf_counter()
         url = ctx.url or ("" if stale else await asyncio.to_thread(browser_url, ctx.app))
-        if denied(ctx.app, ctx.bundle_id, url):
+        if not stale:
+            await asyncio.to_thread(note_private, ctx.app, ctx.window_id)
+        if not (ctx.app or ctx.bundle_id) or _denied(ctx, url):
             # Before any text is read or any frame saved: a denied window leaves nothing.
             self.stats["denied"] += 1
             return
         # Before frames belong to their frozen contexts, not the new destination.
         # Unknown context is unsafe too (including direct/internal capture callers).
         before_ctx = pending.get("before_ctx")
-        if before is not None and (before_ctx is None or denied(before_ctx.app, before_ctx.bundle_id, before_ctx.url)):
+        if before is not None and (before_ctx is None or _denied(before_ctx)):
             before = None
         if T.REDACT_SECRETS:  # title and URL now; the text once it is read
             meta = redact_capture(ctx.window_title, url, "", memory=self._secrets)
             ctx, url, meta_secret = dataclasses.replace(ctx, window_title=meta.title), meta.url, meta.drop_frame
         else:
             meta_secret = False
+        if after is None:
+            # Usually a page left before a frame of it was cached (FRAME_CACHE_S), or a
+            # window the grabber cannot see; the row is still stored, from metadata.
+            self.stats["missing_frame"] += 1
         counts: dict[str, Any] = pending["counts"]
         started, ended = pending["started"], time.time()
         phash = str(imagehash.phash(after)) if after is not None else ""
-        sig = (ctx.app, ctx.window_title, url)
-        prev = self._last_kept.get(sig)
-        if phash and prev and imagehash.hex_to_hash(phash) - imagehash.hex_to_hash(prev) <= T.FRAME_PHASH_MAX_DIST:
-            self.stats["frame_dup"] += 1
-            await self.queue.put(Capture(ObservationDraft(
-                source="screen", event_kind=pending["kind"], session_id=self.session.session_id,
-                started_at=started, ended_at=ended, app=ctx.app, bundle_id=ctx.bundle_id,
-                window_title=ctx.window_title, url=url, frame_duplicate=True, **counts,
-            )))
-            return
-        self._remember(sig, phash)
-
         t_text = time.perf_counter()
-        screen_text, text_source = await asyncio.to_thread(self._screen_text, ctx, after, stale)
+        extracted = await asyncio.to_thread(self._screen_text, ctx, after, stale)
+        screen_text, text_source = extracted
         PERF.sample("capture.text", since_ms(t_text), n=len(screen_text))
         if len(screen_text) >= T.SCREEN_TEXT_MAX_CHARS - 1:
             PERF.count("health.capture_screen_text_cap_hits")
-        drop = meta_secret
+        # Pixels whose text could not be read cannot be approved for egress.
+        drop = meta_secret or (after is not None and isinstance(extracted, ScreenText) and not extracted.pixels_read)
         if T.REDACT_SECRETS:
-            r = redact_capture("", "", screen_text, text_source, memory=self._secrets)
-            screen_text, drop = r.text, drop or r.drop_frame
+            privacy_text = extracted.privacy_text if isinstance(extracted, ScreenText) else screen_text
+            r = redact_capture("", "", privacy_text, text_source, memory=self._secrets)
+            drop = drop or r.drop_frame
+            screen_text = redact_capture("", "", screen_text, text_source, memory=self._secrets).text
         if drop:
             # A credential was on screen and text redaction cannot clean a frame: keep
             # none, caption from the text alone. (Catch-all hits such as document ids
@@ -311,7 +350,28 @@ class ScreenObserver:
             self.stats["redacted"] += 1
             PERF.count("health.capture_redaction_frame_drops")
             before = after = None
+        elif after is not None and T.REDACT_SECRETS:
+            after.info[APPROVED] = True  # its own full text passed; the before frame is checked at egress
         origin = classify_origin(ctx.app, ctx.window_title, screen_text)
+        # pHash only proposes a duplicate: the text, read every time, must match too, so
+        # an edited number in an unchanged layout is kept. The duplicate's target is the
+        # latest durable row, never an in-memory note of a capture that may not have been
+        # stored, and a row older than HEARTBEAT_MAX_GAP_S is not extended.
+        prev = await self.store.q1(
+            "SELECT frame_phash, screen_text, started_at FROM observations WHERE app=? AND site=? "
+            "AND window_title=? AND url=? AND origin='user' ORDER BY id DESC LIMIT 1",
+            (ctx.app, tk.site_from_url(url), ctx.window_title, url),
+        ) if self.store is not None and phash and origin == "user" else None
+        if (prev and prev["frame_phash"] and ended - prev["started_at"] < T.HEARTBEAT_MAX_GAP_S
+                and imagehash.hex_to_hash(phash) - imagehash.hex_to_hash(prev["frame_phash"]) <= T.FRAME_PHASH_MAX_DIST
+                and tk.content_hash(screen_text) == tk.content_hash(prev["screen_text"] or "")):
+            self.stats["frame_dup"] += 1
+            await self.queue.put(Capture(ObservationDraft(
+                source="screen", event_kind=pending["kind"], session_id=self.session.session_id,
+                started_at=started, ended_at=ended, app=ctx.app, bundle_id=ctx.bundle_id,
+                window_title=ctx.window_title, url=url, frame_duplicate=True, **counts,
+            )))
+            return
         base: dict[str, Any] = dict(
             origin=origin, event_kind=pending["kind"], session_id=self.session.session_id,
             started_at=started, ended_at=ended, app=ctx.app, bundle_id=ctx.bundle_id,
@@ -346,23 +406,18 @@ class ScreenObserver:
         # Stored now with the basic caption; the vision caption follows (enrich.py).
         self.stats["captured"] += 1
         job = EnrichJob(frames=[f for f in (before, after) if f is not None], app=ctx.app,
-                        window_title=ctx.window_title, url=url, screen_text=screen_text, counts=dict(counts))
+                        window_title=ctx.window_title, url=url, screen_text=screen_text, counts=dict(counts),
+                        bundle_id=ctx.bundle_id)
         PERF.sample("capture.local", since_ms(t0))  # hash, text, frame save: all work before the queue
         await self.queue.put(Capture(ObservationDraft(
             source="screen", caption=light_caption, frame_path=after_path, enrich_state="pending", **base), job))
 
-    def _remember(self, sig: tuple, phash: str) -> None:
-        self._last_kept[sig] = phash
-        self._last_kept.move_to_end(sig)
-        while len(self._last_kept) > T.LAST_KEPT_MAX:
-            self._last_kept.popitem(last=False)
-
-    def _screen_text(self, ctx: ax.WindowContext, after, stale: bool = False) -> tuple[str, str]:
+    def _screen_text(self, ctx: ax.WindowContext, after, stale: bool = False) -> ScreenText:
         # For a stale (rotated) capture the live AX tree is the *new* window, so the
         # only faithful text for the old article is OCR of its captured frame.
         text = "" if stale else ax.read_screen_text(
             ctx.pid, max_nodes=T.AX_WALK_MAX_NODES, timeout_ms=T.AX_WALK_TIMEOUT_MS,
-            max_chars=T.SCREEN_TEXT_MAX_CHARS, viewport=ctx.bounds)
+            max_chars=None, viewport=ctx.bounds)
         if stale:
             PERF.count("health.capture_ax_empty.stale")
         # A long AX tree can still be only chrome while the document is a scanned page
@@ -371,11 +426,20 @@ class ScreenObserver:
         # they go first so a long chrome tree cannot truncate them away; on an ordinary
         # page that is a few lines, and the exact AX text follows.
         native = after.info.get("_ocr_native", after) if after is not None else None
-        ocr_lines = _novel_lines(ocr.ocr_image(native), text)
-        if not ocr_lines:
-            return tk.truncate(text, T.SCREEN_TEXT_MAX_CHARS), "ax" if text else ""
+        try:
+            raw_ocr = ocr.ocr_image(native) if native is not None else ""
+            pixels_read = native is not None
+        except Exception:
+            raw_ocr, pixels_read = "", False
+        privacy_text = "\n".join(filter(None, (raw_ocr, text)))
+        ocr_lines = _novel_lines(raw_ocr, text)
         merged = "\n".join(ocr_lines + ([text] if text else []))
-        return tk.truncate(merged, T.SCREEN_TEXT_MAX_CHARS), "ax+ocr" if text else "ocr"
+        source = "ax+ocr" if text and ocr_lines else "ocr" if ocr_lines else "ax" if text else ""
+        if not getattr(text, "complete", True):
+            source = (source + "+ax_incomplete").lstrip("+")
+        if not pixels_read:
+            source = (source + "+ocr_failed").lstrip("+")
+        return ScreenText(tk.truncate(merged, T.SCREEN_TEXT_MAX_CHARS), source, privacy_text, pixels_read)
 
     # ------------------------------------------------------------- heartbeat
 

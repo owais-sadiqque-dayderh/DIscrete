@@ -150,6 +150,10 @@ def tmp_db():
 
 @pytest.fixture
 def fake(monkeypatch):
+    from discrete.capture import ocr
+
+    # Frames are screened before egress; synthetic frames must not invoke native Vision.
+    monkeypatch.setattr(ocr, "ocr_image", lambda image: "Synthetic fixture text")
     for k, v in {
         "CORE_LM_API_KEY": "test", "CORE_LM_MODEL_NAME": "fake-chat", "CORE_LM_API_BASE": "http://fake",
         "EMBED_LM_API_KEY": "test", "EMBED_LM_MODEL_NAME": "fake-embed",

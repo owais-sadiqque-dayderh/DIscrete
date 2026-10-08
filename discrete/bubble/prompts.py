@@ -53,6 +53,13 @@ MODE_INSTRUCTIONS = {
         "Several visits match this why question. Ask which visit they mean, listing the candidate dates and times. "
         "Do not select a visit or assert a causal chain."
     ),
+    "unverified": (
+        "Support verification timed out. These records are NOT verified support. Answer only if they visibly "
+        "address the question, using 'it looks like' or 'appears'. State what was seen, preserving actor, dates "
+        "and uncertainty. Never infer ownership, habitual use, preference or completed actions from related "
+        "screens, buttons or instructions. If no record directly answers, say you have nothing on file. "
+        "Do not claim the evidence or answer was verified."
+    ),
     "grounded": (
         "The records directly cover this. Write using the most specific facts they give (names, figures, "
         "titles, dates), preferring [screen] excerpts over [claim] headlines. No hedging, no 'records show'."

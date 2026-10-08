@@ -51,14 +51,53 @@ async def _session():
     try:
         yield store
     finally:
-        await flush_usage(store)
-        await store.close()
+        try:
+            await flush_usage(store)
+        finally:
+            await store.close()
 
 
 async def cmd_run(args) -> int:
+    from .config import validate
+
+    validate()
     from .app import run
 
     await run(bubble=not args.no_bubble)
+    return 0
+
+
+async def cmd_instance(args) -> int:
+    from .aio import daemon_status, daemon_stop
+
+    try:
+        if args.action == "stop":
+            await asyncio.to_thread(daemon_stop, timeout=args.timeout)
+            return 0
+        status = await asyncio.to_thread(daemon_status)
+        _print(json.dumps(status))
+        return 0 if status["running"] else 1
+    except RuntimeError as exc:
+        _err(str(exc))
+        return 2
+
+
+async def cmd_runtime_paths(_args) -> int:
+    _print(json.dumps({"data_dir": str(data_dir().resolve()), "db": str(db_path().resolve())}))
+    return 0
+
+
+async def cmd_read_sql(args) -> int:
+    from .store.db import connect
+
+    def read():
+        conn = connect(str(db_path()), read_only=True)
+        try:
+            return conn.execute(args.sql).fetchall()
+        finally:
+            conn.close()
+    for row in await asyncio.to_thread(read):
+        _print("\t".join("" if value is None else str(value) for value in row))
     return 0
 
 
@@ -130,38 +169,42 @@ async def cmd_overlay_demo(args) -> int:
 
 
 async def cmd_doctor(args) -> int:
+    """Endpoints and permissions. Real screen content never leaves this function: the
+    front window is grabbed only to see that pixels arrive, and nothing of it (app,
+    title, text, image) is printed or sent. `--models` uses synthetic fixtures."""
     from .capture import accessibility as ax
     from .capture.frames import FrameGrabber, is_blank
-    from .capture.ocr import ocr_image
+    from .capture.privacy import denied
 
     for ep in all_endpoints():
         _print(ep.describe())
     _print(f"db: {db_path()}")
     ok = True
     ctx = ax.window_context()
-    _print(f"front window: app={ctx.app!r} title={ctx.window_title!r} bounds={ctx.bounds}")
-    if not ctx.app:
+    if not (ctx.app or ctx.bundle_id):
         ok = False
         _print("ISSUE: no front window detected")
-    g = FrameGrabber()
-    img = g.grab(ctx.bounds, max_width=1600, window_id=ctx.window_id)
-    g.close()
-    if img is None or is_blank(img):
-        ok = False
-        _print("ISSUE: captured frame is blank — grant Screen Recording to this terminal/app")
+    elif denied(ctx.app, ctx.bundle_id, ctx.url, window_title=ctx.window_title, window_id=ctx.window_id):
+        _print("screen capture: not checked (the front window is excluded); rerun from another window")
     else:
-        _print(f"screen capture: OK ({img.width}x{img.height}); OCR sample: {tk.truncate(ocr_image(img), 80)!r}")
+        g = FrameGrabber()
+        img = g.grab(ctx.bounds, max_width=400, window_id=ctx.window_id)
+        g.close()
+        # The OS preflight is unreliable for terminal-launched Python; a frame is the real test.
+        if img is None or is_blank(img):
+            ok = False
+            _print("ISSUE: captured frame is blank — grant Screen Recording to this terminal/app "
+                   "(or the front window is a single flat colour)")
+        else:
+            _print("screen capture: OK")
     ax_ok = ax.accessibility_granted()
     _print(f"accessibility: {'OK (AX text walk active)' if ax_ok else 'NOT granted — OCR-only screen text'}")
-    txt = ""
-    if ax_ok and ctx.pid:
-        txt = ax.read_screen_text(ctx.pid, max_nodes=2000, timeout_ms=250, max_chars=4000)
-        _print(f"AX text sample: {txt[:80]!r}")
     if args.models:
         from .evaluation.model_check import check_models, render
 
-        _print("\nmodels (one real request each, same prompts, limits and .env settings as the pipeline):")
-        results = await check_models(img, app=ctx.app, title=ctx.window_title, screen_text=txt)
+        _print("\nmodels (one real request each with synthetic content, same prompts, limits and .env settings "
+               "as the pipeline):")
+        results = await check_models()
         _print(render(results))
         ok = ok and all(r.ok for r in results)
     _print("OK" if ok else "issues found")
@@ -172,6 +215,9 @@ async def cmd_stats(_args) -> int:
     async with _session() as store:
         _print(await store_card(store))
         _print(await usage_table(store))
+        unknown = sum(fields.get("unknown_cost_calls", 0) for fields in (await store.usage_by_component()).values())
+        if unknown:
+            _print(f"Reported cost is a lower bound: {int(unknown)} calls have unknown prices")
     return 0
 
 
@@ -266,7 +312,8 @@ async def cmd_eval(args) -> int:
         _print(json.dumps({"metrics": result.metrics(), "health": result.health, "snapshot": result.snapshot,
                            "stale": result.stale}, indent=2))
         if result.stale:
-            _print("WARNING: case file snapshot differs from the store; scores are not comparable")
+            _print("INVALID: case file snapshot differs from the store; scores are not comparable")
+            return 2
         if args.save_baseline:
             save_baseline(result, path)
             _print("baseline saved")
@@ -274,9 +321,9 @@ async def cmd_eval(args) -> int:
         cmp = compare(result, path)
         if cmp["baseline"] is not None:
             _print(json.dumps({k: v for k, v in cmp.items() if k != "baseline"}, indent=2))
-            if cmp["regressions"] and not result.stale:
+            if cmp.get("incomparable") or cmp["regressions"]:
                 return 2
-    return 1 if not result.stale and any(not case.correct for case in result.cases) else 0
+    return 1 if any(not case.correct for case in result.cases) else 0
 
 
 async def cmd_bench(args) -> int:
@@ -401,7 +448,24 @@ async def cmd_forget(args) -> int:
             _err(str(exc).strip("'\""))
             return 1
         _print(_event_line(await store.get_event(eid)))
-        _print(f"undo with: discrete revert {eid}")
+        _print(f"undo with: discrete revert {eid}  (the content is retired, not erased; see `discrete erase`)")
+        await _refresh_export(store)
+    return 0
+
+
+async def cmd_erase(args) -> int:
+    if not args.yes:
+        _err("erase is permanent and cannot be undone; repeat with --yes to confirm")
+        return 1
+    async with _session() as store:
+        try:
+            n = await store.erase_claim(args.claim_id)
+        except KeyError as exc:
+            _err(str(exc).strip("'\""))
+            return 1
+        _print(f"erased {n} version(s) of memory #{args.claim_id} (text, evidence quotes, search and change-log content)")
+        _print("not erased: source observations and screenshots, episode summaries, and earlier commits of a "
+               "git-tracked export; delete those separately")
         await _refresh_export(store)
     return 0
 
@@ -652,7 +716,13 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--force", action="store_true", help="even if later changes touched the same memories")
     pr.set_defaults(func=cmd_revert)
 
-    pf = sub.add_parser("forget", help="forget a memory and never re-learn it")
+    pe = sub.add_parser("erase", help="permanently remove a memory's derived content (not undoable)")
+    pe.add_argument("claim_id", type=int)
+    pe.add_argument("--yes", action="store_true", help="confirm the permanent removal")
+    pe.set_defaults(func=cmd_erase)
+
+    pf = sub.add_parser("forget", help="stop using a memory and never re-learn it (reversible; content is kept, "
+                                       "use `erase` to remove it)")
     pf.add_argument("claim_id", type=int)
     pf.add_argument("--reason", default="")
     pf.set_defaults(func=cmd_forget)
@@ -698,6 +768,15 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--kind", choices=PAGE_KINDS, default="")
     pp.add_argument("--top", type=int, default=20)
     pp.set_defaults(func=cmd_pages)
+    ip = sub.add_parser("instance", help="owned daemon status or waited shutdown")
+    ip.add_argument("action", choices=("status", "stop"))
+    ip.add_argument("--timeout", type=float, default=30.0)
+    ip.set_defaults(func=cmd_instance)
+    rp = sub.add_parser("runtime-paths", help="resolved runtime paths")
+    rp.set_defaults(func=cmd_runtime_paths)
+    sql = sub.add_parser("read-sql", help="read-only encrypted-aware wrapper query")
+    sql.add_argument("sql")
+    sql.set_defaults(func=cmd_read_sql)
     return p
 
 

@@ -182,7 +182,7 @@ def test_chrome_threshold_is_per_app_and_site(gate_db):
     path, conn = gate_db
     for oid in range(2, 7):
         execute(conn, "INSERT INTO observations(id,screen_text,site) VALUES (?,?,?)",
-                (oid, "Repeated chrome navigation labels\n" + str(oid), "chrome.example"))
+                (oid, "Repeated chrome labels\n" + str(oid), "chrome.example"))
     result = checks(path)["chrome_share"]
     assert not result.passed and result.details["share"] > .3
     execute(conn, "UPDATE observations SET site=CAST(id AS TEXT)")
@@ -441,7 +441,6 @@ def test_ax_empty_walk_budget_reason(monkeypatch, reason):
 
 
 async def test_redaction_drop_counts_and_saves_no_frame(monkeypatch):
-    from collections import OrderedDict
     from types import SimpleNamespace
 
     from PIL import Image
@@ -455,7 +454,7 @@ async def test_redaction_drop_counts_and_saves_no_frame(monkeypatch):
     capture.stats = {"redacted": 0, "degraded": 0}
     capture.queue = asyncio.Queue()
     capture.session = SimpleNamespace(session_id="test")
-    capture._last_kept = OrderedDict()
+    capture.store = None
     capture._secrets = SecretMemory()
     capture._last_full_text = ""
     capture._last_full_capture = 0

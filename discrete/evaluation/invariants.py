@@ -48,8 +48,12 @@ class CheckReport:
     def passed(self) -> bool:
         return all(check.passed is not False for check in self.checks)
 
+    @property
+    def release_passed(self) -> bool:
+        return bool(self.checks) and all(check.passed is True for check in self.checks)
+
     def to_dict(self) -> dict[str, Any]:
-        return {**asdict(self), "passed": self.passed}
+        return {**asdict(self), "passed": self.passed, "release_passed": self.release_passed}
 
 
 @dataclass(frozen=True)
@@ -186,7 +190,7 @@ def _chrome(rows: list[dict[str, Any]], maximum: float) -> CheckResult:
                         "note": "raw text recurrence per (app, site); persistent content also counts"})
 
 
-def check_store(path: str | Path, *, expect: str | Path | None = None, slo: bool = False) -> CheckReport:
+def check_store(path: str | Path, *, expect: str | Path | None = None, slo: bool = False, release: bool = False) -> CheckReport:
     """Return structured pass/fail/n/a checks from one consistent read-only snapshot.
 
     `slo=True` adds all three latency gates. Absent measurements are n/a.
@@ -275,9 +279,31 @@ def check_store(path: str | Path, *, expect: str | Path | None = None, slo: bool
                        and (assertion.kind is None or c["kind"] == assertion.kind)]
             checks.append(CheckResult(name, len(matched) >= assertion.min_count,
                                       {"claim_ids": matched, "min_count": assertion.min_count}))
-        if slo:
+        if release:
+            from ..store.index import _LIVE
+
+            required = {"embeddings": {"ref_kind", "ref_id"}, "index_outbox": {"ref_kind", "ref_id"}}
+            for table in required:
+                schema[table] = {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}
+            unavailable = _require_columns("index_ready", schema, required)
+            if unavailable is not None or any(table not in tables for table, _ in _LIVE.values()):
+                checks.append(unavailable or CheckResult("index_ready", None, {"reason": "index sources absent"}))
+            else:
+                missing = {}
+                for kind, (table, live) in _LIVE.items():
+                    count = conn.execute(f"SELECT COUNT(*) FROM {table} t WHERE {live} AND NOT EXISTS "
+                                         "(SELECT 1 FROM embeddings e WHERE e.ref_kind=? AND e.ref_id=t.id)",
+                                         (kind,)).fetchone()[0]
+                    if count:
+                        missing[kind] = count
+                pending = conn.execute("SELECT COUNT(*) FROM index_outbox").fetchone()[0]
+                checks.append(CheckResult("index_ready", not missing and not pending,
+                                          {"missing": missing, "outbox_pending": pending}))
+        if slo or release:
             unavailable = _require_columns("slo", schema, {"perf_samples": {"stage", "ms", "src"}})
             samples = conn.execute("SELECT stage, ms, src FROM perf_samples").fetchall() if unavailable is None else []
+            if release:
+                samples = [sample for sample in samples if sample["src"] == "live"]
             for result in evaluate_slos(samples):
                 details = asdict(result)
                 if unavailable is not None:
