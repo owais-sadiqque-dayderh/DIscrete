@@ -1,0 +1,8 @@
+# Verified against live1006/branch.db. Baseline wording exists, but lacks action typing.
+screen_text_cap: 16000
+chrome_max_share: 0.30
+claims:
+  - name: helium_download
+    kind: event
+    action: downloaded
+    text_regex: 'downloaded.*Helium'

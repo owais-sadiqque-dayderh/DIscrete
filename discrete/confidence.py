@@ -25,7 +25,7 @@ def compute_confidence(episode_modalities: list[str], distinct_days: int) -> flo
 def half_life_days(kind: str) -> float | None:
     if kind == "event":
         return None
-    if kind == "preference":
+    if kind in ("preference", "pattern"):
         return T.PREF_HALF_LIFE_DAYS
     if kind == "fact":
         return T.FACT_HALF_LIFE_DAYS

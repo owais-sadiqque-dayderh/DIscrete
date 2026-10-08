@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 
 from ..config import db_path, embedding_endpoint
+from ..encryption import EncryptionError, EncryptionState
 from ..timeutil import now
 from .db import connect
 
@@ -34,7 +35,7 @@ class StoreBase:
         self.rconn = rconn or conn
         self._lock = asyncio.Lock()
         self._rlock = asyncio.Lock() if rconn is not None else self._lock
-        self._dense: dict[str, tuple[int, np.ndarray, np.ndarray]] = {}
+        self._dense: dict[str, tuple[tuple[int, str, str], np.ndarray, np.ndarray]] = {}
         self._dense_version: dict[str, int] = {}
         self._dirty_kinds: set[str] = set()
         self._alias_cache: tuple[int, list[sqlite3.Row]] | None = None
@@ -44,8 +45,23 @@ class StoreBase:
     async def open(cls, path: str | None = None):
         path = str(path or db_path())
         conn = connect(path)
-        rconn = None if path == ":memory:" else connect(path, read_only=True)
-        return cls(conn, rconn)
+        try:
+            rconn = None if path == ":memory:" else connect(path, read_only=True)
+        except BaseException:
+            conn.close()
+            raise
+        store = cls(conn, rconn)
+        if path == ":memory:":
+            store._frame_encryption = None
+        else:
+            store._frame_encryption = conn._discrete_encryption_state
+        return store
+
+    @property
+    def frame_encryption(self) -> EncryptionState | None:
+        if not hasattr(self, "_frame_encryption"):
+            raise EncryptionError("Frame encryption requires an open owning store.")
+        return self._frame_encryption
 
     async def close(self) -> None:
         async with self._lock:
@@ -57,18 +73,32 @@ class StoreBase:
     async def _call(self, fn, *args, **kwargs):
         """Run `fn` on the writer connection."""
         async with self._lock:
-            return await asyncio.to_thread(fn, *args, **kwargs)
+            return await self._thread(fn, *args, **kwargs)
 
     async def _read(self, fn, *args, **kwargs):
         """Run `fn` (reads only) on the reader connection."""
         async with self._rlock:
-            return await asyncio.to_thread(fn, *args, **kwargs)
+            return await self._thread(fn, *args, **kwargs)
+
+    @staticmethod
+    async def _thread(fn, *args, **kwargs):
+        # Cancelling to_thread does not stop SQLite. Keep the connection lock
+        # until the worker finishes, including a transaction already committing.
+        task = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
 
     @contextmanager
     def _tx(self):
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             yield self.conn
+            from .pages import sync_pages
+
+            sync_pages(self.conn)
         except BaseException:
             self.conn.execute("ROLLBACK")
             self._dirty_kinds.clear()
@@ -96,7 +126,10 @@ class StoreBase:
         return row[0]
 
     async def execute(self, sql: str, args: Sequence = ()) -> None:
-        await self._call(lambda: self.conn.execute(sql, args))
+        def run():
+            with self._tx() as conn:
+                conn.execute(sql, args)
+        await self._call(run)
 
     # ------------------------------------------------------ shared write helpers
 
@@ -115,10 +148,17 @@ class StoreBase:
             (ref_kind, ref_id, now()),
         )
 
+    def _vectors_changed(self, conn, ref_kind: str) -> None:
+        """Bump the stored per-kind vector version, so a dense cache in another process
+        (the CLI, an eval run beside the daemon) notices the change too."""
+        conn.execute("INSERT INTO meta(key, value) VALUES (?, '1') "
+                     "ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1", (f"vectors:{ref_kind}",))
+        self._dirty_kinds.add(ref_kind)
+
     def _drop_vector(self, conn, ref_kind: str, ref_id: int) -> None:
         conn.execute("DELETE FROM embeddings WHERE ref_kind=? AND ref_id=?", (ref_kind, ref_id))
         conn.execute("DELETE FROM index_outbox WHERE ref_kind=? AND ref_id=?", (ref_kind, ref_id))
-        self._dirty_kinds.add(ref_kind)
+        self._vectors_changed(conn, ref_kind)
         if not conn.in_transaction:
             self._publish_vectors()
 
@@ -132,7 +172,7 @@ class StoreBase:
              np.asarray(vec, dtype=np.float32).tobytes(), text_hash, now()),
         )
         conn.execute("DELETE FROM index_outbox WHERE ref_kind=? AND ref_id=?", (ref_kind, ref_id))
-        self._dirty_kinds.add(ref_kind)
+        self._vectors_changed(conn, ref_kind)
         if not conn.in_transaction:
             self._publish_vectors()
 

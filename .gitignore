@@ -9,3 +9,6 @@ data/
 .ruff_cache/
 # written at runtime into the data dir; never commit one if it appears here
 golden/auto_cases.pending.yaml
+
+# real screen data for benchmarks (never commit)
+bench/private/

@@ -17,10 +17,14 @@ import contextlib
 import contextvars
 import json
 import logging
+import math
+import random
 import re
 import time
-from collections.abc import Iterator
-from typing import Any
+from collections.abc import Awaitable, Callable, Iterator
+from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
+from typing import Any, TypeVar
 
 import httpx
 import openai
@@ -34,6 +38,19 @@ log = logging.getLogger("discrete.llm")
 
 class LLMError(RuntimeError):
     """A model call returned nothing usable."""
+
+
+class StreamError(LLMError):
+    """An interrupted or explicitly failed provider stream; safe to retry before text."""
+
+
+class EmptyCompletion(LLMError):
+    """A finished writer attempt with no visible answer."""
+
+    def __init__(self, finish_reason: str | None = None, reasoning_present: bool = False):
+        self.finish_reason = finish_reason
+        self.reasoning_present = reasoning_present
+        super().__init__(f"empty completion (finish_reason={finish_reason}, reasoning_present={reasoning_present})")
 
 
 class NotConfigured(LLMError):
@@ -56,11 +73,24 @@ EXPECTED_ERRORS: tuple[type[BaseException], ...] = (
     openai.APIError,
     httpx.HTTPError,
     asyncio.TimeoutError,
+    ConnectionError,
 )
 
 
 # The call in flight in this task, so usage a backend reports lands on its record.
 _CURRENT: contextvars.ContextVar[Call | None] = contextvars.ContextVar("discrete_llm_call", default=None)
+_INTERACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar("discrete_llm_interactive", default=False)
+_Result = TypeVar("_Result")
+
+
+@contextlib.contextmanager
+def interactive() -> Iterator[None]:
+    """Use Bubble's short retry budget, inherited by its concurrent retrieval tasks."""
+    token = _INTERACTIVE.set(True)
+    try:
+        yield
+    finally:
+        _INTERACTIVE.reset(token)
 
 
 class UsageMeter:
@@ -150,7 +180,7 @@ class OpenAIBackend:
         key = (ep.base_url, ep.api_key)
         if key not in self._clients:
             self._clients[key] = AsyncOpenAI(
-                base_url=ep.base_url, api_key=ep.api_key, timeout=T.LLM_TIMEOUT_S, max_retries=2
+                base_url=ep.base_url, api_key=ep.api_key, timeout=T.LLM_TIMEOUT_S, max_retries=0
             )
         return self._clients[key]
 
@@ -191,18 +221,51 @@ class OpenAIBackend:
             payload["temperature"] = temperature
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
-        rsp = await self._client(ep).chat.completions.create(**payload, **self._extras(ep))
-        wrote = False
-        try:
-            async for chunk in rsp:
-                METER.add_usage(ep.name, getattr(chunk, "usage", None))  # final chunk, where sent
-                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                    wrote = True
-                    yield chunk.choices[0].delta.content
-                elif chunk.choices and chunk.choices[0].finish_reason == "length" and not wrote:
-                    raise TokenLimit(ep, max_tokens)
-        finally:
-            await rsp.close()  # an abandoned stream otherwise errors when the loop shuts down
+        # Read SSE explicitly: the SDK accepts EOF without [DONE], hiding truncation.
+        wrote, reasoning_present, finish_reason = False, False, None
+        async with self._client(ep).chat.completions.with_streaming_response.create(
+                **payload, **self._extras(ep)) as rsp:
+            data_lines: list[str] = []
+            async for line in rsp.iter_lines():
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip(" "))
+                    continue
+                if line or not data_lines:
+                    continue
+                data = "\n".join(data_lines)
+                data_lines.clear()
+                if data.strip() == "[DONE]":
+                    if not wrote:
+                        raise EmptyCompletion(finish_reason, reasoning_present)
+                    return
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError as exc:
+                    raise StreamError(f"{ep.name}: invalid stream chunk") from exc
+                if not isinstance(chunk, dict):
+                    raise StreamError(f"{ep.name}: invalid stream chunk")
+                if chunk.get("error"):
+                    raise StreamError(f"{ep.name}: provider stream error: {chunk['error']}")
+                usage = chunk.get("usage")
+                METER.add_usage(ep.name, usage)
+                if isinstance(usage, dict):
+                    details = usage.get("completion_tokens_details") or {}
+                    reasoning_present |= bool(details.get("reasoning_tokens"))
+                for choice in chunk.get("choices") or []:
+                    if choice.get("index", 0) != 0:
+                        continue
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                    delta = choice.get("delta") or {}
+                    reasoning_present |= any(bool(delta.get(k)) for k in
+                                             ("reasoning", "reasoning_content", "reasoning_details"))
+                    content = delta.get("content")
+                    if content:
+                        wrote |= bool(content.strip())
+                        yield content
+            # Some compatible servers omit [DONE]; a finished choice with text is complete.
+            if wrote and finish_reason in ("stop", "length"):
+                return
+            raise StreamError(f"{ep.name}: stream ended without [DONE]")
 
     async def embed(self, ep: Endpoint, texts: list[str]) -> list[list[float]]:
         rsp = await self._client(ep).embeddings.create(model=ep.model or "", input=texts, **self._extras(ep))
@@ -273,32 +336,140 @@ def _tuned(ep: Endpoint, temperature: float | None, max_tokens: int | None) -> t
     return temperature, max_tokens
 
 
+def provider_glitch(exc: BaseException) -> bool:
+    """Retry provider/transport failures, never validation or authentication errors.
+
+    Preserve the router-specific upstream 404 exception from 5e7d73a; a wrong
+    model name is still terminal. Status takes precedence over overload wording.
+    """
+    if isinstance(exc, StreamError | EmptyCompletion):
+        return True
+    if isinstance(exc, openai.APIStatusError | httpx.HTTPStatusError):
+        status = exc.status_code if isinstance(exc, openai.APIStatusError) else exc.response.status_code
+        if status in (429, 500, 502, 503, 504, 529):
+            return True
+        text = str(exc)
+        return status == 404 and (
+            "Provider returned error" in text or ("model_not_found" in text and "provider_name" in text))
+    if isinstance(exc, openai.APIConnectionError | httpx.TimeoutException | httpx.NetworkError
+                  | httpx.RemoteProtocolError | TimeoutError | ConnectionError):
+        return True
+    return isinstance(exc, openai.APIError | LLMError) and "overload" in str(exc).lower()
+
+
+def _retry_after(exc: BaseException) -> float:
+    response = getattr(exc, "response", None)
+    value = response.headers.get("Retry-After") if response is not None else None
+    if value is None:
+        return 0.0
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            seconds = parsedate_to_datetime(value).timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+    return max(0.0, seconds) if math.isfinite(seconds) else 0.0
+
+
+@dataclass
+class _RetryPolicy:
+    """Gate additional attempts; in-flight requests keep their transport timeout."""
+
+    ep: Endpoint
+    interactive: bool = field(default_factory=_INTERACTIVE.get)
+    attempts: int = 0
+    deadline: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        budget = T.LLM_INTERACTIVE_RETRY_MAX_S if self.interactive else T.LLM_RETRY_MAX_S
+        self.deadline = time.monotonic() + max(0.0, budget)
+
+    def remaining(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
+
+    def giveup(self) -> None:
+        PERF.count(f"llm.{self.ep.name}.provider_giveup")
+        PERF.count("health.llm_provider_giveup")
+
+    async def retry(self, exc: BaseException, *, replayable: bool = True) -> bool:
+        if not provider_glitch(exc):
+            return False
+        base = max(0.0, T.LLM_PROVIDER_RETRY_S) * (2 ** self.attempts)
+        delay = max(_retry_after(exc), base + random.uniform(0.0, base * 0.25))
+        if not replayable or self.attempts >= T.LLM_PROVIDER_RETRIES or delay >= self.remaining():
+            self.giveup()
+            return False
+        log.info("%s: transient provider failure, retry %d in %.2fs", self.ep.name, self.attempts + 1, delay)
+        await asyncio.sleep(delay)
+        # A suspended process may wake after the deadline: never issue another request then.
+        if self.remaining() <= 0:
+            self.giveup()
+            return False
+        self.attempts += 1
+        PERF.count(f"llm.{self.ep.name}.provider_retry")
+        PERF.count("health.llm_provider_retry")
+        return True
+
+
+async def _with_retry(fn: Callable[[], Awaitable[_Result]], policy: _RetryPolicy, *, metered: bool = True) -> _Result:
+    while True:
+        try:
+            with _metered(policy.ep) if metered else contextlib.nullcontext():
+                # The budget limits retry starts, not healthy (possibly slow) attempts.
+                return await fn()
+        except EXPECTED_ERRORS as exc:
+            if not await policy.retry(exc):
+                raise
+
+
 async def complete(ep: Endpoint, messages: list[dict], *, temperature: float | None = 0.0,
                    max_tokens: int | None = None, json_mode: bool = False) -> str:
+    return await _complete(ep, messages, policy=_RetryPolicy(ep), temperature=temperature,
+                           max_tokens=max_tokens, json_mode=json_mode)
+
+
+async def _complete(ep: Endpoint, messages: list[dict], *, policy: _RetryPolicy,
+                    temperature: float | None, max_tokens: int | None, json_mode: bool = False) -> str:
     if not ep.configured:
         raise NotConfigured(f"{ep.name} endpoint not configured")
     temperature, max_tokens = _tuned(ep, temperature, max_tokens)
     json_mode = json_mode and ep.json_mode
-    with _metered(ep):
-        return await _backend.chat(ep, messages, temperature=temperature, max_tokens=max_tokens, json_mode=json_mode)
+
+    async def _once() -> str:
+        return await _backend.chat(ep, messages, temperature=temperature, max_tokens=max_tokens,
+                                   json_mode=json_mode)
+
+    return await _with_retry(_once, policy)
 
 
 async def complete_json(ep: Endpoint, messages: list[dict], *, temperature: float | None = 0.0,
                         max_tokens: int | None = None) -> Any:
     """JSON-producing call. Tries json mode (unless the model's JSON_MODE is off), then
     a plain call. Raises LLMError if unparseable, TokenLimit if the model ran out."""
+    # JSON-mode fallback shares the original deadline and retry count.
+    policy = _RetryPolicy(ep)
     if ep.json_mode:
-        try:
-            parsed = parse_json(await complete(ep, messages, temperature=temperature, max_tokens=max_tokens,
-                                               json_mode=True))
-            if parsed is not None:
-                return parsed
-        except openai.BadRequestError as exc:  # proxy rejected response_format
-            log.debug("json mode rejected by %s: %s", ep.model, exc)
-    parsed = parse_json(await complete(ep, messages, temperature=temperature, max_tokens=max_tokens))
+        # A 400 (including response_format validation) is terminal. Providers that
+        # do not support JSON mode use <COMPONENT>_JSON_MODE=false instead.
+        parsed = parse_json(await _complete(ep, messages, policy=policy, temperature=temperature,
+                                            max_tokens=max_tokens, json_mode=True))
+        if parsed is not None:
+            return parsed
+    parsed = parse_json(await _complete(ep, messages, policy=policy, temperature=temperature, max_tokens=max_tokens))
     if parsed is None:
         raise LLMError(f"{ep.name}: unparseable JSON")
     return parsed
+
+
+async def complete_obj(ep: Endpoint, messages: list[dict], *, temperature: float | None = 0.0,
+                       max_tokens: int | None = None) -> dict:
+    """A JSON *object* reply, or LLMError: a model that answers with a list or a bare
+    value is a failed call, never an AttributeError deep in the caller."""
+    data = await complete_json(ep, messages, temperature=temperature, max_tokens=max_tokens)
+    if not isinstance(data, dict):
+        raise LLMError(f"{ep.name}: expected a JSON object, got {type(data).__name__}")
+    return data
 
 
 async def stream(ep: Endpoint, messages: list[dict], *, temperature: float | None = 0.2,
@@ -314,28 +485,60 @@ async def stream(ep: Endpoint, messages: list[dict], *, temperature: float | Non
     rec = Call(ep.name, ep.model or "", at=time.time())
     t0 = time.perf_counter()
     fn = getattr(_backend, "stream", None)
+    # Streaming is Bubble's interactive writer. Gate retries with its short budget;
+    # even the first delta keeps the transport timeout (reasoning can take longer).
+    policy = _RetryPolicy(ep, interactive=True)
     try:
-        if fn is None:
-            token = _CURRENT.set(rec)
+        empty_attempts = 0
+        while True:
+            pending = ""
             try:
-                reply = await _backend.chat(ep, messages, temperature=temperature, max_tokens=max_tokens, json_mode=False)
-            finally:
-                _CURRENT.reset(token)
-            rec.first_ms = (time.perf_counter() - t0) * 1000
-            yield reply
-            return
-        async with contextlib.aclosing(fn(ep, messages, temperature=temperature, max_tokens=max_tokens)) as inner:
-            while True:
-                token = _CURRENT.set(rec)
-                try:
-                    piece = await anext(inner)
-                except StopAsyncIteration:
-                    break
-                finally:
-                    _CURRENT.reset(token)
-                if rec.first_ms is None:
+                if fn is None:
+                    token = _CURRENT.set(rec)
+                    try:
+                        reply = await _backend.chat(ep, messages, temperature=temperature,
+                                                    max_tokens=max_tokens, json_mode=False)
+                    finally:
+                        _CURRENT.reset(token)
+                    if not reply.strip():
+                        raise EmptyCompletion()
                     rec.first_ms = (time.perf_counter() - t0) * 1000
-                yield piece
+                    yield reply
+                    return
+                async with contextlib.aclosing(fn(ep, messages, temperature=temperature,
+                                                  max_tokens=max_tokens)) as inner:
+                    while True:
+                        token = _CURRENT.set(rec)
+                        try:
+                            piece = await anext(inner)
+                        except StopAsyncIteration:
+                            break
+                        finally:
+                            _CURRENT.reset(token)
+                        if rec.first_ms is None:
+                            pending += piece or ""
+                            if not pending.strip():
+                                continue
+                            piece, pending = pending, ""
+                            rec.first_ms = (time.perf_counter() - t0) * 1000
+                        yield piece
+                if rec.first_ms is None:
+                    raise EmptyCompletion()
+                return
+            except EXPECTED_ERRORS as exc:
+                if isinstance(exc, TokenLimit) and rec.first_ms is None:
+                    exc = EmptyCompletion("length", reasoning_present=True)
+                if isinstance(exc, EmptyCompletion):
+                    log.warning("%s: empty writer completion; finish_reason=%s reasoning_present=%s",
+                                ep.name, exc.finish_reason, exc.reasoning_present)
+                    empty_attempts += 1
+                    if empty_attempts > 1:
+                        raise exc
+                    if exc.finish_reason == "length" and max_tokens is not None:
+                        max_tokens += max(256, max_tokens // 2)
+                # Share the transport retry deadline/count; never replay visible text.
+                if not await policy.retry(exc, replayable=rec.first_ms is None):
+                    raise exc
     except BaseException as exc:
         rec.status = _status(exc)
         raise
@@ -357,8 +560,7 @@ async def embed(texts: list[str]) -> list[list[float]]:
     out: list[list[float]] = []
     for i in range(0, len(texts), T.EMBED_BATCH):
         batch = [t if t.strip() else " " for t in texts[i : i + T.EMBED_BATCH]]
-        with _metered(ep):
-            got = await _backend.embed(ep, batch)
+        got = await _with_retry(lambda batch=batch: _backend.embed(ep, batch), _RetryPolicy(ep))
         if len(got) != len(batch):
             raise LLMError(f"embedding: {len(got)} vectors for {len(batch)} texts")
         out.extend(got)
@@ -381,5 +583,4 @@ async def rerank(query: str, docs: list[str], top_n: int) -> list[tuple[int, flo
     ep = rerank_endpoint()
     if not ep.configured:
         raise NotConfigured("rerank endpoint not configured")
-    with _metered(ep):
-        return await _backend.rerank(ep, query, docs, top_n)
+    return await _with_retry(lambda: _backend.rerank(ep, query, docs, top_n), _RetryPolicy(ep))

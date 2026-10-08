@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 
@@ -14,11 +15,16 @@ from ..config import T
 from ..llm import EXPECTED_ERRORS, NotConfigured, rerank, try_embed
 from ..models import Hit, QueryPlan, RetrievalResult
 from ..perf import PERF, since_ms
+from ..process.trails import thing_terms
 from ..store import KINDS, Store
 from ..timeutil import age_days, day_key, now, to_local
 from .enumerate import enumerate_pages
-from .query import build_plan
+from .page_activity import page_activity
+from .query import EventQueryPlan, build_plan, fallback_plan, page_request, relative_event
 from .rerank import llm_rerank
+from .support import verify_support
+from .temporal import relative_timeline, temporal_answer
+from .why import chain_hits, resolve_why
 
 log = logging.getLogger("discrete.retrieval.hybrid")
 
@@ -33,12 +39,16 @@ async def materialize(store: Store, kind: str, ids: list[int]) -> dict[int, Hit]
     rows = await store.live_rows(kind, ids)
     if kind == "claim":
         quotes = await store.first_quotes([r["id"] for r in rows])
+        strengths = await store.strengths([r["id"] for r in rows if r["kind"] != "event"])
         for r in rows:
             q = quotes.get(r["id"])
             body = r["text"] + (f"\n> {q}" if q else "")
             out[r["id"]] = Hit("claim", r["id"], r["text"][:120], body, modality=r["modality"],
                                confidence=r["confidence"], status=r["status"], occurred_at=r["occurred_from"],
-                               occurred_to=r["occurred_to"], claim_kind=r["kind"], untrusted=bool(q))
+                               occurred_to=r["occurred_to"], claim_kind=r["kind"], untrusted=bool(q),
+                               action=r["action"] if "action" in r.keys() else "")
+            if (st := strengths.get(r["id"])) is not None:
+                out[r["id"]].strength = f"{st.tier}: {st.describe()}"
     elif kind == "observation":
         for r in rows:
             name = r["page_title"] or r["window_title"]
@@ -87,16 +97,35 @@ async def retrieve(store: Store, query: str, *, field_text: str = "", progress=N
     """`progress(stage, detail)` is an optional UI hook (Bubble's overlay)."""
     with PERF.timer("retrieve.total") as t:
         result = await _retrieve(store, query, field_text=field_text, progress=progress or _noop)
+        with PERF.timer("retrieve.support", n=len(result.hits)):
+            await verify_support(result)
+        temporal_answer(result)
         t.n = len(result.hits)
     return result
 
 
 async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> RetrievalResult:
+    unresolved_event = False
+    structural = fallback_plan(query) if relative_event(query) else None
+    if isinstance(structural, EventQueryPlan):
+        result = RetrievalResult(query=query, plan=structural)
+        progress("searching", "temporal")
+        if await relative_timeline(store, result):
+            return result
+        # An unresolved event must keep the old route; it is not an invented
+        # calendar interval or an empty synthetic timeline.
+        unresolved_event = True
+    if T.PAGES and page_request(query)[0]:
+        structural = fallback_plan(query)
+        if structural.page_operation:
+            result = RetrievalResult(query=query, plan=structural)
+            await page_activity(store, result)
+            return result
     # The planner and the query embedding are independent API calls: run them together.
     qvec_task = asyncio.create_task(try_embed(query))
     try:
         with PERF.timer("retrieve.plan"):
-            plan = await build_plan(query)
+            plan = await build_plan(query, relative_events=False) if unresolved_event else await build_plan(query)
     except BaseException:
         qvec_task.cancel()
         raise
@@ -130,8 +159,11 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> R
                             f"(seen in {row['episodes']} episodes)", score=1.0, strong=True))
 
     seen = {(h.ref_kind, h.ref_id) for h in pool}
+    graph_claims = await _graph_claims(store, plan)
     for kind in KINDS:
         rankings = [await store.fts_ids(kind, q, limit=T.CANDIDATE_POOL) for q in plan.queries[:8]]
+        if kind == "claim" and graph_claims:
+            rankings.append(graph_claims)
         dense: dict[int, float] = {}
         if qvec is not None:
             dense = dict(await store.dense_search(kind, qvec, limit=T.CANDIDATE_POOL))
@@ -161,7 +193,189 @@ async def _retrieve(store: Store, query: str, *, field_text: str, progress) -> R
         pool = await _rerank(query, pool, cold)
     with PERF.timer("retrieve.mmr"):
         result.hits = await _mmr(store, pool, T.TOP_K)
+    await expand_tasks(store, result)
+    if plan.intent == "why":
+        with PERF.timer("retrieve.why"):
+            await expand_why(store, result)
+    if plan.about_user:
+        await add_profile(store, result)
+    if plan.time_spent:
+        await add_attention(store, result)
     return result
+
+
+async def expand_tasks(store: Store, result: RetrievalResult) -> None:
+    """Bounded siblings of strong matches, within the requested interval.
+
+    These are context, not automatically strong support; the normal support
+    verifier still judges each sibling against the question.
+    """
+    if T.TASK_RETRIEVAL_SIBLINGS <= 0 or result.plan.intent not in ('recall', 'why'):
+        return
+    anchors = [h.ref_id for h in result.hits if h.ref_kind == 'episode' and h.strong and not h.via]
+    for kind in ('observation', 'claim'):
+        ids = [h.ref_id for h in result.hits if h.ref_kind == kind and h.strong and not h.via]
+        anchors += [r['episode_id'] for r in await store.live_rows(kind, ids) if r['episode_id'] is not None]
+    anchors = list(dict.fromkeys(anchors))
+    if not anchors:
+        return
+    have = {(h.ref_kind, h.ref_id) for h in result.hits}
+    for ep in await store.task_siblings(anchors, limit=T.TASK_RETRIEVAL_SIBLINGS, interval=result.plan.interval,
+                                       exclude_ids=[h.ref_id for h in result.hits if h.ref_kind == 'episode']):
+        if ('episode', ep['id']) in have or not ep['summary']:
+            continue
+        h = Hit('episode', ep['id'], ep['title'] or 'episode', ep['summary'],
+                occurred_at=ep['started_at'], occurred_to=ep['ended_at'], via=f"task {ep['task_id']} sibling")
+        if h.in_interval(result.plan.interval):
+            result.hits.append(h)
+            have.add(('episode', ep['id']))
+
+
+async def add_attention(store: Store, result: RetrievalResult) -> None:
+    """Time totals per site and app for the question's interval (default: the last week)."""
+    start, end = result.plan.interval or (now() - 7 * 86400, now())
+    sites = await store.attention(start, end, by="site", limit=12)
+    apps = await store.attention(start, end, by="app", limit=8)
+    if not sites:
+        return
+    span = f"{to_local(start):%a %b %d %H:%M} – {to_local(end):%a %b %d %H:%M}"
+    body = "\n".join([f"Time on screen, {span} (estimated from captures; active = scrolling, clicking or typing):",
+                      "By site:", *(f"- {a.describe()}" for a in sites), "By app:", *(f"- {a.describe()}" for a in apps)])
+    result.hits.insert(0, Hit("attention", 0, "time spent", body, occurred_at=start, occurred_to=end))
+
+
+async def add_profile(store: Store, result: RetrievalResult) -> None:
+    """The profile (process/profile.py) as the first record, for the support check to judge."""
+    from ..process.profile import render_profile
+
+    text = render_profile(await store.get_profile())
+    if text:
+        result.hits.insert(0, Hit("profile", 0, "profile", text, occurred_at=0.0))
+
+
+async def expand_why(store: Store, result: RetrievalResult) -> None:
+    """For "why did I …": put what led to the matched moment right after it.
+
+    The anchor is a matched event memory (completed actions first) or, failing that, a
+    matched screen. A causal-trail link (process/trails.py) was checked in code and by
+    the verifier when it was written, so it joins as a strong record. Without one, the
+    moments before the anchor that plausibly lead to it join for the support check to
+    judge: those naming the same thing (with the matching line of screen text, since
+    the caption often misses it: a browser's menu bar inside a video), the page it was
+    reached from, and the moment or two just before."""
+    chain = await resolve_why(store, result.query, plan=result.plan, hits=result.hits)
+    if chain.candidates:
+        result.why_chain = chain
+        result.hits = []
+        result.digest = ""
+        return
+    if chain.effect is not None:
+        result.why_chain = chain
+    if chain.edges:
+        records = chain_hits(chain)
+        ids = {h.ref_id for h in records}
+        result.hits = records + [h for h in result.hits if h.ref_kind != "observation" or h.ref_id not in ids]
+        # Keep independently verified completed-action trails alongside the graph.
+        links = chain.trails
+        rows = {r["id"]: r for r in await store.get_observations([lk["src_id"] for lk in links], user_only=True)}
+        for lk in links:
+            if lk["src_id"] not in rows:
+                continue
+            quotes = json.loads(lk["evidence"] or "[]")
+            role = "led to" if lk["relation"] == "led_to" else "a step towards"
+            h = _trail_hit(rows[lk["src_id"]], quotes[0]["quote"] if quotes else "",
+                           via=f"{role} claim {lk['dst_id']}: {lk['reason']}")
+            h.strong = True
+            result.hits.append(h)
+        return
+    anchors = sorted((h for h in result.hits if h.ref_kind == "claim" and h.claim_kind == "event"),
+                     key=lambda h: not h.action)[: T.WHY_TARGETS]  # stable: actions first, then rank
+    if not anchors:
+        anchors = [h for h in result.hits if h.ref_kind == "observation" and not h.via][:1]
+    if not anchors:
+        return
+    have = {(h.ref_kind, h.ref_id) for h in result.hits}
+    added: dict[tuple[str, int], list[Hit]] = {}
+    claim_ids = [a.ref_id for a in anchors if a.ref_kind == "claim"]
+    links = await store.links_into("claim", claim_ids)
+    rows = {r["id"]: r for r in await store.get_observations(list({lk["src_id"] for lk in links}), user_only=True)}
+    for lk in links:
+        r = rows.get(lk["src_id"])
+        if r is None or ("observation", r["id"]) in have:
+            continue
+        quote = json.loads(lk["evidence"] or "[]")
+        role = "led to" if lk["relation"] == "led_to" else "a step towards"
+        h = _trail_hit(r, quote[0]["quote"] if quote else "", via=f"{role} claim {lk['dst_id']}: {lk['reason']}")
+        h.strong = True  # verified when the link was written
+        added.setdefault(("claim", lk["dst_id"]), []).append(h)
+        have.add(("observation", r["id"]))
+    anchor = anchors[0]
+    key = (anchor.ref_kind, anchor.ref_id)
+    if key not in added and anchor.occurred_at and not T.PROVENANCE:
+        added[key] = await _moments_before(store, anchor, result.query, have)
+    if not any(added.values()):
+        return
+    out: list[Hit] = []
+    for h in result.hits:
+        out.append(h)
+        out += sorted(added.get((h.ref_kind, h.ref_id), []), key=lambda x: x.occurred_at)
+    result.hits = out
+
+
+async def _moments_before(store: Store, anchor: Hit, query: str, have: set) -> list[Hit]:
+    t = anchor.occurred_at
+    label = f"{'claim' if anchor.ref_kind == 'claim' else 'screen'} {anchor.ref_id}"
+    rows = [r for r in await store.observations_started_within(t - T.WHY_BEFORE_MIN * 60, t)
+            if r["started_at"] < t and ("observation", r["id"]) not in have]
+    if not rows:
+        return []
+    terms = await thing_terms(store, f"{anchor.title} {anchor.body[:300]}", [query])
+    own = await store.get_observations(
+        [r["observation_id"] for r in await store.evidence_for_claim(anchor.ref_id)] if anchor.ref_kind == "claim"
+        else [anchor.ref_id])
+    came_from = {tk.norm_key(o["navigated_from"]) for o in own if o["navigated_from"]}
+    picked: dict[int, str] = {}
+    for r in rows:
+        text = " ".join([r["window_title"], r["page_title"], r["caption"], r["screen_text"]])
+        name = tk.norm_key(r["page_title"] or r["window_title"])
+        if came_from and name and any(name in c or c in name for c in came_from):
+            picked[r["id"]] = f"the page {label} was reached from"
+        elif terms and set(terms) & set(tk.tokens(text)):
+            picked.setdefault(r["id"], f"before {label}, about the same thing")
+    named = [r for r in rows if r["id"] in picked][-T.WHY_BEFORE_MAX:]
+    for r in rows[-T.WHY_IMMEDIATE:]:
+        picked.setdefault(r["id"], f"just before {label}")
+    keep = {r["id"] for r in named} | {r["id"] for r in rows[-T.WHY_IMMEDIATE:]}
+    out = []
+    for r in rows:
+        if r["id"] in keep:
+            snippet = tk.best_window(r["screen_text"] or "", set(terms), width=24)[0] if terms else ""
+            out.append(_trail_hit(r, snippet, via=picked[r["id"]]))
+    return out
+
+
+def _trail_hit(r, quote: str, *, via: str) -> Hit:
+    name = r["page_title"] or r["window_title"]
+    title = f"{r['app']} — {name}".strip(" —") or r["caption"][:80]
+    body = "\n".join(p for p in (r["caption"], f"> {quote}" if quote else "") if p)
+    return Hit("observation", r["id"], title[:120], body, occurred_at=r["started_at"], occurred_to=r["ended_at"],
+               untrusted=True, url=r["url"] or "", via=via)
+
+
+async def _graph_claims(store: Store, plan: QueryPlan) -> list[int]:
+    """Memories mentioning the entities the question names, and with GRAPH_EXPAND their
+    strongest neighbours' (the cheap analogue of Hindsight's link expansion), as one
+    more ranking list. They still pass the same relevance gates as any candidate."""
+    if not T.ENTITY_RECALL or not plan.entities:
+        return []
+    seeds = await store.entity_ids_named(plan.entities)
+    if not seeds:
+        return []
+    ids = await store.claim_ids_mentioning(seeds, limit=T.CANDIDATE_POOL)
+    if T.GRAPH_EXPAND:
+        near = [n["id"] for s in seeds for n in await store.neighbors(s, limit=T.GRAPH_NEIGHBORS)]
+        ids += [i for i in await store.claim_ids_mentioning(near, limit=T.CANDIDATE_POOL) if i not in ids]
+    return ids
 
 
 async def _rerank(query: str, pool: list[Hit], cold: bool) -> list[Hit]:

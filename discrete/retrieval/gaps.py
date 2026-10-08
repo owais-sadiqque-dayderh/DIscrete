@@ -46,7 +46,7 @@ async def answer_and_learn(store: Store, gap_id: int, answer: str) -> dict:
         reasoning=f"user answered gap: {gap['question']!r}",
         occurred_from=gap["answered_at"], occurred_to=gap["answered_at"],
     )
-    cid = await store.create_claim(draft)
+    cid = await store.create_claim(draft, actor="user", reason=f"answered gap #{gap_id}")
     await store.link_gap_claim(gap_id, cid)
     return {"ok": True, "claim_id": cid, "gap_id": gap_id}
 

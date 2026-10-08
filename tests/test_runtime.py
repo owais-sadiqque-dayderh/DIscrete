@@ -68,7 +68,7 @@ async def test_capture_is_queued_without_a_model_call(store, fake, monkeypatch):
     """The capture lock no longer covers the vision call: a capture is queued at once
     with a basic caption and its frames, and the model is not called on this path."""
     q: asyncio.Queue = asyncio.Queue()
-    obs = sc.ScreenObserver(queue=q)
+    obs = sc.ScreenObserver(queue=q, store=store)
     monkeypatch.setattr(obs, "_screen_text", lambda ctx, after, stale=False: (TEXT, "ax"))
     pending = {"kind": "click", "started": time.time(), "counts": {"keys": 0, "clicks": 1, "scrolls": 0, "clipboard": 0}}
     await obs._capture(pending, _ctx(), None, _img())
@@ -81,7 +81,7 @@ async def test_capture_is_queued_without_a_model_call(store, fake, monkeypatch):
 async def test_slow_vision_call_does_not_hold_up_the_next_capture(store, fake, monkeypatch):
     fake.caption_gate = asyncio.Event()  # the model hangs until released
     q: asyncio.Queue = asyncio.Queue()
-    obs = sc.ScreenObserver(queue=q)
+    obs = sc.ScreenObserver(queue=q, store=store)
     monkeypatch.setattr(obs, "_screen_text", lambda ctx, after, stale=False: (TEXT + ctx.window_title, "ax"))
     enricher = Enricher(store)
     counts = {"keys": 0, "clicks": 1, "scrolls": 0, "clipboard": 0}

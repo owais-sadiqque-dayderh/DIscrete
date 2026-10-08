@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 from .. import textkit as tk
 from ..config import USER_NAME, T, writer_endpoint
-from ..llm import stream
+from ..llm import EmptyCompletion, interactive, stream
 from ..models import Hit, RetrievalResult
 from ..perf import PERF
 from ..retrieval.enumerate import shape_enumerate_items
@@ -29,7 +29,7 @@ from ..retrieval.grounding import GroundingDecision, evaluate
 from ..retrieval.hybrid import retrieve
 from ..store import Store
 from ..timeutil import now, to_local
-from .prompts import MODE_INSTRUCTIONS, WRITER_SYSTEM, WRITER_USER
+from .prompts import MODE_INSTRUCTIONS, PREMISE_INSTRUCTION, WRITER_SYSTEM, WRITER_USER
 
 _PARA = re.compile(r"\n\s*\n")
 _SENT_START = re.compile(r"(?<=[.!?])\s+")
@@ -104,6 +104,10 @@ def format_enumerate_answer(result: RetrievalResult) -> str:
 def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> str:
     """Evidence pack for the writer: typed, time-stamped, id-tagged, budgeted."""
     max_chars = max_chars or T.BUBBLE_CONTEXT_CHARS
+    if result.why_chain and result.why_chain.candidates:
+        from ..retrieval.why import render_chain
+
+        return render_chain(result.why_chain)
     if result.plan.intent == "enumerate":
         # One compact line per page, time-ordered, so the whole trail fits (planS3 §17).
         if not result.hits:
@@ -123,12 +127,25 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
     terms = set(result.plan.terms)
     blocks: list[str] = []
     used = 0
+    if result.why_chain and result.why_chain.edges and not result.why_chain.verified:
+        blocks.append("[attention provenance: inferred, unverified sequence; "
+                      "describe what preceded it, never assert causation]")
+        used += len(blocks[-1])
     if result.digest:
         blocks.append(f"[day digest]\n{tk.truncate(result.digest, 1200)}")
         used += len(blocks[-1])
     for h in result.hits:
         if h.ref_kind == "claim":
-            head = f"[claim {h.ref_id} · {h.claim_kind} · {h.modality}{_when(h)}]"
+            kind = f"{h.claim_kind} ({h.action})" if h.action else h.claim_kind
+            strength = f" · {h.strength}" if h.strength else ""
+            head = f"[claim {h.ref_id} · {kind} · {h.modality}{strength}{_when(h)}]"
+            body = h.body
+        elif h.ref_kind == "attention":
+            head, body = "[attention: where their time went, computed from every capture]", h.body
+        elif h.ref_kind == "profile":
+            head, body = "[profile: what is known about them, each point backed by memories]", h.body
+        elif h.ref_kind == "observation" and h.via:
+            head = f"[screen {h.ref_id}{_when(h)} · {h.title} · {h.via}]"
             body = h.body
         elif h.ref_kind == "observation":
             head = f"[screen {h.ref_id}{_when(h)} · {h.title}]"
@@ -149,6 +166,12 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
     return "\n\n".join(blocks) or "(no records)"
 
 
+#: A writer that stays silent twice had nothing it could support: muse returns an empty
+#: completion exactly when the records lack the answer, so quoting the top record would
+#: put an unrelated line in the field (seen live: "From xa11y: xa11y" for a salary question).
+EMPTY_WRITER_ANSWER = "(nothing on file about that)"
+
+
 class BubbleEngine:
     def __init__(self, store: Store, user_name: str = USER_NAME):
         self.store = store
@@ -162,7 +185,10 @@ class BubbleEngine:
             # An empty query retrieves arbitrary records, and the writer paraphrased them
             # as if they were an answer (insights.md §7.35).
             raise EmptyField(repr(field_text[:20]))
-        result = await retrieve(self.store, query, field_text=field_text, progress=progress)
+        # The same verifier/embedding endpoints serve background jobs; only this
+        # request's task tree gets the shorter budget (not concurrent maintenance).
+        with interactive():
+            result = await retrieve(self.store, query, field_text=field_text, progress=progress)
         decision = evaluate(result)
         p = Prepared(field_text=field_text, query=query, app=app or "an app", field_desc=field_desc or "text field",
                      result=result, decision=decision, timings={"retrieve_s": time.perf_counter() - t0})
@@ -171,6 +197,8 @@ class BubbleEngine:
 
     def messages(self, p: Prepared) -> list[dict]:
         instruction = MODE_INSTRUCTIONS.get(p.mode, MODE_INSTRUCTIONS["grounded"])
+        if p.result.plan.premise_check:
+            instruction += "\n" + PREMISE_INSTRUCTION
         records = "(not needed)" if p.mode == "edit" else render_records(p.result)
         return [
             {"role": "system", "content": WRITER_SYSTEM.format(user_name=self.user_name)},
@@ -183,8 +211,8 @@ class BubbleEngine:
                     should_continue: Callable[[], bool] = lambda: True) -> str:
         """Stream the writer, emitting at word boundaries so the field never shows half a word.
         `emit` returns False when it could not insert, which stops the run."""
-        if p.mode == "enumerate":
-            text = format_enumerate_answer(p.result)
+        if p.mode in ("enumerate", "pages"):
+            text = p.result.page_answer if p.mode == "pages" else format_enumerate_answer(p.result)
             if not text:
                 return ""
             if needs_space(p.field_text, text):
@@ -217,20 +245,27 @@ class BubbleEngine:
 
         max_tokens = T.ENUMERATE_WRITER_MAX_TOKENS if p.mode == "enumerate" else T.BUBBLE_WRITER_MAX_TOKENS
         # aclosing: an early return must close the HTTP stream now, not at interpreter exit.
-        async with contextlib.aclosing(stream(writer_endpoint(), self.messages(p), temperature=0.2,
-                                              max_tokens=max_tokens)) as pieces:
-            async for piece in pieces:
-                if not should_continue():
-                    return out
-                buf += piece
-                if len(buf) < T.BUBBLE_MIN_CHUNK:
-                    continue
-                cut = max(buf.rfind(" "), buf.rfind("\n"))
-                if cut <= 0:
-                    continue
-                chunk, buf = buf[:cut], buf[cut:]
-                if not push(chunk):
-                    return out
+        try:
+            async with contextlib.aclosing(stream(writer_endpoint(), self.messages(p), temperature=0.2,
+                                                  max_tokens=max_tokens)) as pieces:
+                async for piece in pieces:
+                    if not should_continue():
+                        return out
+                    buf += piece
+                    if len(buf) < T.BUBBLE_MIN_CHUNK:
+                        continue
+                    cut = max(buf.rfind(" "), buf.rfind("\n"))
+                    if cut <= 0:
+                        continue
+                    chunk, buf = buf[:cut], buf[cut:]
+                    if not push(chunk):
+                        return out
+        except EmptyCompletion:
+            if not out.strip():
+                buf = EMPTY_WRITER_ANSWER
+        # Also cover custom stream adapters that silently finish without content.
+        if not out.strip() and not buf.strip():
+            buf = EMPTY_WRITER_ANSWER
         tail = buf.rstrip()
         if tail and should_continue():
             push(tail)

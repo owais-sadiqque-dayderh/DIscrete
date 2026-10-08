@@ -68,6 +68,23 @@ class ClaimDraft:
     occurred_to: float = 0.0
     entities: list[str] = field(default_factory=list)
     evidence: list[dict] = field(default_factory=list)  # [{observation_id, quote}]
+    # A completed action with consequences ("downloaded", "installed", "sent"), or "".
+    # Actions are never dropped for the per-episode cap, and get a causal trail (trails.py).
+    action: str = ""
+
+
+@dataclass
+class ClaimWrite:
+    """A prepared mutation; model calls and entity resolution precede persistence."""
+
+    draft: ClaimDraft
+    operation: str = "added"
+    target_id: int | None = None
+    refines_id: int | None = None
+    contested_id: int | None = None
+    vector: list[float] | None = None
+    text_hash: str = ""
+    mentions: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -80,6 +97,15 @@ class QueryPlan:
     interval: tuple[float, float] | None = None
     entity_kind_filter: str = ""
     needs_store: bool = True
+    # A question about the user as a whole ("what am I into"): the profile joins the records.
+    about_user: bool = False
+    # "Where does my time go": answered from attention totals (store/attention.py).
+    time_spent: bool = False
+    # Guarded deterministic activity aggregates using the page store.
+    page_operation: str = ""
+    page_search: str = ""
+    # Completion questions need an explicit evidence check before naming an action.
+    premise_check: bool = False
 
 
 @dataclass
@@ -104,6 +130,12 @@ class Hit:
     url: str = ""
     is_listing: bool = False
     navigated_from: str = ""
+    # How this record joined the result when it was not a search match: "led to claim 12:
+    # <why>" for a causal-trail link, "before claim 12" for the moments preceding it.
+    via: str = ""
+    action: str = ""
+    # For lasting claims: "established: seen in 4 episodes over 3 days" (store/beliefs.py).
+    strength: str = ""
 
     @property
     def text(self) -> str:
@@ -124,6 +156,63 @@ class RetrievalResult:
     hits: list[Hit] = field(default_factory=list)
     exhaustive: bool = False
     digest: str = ""
+    why_chain: WhyChain | None = None
+    page_answer: str = ""
 
     def of(self, kind: str) -> list[Hit]:
         return [h for h in self.hits if h.ref_kind == kind]
+
+
+@dataclass(frozen=True)
+class AttentionMoment:
+    """A visit, not a widened deduplicated observation interval."""
+
+    sighting_id: int
+    observation_id: int
+    at: float
+    ended_at: float
+    fields: dict[str, str]
+    app: str = ""
+    session_id: str = ""
+    episode_id: int | None = None
+    keys: int = 0
+    clicks: int = 0
+    clipboard: int = 0
+    updated_at: float = 0.0
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.fields.values())
+
+    @property
+    def title(self) -> str:
+        return self.fields.get("page_title") or self.fields.get("window_title") or self.app
+
+
+@dataclass(frozen=True)
+class ProvenanceEdge:
+    source: int
+    target: int
+    kind: str
+    confidence: float
+    source_field: str
+    source_quote: str
+    target_field: str
+    target_quote: str
+    gap_s: float
+    term: str = ""
+
+
+@dataclass
+class WhyChain:
+    effect: AttentionMoment | None = None
+    moments: list[AttentionMoment] = field(default_factory=list)
+    edges: list[ProvenanceEdge] = field(default_factory=list)
+    trails: list[dict] = field(default_factory=list)
+    reason: str = "effect not found"
+    candidates: list[AttentionMoment] = field(default_factory=list)
+    verified: bool = False
+
+    @property
+    def confidence(self) -> float:
+        return min((e.confidence for e in self.edges), default=0.0)

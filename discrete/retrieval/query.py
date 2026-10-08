@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from dataclasses import dataclass
 from datetime import timedelta
 
 from dateparser.search import search_dates
@@ -20,7 +21,7 @@ from ..llm import EXPECTED_ERRORS, complete_json
 from ..models import QueryPlan
 from ..timeutil import day_bounds, from_local, now, to_local
 
-INTENTS = frozenset({"edit", "recall", "temporal", "aggregate", "enumerate", "world", "continuation", "mixed"})
+INTENTS = frozenset({"edit", "recall", "temporal", "aggregate", "enumerate", "world", "continuation", "mixed", "why"})
 ENTITY_KINDS = frozenset({"person", "organization", "software", "website", "project", "file", "place", "topic"})
 
 _FILE = re.compile(r"[\w.-]+\.(?:py|js|ts|tsx|md|json|yaml|yml|txt|csv|pdf|png|jpg)\b", re.I)
@@ -32,7 +33,32 @@ _AGG = re.compile(r"\b(?:which|what)\b.*\b(?:have i|did i|do i)\b.*\b(?:use|used
 # record listed, not a synthesized summary or a count (planS3 §17).
 _ENUM = re.compile(r"\ball (?:the|of the)\b|\bevery\b|\blist\b|\bshow (?:me |all )\b"
                    r"|\bwhat .*\bdid i (?:open|read|visit|see|watch|look)\b", re.I)
+# "Why did I …", "what made me …": answered by following causal trails (trails.py).
+_WHY = re.compile(r"^\s*why\b|\bwhy (?:did|do|was|were|have|had) i\b|\bwhat (?:made|led|prompted|caused|got) me\b"
+                  r"|\bhow did i (?:end up|come to|get to|find|hear about|discover)\b|\breason (?:i|for my|why i)\b", re.I)
+# Questions about the user as a whole, answered best with the profile (process/profile.py).
+_ABOUT_USER = re.compile(
+    r"\babout me\b|\bmy (?:interests|hobbies|habits|routines?|projects|preferences|work|tools)\b"
+    r"|\b(?:what|which) (?:kinds?|sorts?|types?) of\b.*\b(?:i|me)\b"
+    r"|\b(?:am i|do i|i'm)\b.*\b(?:interested|into|building|working on|usually|tend to|often|prefer|rely on)\b"
+    r"|\bwho am i\b|\bdescribe me\b", re.I)
+# "what time on Monday did I…" asks when, not how long: no bare "time on".
+_TIME_SPENT = re.compile(r"\b(?:how much time|how long (?:did|do|have) i (?:spend|spent|been)|most (?:of my )?time|"
+                         r"time spent|spend(?:ing)? (?:my |the most )?time|spent (?:the )?most)\b", re.I)
 _EDIT_VERBS = ("fix", "rewrite", "complete", "summarize", "translate", "format", "rephrase", "shorten")
+# Match the user's completion question, not an action mentioned later in a recall question.
+_COMPLETED_ACTION = (
+    r"(?:book(?:ed)?|order(?:ed)?|buy|bought|pay|paid|send|sent|submit(?:ted)?|"
+    r"switch(?:ed)?|install(?:ed)?|subscribe(?:d)?|reply|replied|purchase(?:d)?)"
+)
+_PREMISE_CLOSED = re.compile(
+    r"^\s*(?:did|have|had)\s+i\s+(?:(?:actually|really)\s+)?" + _COMPLETED_ACTION + r"\b", re.I)
+_PREMISE_ACTUAL = re.compile(
+    r"\b(?:did|have|had)\s+i\s+(?:actually|really)\s+" + _COMPLETED_ACTION + r"\b", re.I)
+_PREMISE_CHOICE = re.compile(
+    r"^\s*(?:which|what)\b[^?]*\b(?:did|have|had)\s+i\s+" + _COMPLETED_ACTION
+    + r"\b[^?]*\bor\b", re.I)
+_PREMISE_TEMPORAL = re.compile(r"^\s*(?:when\b|what time\b|how (?:long|recently)\b)", re.I)
 # The request's own scaffolding. Searching for "list" or "opened" matches any row that
 # says so (a todo list), not the pages being asked about (insights.md §7.36).
 _ENUM_SCAFFOLD = frozenset(
@@ -45,6 +71,17 @@ def strip_scaffold(text: str) -> str:
     return " ".join(t for t in tk.content_tokens(text) if t not in _ENUM_SCAFFOLD)
 
 
+def is_why(text: str, plan: QueryPlan | None = None) -> bool:
+    return bool((plan and plan.intent == "why") or _WHY.search(text))
+
+
+def is_premise_question(text: str) -> bool:
+    """Completion checks (including either/or choices), excluding temporal recall."""
+    if _PREMISE_TEMPORAL.search(text) or is_why(text):
+        return False
+    return bool(_PREMISE_CLOSED.search(text) or _PREMISE_ACTUAL.search(text) or _PREMISE_CHOICE.search(text))
+
+
 KIND_VOCAB = {
     "software": ("tool", "tools", "app", "apps", "software", "program", "programs", "editor", "editors"),
     "website": ("site", "sites", "website", "websites", "domain", "domains", "page", "pages"),
@@ -52,6 +89,43 @@ KIND_VOCAB = {
     "project": ("project", "projects", "repo", "repos", "repository"),
     "file": ("file", "files", "document", "documents"),
 }
+
+
+@dataclass(frozen=True)
+class RelativeEvent:
+    phrase: str
+    direction: str
+    last: bool = False
+
+
+@dataclass
+class EventQueryPlan(QueryPlan):
+    anchor: RelativeEvent | None = None
+
+
+def relative_event(text: str) -> RelativeEvent | None:
+    # Causal questions have their own resolver; dates and clocks remain intervals.
+    if is_why(text):
+        return None
+    m = re.search(r"\b(?:(?:right|just|immediately)\s+)?(after|before)\s+(.+?)\s*[?.!]*$"
+                  r"|\bwhen\s+I\s+(finished\s+.+?)\s*[?.!]*$", text, re.I)
+    if not m:
+        return None
+    phrase = (m[2] or m[3]).strip().rstrip("?.!")
+    phrase = re.sub(r"^I\s+(?:had\s+)?", "", phrase, flags=re.I)
+    if not phrase or re.fullmatch(r"(?:\d[\d: .apm-]*|today|yesterday|last .+|this .+)", phrase, re.I):
+        return None
+    # A clock/date ("after midnight on Oct 1") is an interval, not an event.
+    if _TEMPORAL_CUE.search(phrase) or re.search(r"\b(?:midnight|noon|lunch|dinner|breakfast)\b", phrase, re.I):
+        return None
+    # Only the user's own next steps: "what did X reply after I…" asks for content the
+    # following moments cannot supply, and an unanswerable must stay a refusal.
+    head = text[:m.start()]
+    if not re.search(r"\b(?:what|where|which|who)\b.*\b(?:did|was|were|do)\s+I\b", head, re.I):
+        return None
+    last = bool(re.match(r"(?:finish(?:ed|ing)?|complet(?:ed|ing|e)|done with)\b", phrase, re.I))
+    return RelativeEvent(phrase, (m[1] or "after").lower(), last)
+
 
 # A dateparser match is trusted only if it contains one of these (planS3 Rev 3).
 _TEMPORAL_CUE = re.compile(
@@ -74,9 +148,9 @@ Return strict JSON:
 """
 
 
-async def build_plan(text: str) -> QueryPlan:
-    plan = fallback_plan(text)
-    if plan.intent == "edit" or not T.QUERY_LLM_PLAN:
+async def build_plan(text: str, *, relative_events: bool = True) -> QueryPlan:
+    plan = fallback_plan(text, relative_events=relative_events)
+    if plan.intent == "edit" or isinstance(plan, EventQueryPlan) or plan.page_operation or not T.QUERY_LLM_PLAN:
         return plan
     ep = utility_endpoint()
     if not ep.configured:
@@ -112,7 +186,7 @@ async def build_plan(text: str) -> QueryPlan:
     return plan
 
 
-def fallback_plan(text: str) -> QueryPlan:
+def fallback_plan(text: str, *, reference_at: float | None = None, relative_events: bool = True) -> QueryPlan:
     ents = list(dict.fromkeys(m.group(0) for m in _IDENT.finditer(text)))
     files = list(dict.fromkeys(m.group(0) for m in _FILE.finditer(text)))
     terms = tk.content_tokens(text)
@@ -124,9 +198,14 @@ def fallback_plan(text: str) -> QueryPlan:
         intent = "edit"
     elif "?" not in text and len(text.split()) > 12 and not (set(tk.tokens(text)[:2]) & tk.INTERROGATIVES):
         intent = "continuation"
-    interval = parse_interval(text)
+    interval = parse_interval(text, reference_at)
+    anchor = relative_event(text) if relative_events else None
     kind = ""
-    if intent == "recall" and _AGG.search(text):
+    if intent in ("recall", "continuation") and is_why(text):
+        intent = "why"
+    elif intent == "recall" and anchor:
+        intent = "temporal"
+    elif intent == "recall" and _AGG.search(text):
         intent = "aggregate"
         words = set(tk.tokens(text))
         kind = next((k for k, vocab in KIND_VOCAB.items() if words & set(vocab)), "")
@@ -136,8 +215,38 @@ def fallback_plan(text: str) -> QueryPlan:
         queries = list(dict.fromkeys(q for q in (strip_scaffold(x) for x in queries) if q))
     elif intent == "recall" and interval:
         intent = "temporal"
-    return QueryPlan(raw=text, intent=intent, queries=queries, entities=ents + files, terms=terms,
-                     interval=interval, entity_kind_filter=kind, needs_store=intent != "edit")
+    operation, page_search = page_request(text) if T.PAGES and intent not in ("edit", "continuation", "why") else ("", "")
+    if operation:
+        intent = "enumerate" if operation == "edited" else "aggregate"
+    plan_type = EventQueryPlan if anchor and intent == "temporal" else QueryPlan
+    plan = plan_type(raw=text, intent=intent, queries=queries, entities=ents + files, terms=terms,
+                     interval=interval, entity_kind_filter=kind, needs_store=intent != "edit",
+                     about_user=intent not in ("edit", "continuation") and bool(_ABOUT_USER.search(text)),
+                     time_spent=intent not in ("edit", "continuation") and bool(_TIME_SPENT.search(text)),
+                     page_operation=operation, page_search=page_search,
+                     premise_check=intent not in ("edit", "continuation") and is_premise_question(text))
+    if isinstance(plan, EventQueryPlan):
+        plan.anchor = anchor
+    return plan
+
+
+def page_request(text: str) -> tuple[str, str]:
+    """Closed personal activity forms; preference/ownership/causal questions stay on recall."""
+    low = text.lower().strip().rstrip("?")
+    period = r"(?:\s+(?:today|yesterday|this week|last week|this month|last month))?"
+    if re.fullmatch(r"what (?:did|do|have) i read (?:the )?most" + period, low):
+        return "read_most", ""
+    if re.fullmatch(r"(?:which|what) (?:repos|repositories) (?:do|did|have) i (?:return to|returned to|revisit)" + period, low):
+        return "returns", ""
+    if re.fullmatch(r"(?:which|what) (?:docs|documents|files) (?:did|do|have) i (?:edit|edited)" + period, low):
+        return "edited", ""
+    m = re.match(r"^how (?:long|much time)\s+(?:(?:did i spend|do i spend|have i spent)\s+)?on\s+(.+)$", low)
+    if m:
+        target = re.sub(r"\s+(?:today|yesterday|this (?:week|month|morning|evening)|last (?:week|month))$", "", m[1])
+        if target and not re.search(r"\b(?:why|prefer|own|bought|purchase|install|installing|and|or)\b", target):
+            target = {"x": "x.com", "twitter": "x.com"}.get(target.strip(), target.strip())
+            return "duration", target
+    return "", ""
 
 
 def parse_interval(text: str, ref: float | None = None) -> tuple[float, float] | None:
@@ -173,6 +282,15 @@ def parse_interval(text: str, ref: float | None = None) -> tuple[float, float] |
             t = ref - n * 3600
             return t - 3600, t + 3600
         return day_bounds(ref - n * 86400)
+    # A clock-only anchor identifies the captured moment across stored days. It
+    # must not silently become today's date (or discard yesterday's captures).
+    without_clock = re.sub(r"\b\d{1,2}:\d{2}\s*(?:am|pm)?\b", "", text, flags=re.I)
+    if is_why(text) and re.search(r"\b\d{1,2}:\d{2}\b", text) and not _TEMPORAL_CUE.search(without_clock):
+        return None
+    # No parser result can survive the cue filter without a cue in the input.
+    # Avoid language/date detection work on ordinary effect titles.
+    if not _TEMPORAL_CUE.search(text):
+        return None
     try:
         found = search_dates(text, settings={"PREFER_DATES_FROM": "past", "RELATIVE_BASE": local.replace(tzinfo=None)})
     except Exception:

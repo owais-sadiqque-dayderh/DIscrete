@@ -11,6 +11,7 @@ import numpy as np
 from .. import textkit as tk
 from ..config import T
 from ..models import ObservationDraft, world_text
+from ..page_identity import canonical_url, document_identity
 from ..timeutil import now
 from .base import StoreBase, rowid
 
@@ -22,6 +23,7 @@ _INSERT_COLS = (
 )
 _INSERT_SQL = (f"INSERT INTO observations({', '.join(_INSERT_COLS)}) "
                f"VALUES ({', '.join('?' * len(_INSERT_COLS))})")
+_LEGACY_SCREEN_TEXT_CAP = 12_000  # older golden captures already lost text at this boundary
 
 
 def _ph(ids: Sequence) -> str:
@@ -29,10 +31,27 @@ def _ph(ids: Sequence) -> str:
 
 
 class ObservationsMixin(StoreBase):
+    async def pending_enrichment(self, *, limit: int = 16) -> list[sqlite3.Row]:
+        return await self.q("SELECT * FROM observations WHERE origin='user' AND enrich_state='pending' "
+                            "ORDER BY id LIMIT ?", (limit,))
+
+    async def unsegmented_observations(self, *, limit: int = 1) -> list[sqlite3.Row]:
+        """User rows not yet in an episode, oldest first: the runtime's segmentation queue."""
+        return await self.q("SELECT * FROM observations WHERE origin='user' AND episode_id IS NULL "
+                            "ORDER BY id LIMIT ?", (limit,))
+
     async def add_observation(self, draft: ObservationDraft) -> tuple[int | None, bool]:
         """Insert, or collapse into an existing row. Returns (id, is_new)."""
 
+        def _sighting(conn, oid: int) -> None:
+            if draft.origin == "user":
+                ts = draft.started_at or now()
+                conn.execute("INSERT INTO sightings(obs_id, started_at, ended_at, keys, clicks, scrolls, clipboard) "
+                             "VALUES (?,?,?,?,?,?,?)", (oid, ts, max(draft.ended_at or ts, ts), draft.keys,
+                                                        draft.clicks, draft.scrolls, draft.clipboard))
+
         def _bump(conn, oid: int) -> None:
+            _sighting(conn, oid)
             conn.execute(
                 "UPDATE observations SET dup_count=dup_count+1, ended_at=MAX(ended_at, ?), updated_at=?, "
                 "keys=keys+?, clicks=clicks+?, scrolls=scrolls+?, clipboard=clipboard+? WHERE id=?",
@@ -68,10 +87,15 @@ class ObservationsMixin(StoreBase):
                 sig = tk.minhash(key, permutations=T.DEDUP_MINHASH_PERMUTATIONS)
                 if len(tk.word_shingles(key)) >= T.DEDUP_SHORT_SHINGLES:
                     recent = conn.execute(
-                        "SELECT o.id, m.sig FROM observations o JOIN obs_minhash m ON m.obs_id=o.id "
+                        "SELECT o.id, m.sig, o.url, o.window_title FROM observations o JOIN obs_minhash m ON m.obs_id=o.id "
                         "WHERE o.app=? AND o.site=? ORDER BY o.id DESC LIMIT 200",
                         (draft.app, site),
                     ).fetchall()
+                    # Similar screen text on a different page is still a different
+                    # object. Otherwise its sightings would be credited to the old URL.
+                    identity = canonical_url(draft.url) or document_identity(draft.app, draft.window_title)
+                    recent = [(r["id"], r["sig"]) for r in recent
+                              if (canonical_url(r["url"]) or document_identity(draft.app, r["window_title"])) == identity]
                     if (oid := _near_duplicate(sig, recent)) is not None:
                         _bump(conn, oid)
                         return oid, False
@@ -85,6 +109,19 @@ class ObservationsMixin(StoreBase):
                     tk.content_hash(draft.world_text()), text_hash, now(), now(),
                 ))
                 oid = rowid(cur)
+                # Older rows lack per-capture flags. Retain the first instrumented
+                # ID so checking an upgraded store does not accuse legacy captures.
+                conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES ('screen_text_flags_from', ?)", (str(oid),))
+                # Flag conservative cap hits per row, even when replaying old text.
+                # A count alone cannot prove that every capped row was acknowledged.
+                cap = next((n for n in (_LEGACY_SCREEN_TEXT_CAP, T.SCREEN_TEXT_MAX_CHARS)
+                            if n - 1 <= len(draft.screen_text) <= n), None)
+                if cap is not None or len(draft.screen_text) > T.SCREEN_TEXT_MAX_CHARS:
+                    conn.execute("INSERT INTO meta(key,value) VALUES (?,?) ON CONFLICT(key) "
+                                 "DO UPDATE SET value=excluded.value",
+                                 (f"screen_text_truncated:{oid}", str(cap or T.SCREEN_TEXT_MAX_CHARS)))
+                    self._metric(conn, "capture_screen_text_truncated")
+                _sighting(conn, oid)
                 conn.execute("INSERT INTO obs_minhash(obs_id, sig) VALUES (?, ?)", (oid, tk.minhash_bytes(sig)))
                 if draft.origin == "user":
                     self._bump_df(conn, tk.content_tokens(draft.world_text()))
@@ -153,6 +190,13 @@ class ObservationsMixin(StoreBase):
                 f"UPDATE observations SET episode_id=? WHERE id IN ({_ph(obs_ids)})",
                 [episode_id, *obs_ids],
             )
+
+    async def recent_texts(self, app: str, site: str, *, before: float, limit: int) -> list[str]:
+        """Screen text of the latest captures of one (app, site): the baseline for chrome."""
+        rows = await self.q("SELECT screen_text FROM observations WHERE origin='user' AND app=? AND site=? "
+                            "AND started_at <= ? AND screen_text != '' ORDER BY started_at DESC LIMIT ?",
+                            (app, site, before, limit))
+        return [r[0] for r in rows]
 
     async def observation_count(self) -> int:
         return await self.scalar("SELECT COUNT(*) FROM observations WHERE origin='user'")

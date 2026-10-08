@@ -1,0 +1,193 @@
+#!/bin/bash
+# jarvis — one command for DIscrete (this checkout; install as jarvis-exp to test a branch).
+#
+#   jarvis start              start watching + Bubble (Option+Tab) in the background
+#   jarvis stop               stop it
+#   jarvis restart            stop, then start (after editing .env)
+#   jarvis status             running or not, what's stored, blocked apps/sites, credit left
+#
+#   jarvis memories [N]       the last N memories DIscrete wrote about you (default 20)
+#   jarvis episodes [N]       the last N episodes: what you were doing, summarised (default 10)
+#   jarvis captured [N]       the last N raw captures: app, window, caption (default 20)
+#   jarvis ask "question"     ask from the terminal, with the records behind the answer
+#   jarvis search "question"  what search finds for a question (debugging a wrong answer)
+#   jarvis process            turn waiting episodes into memories now
+#   jarvis consolidate        run the hourly merge (entity pages, day digests) now
+#   jarvis cost               model calls, tokens and cost per component
+#
+#   jarvis profile            what it has learned about you, with the memories behind each point
+#   jarvis patterns           patterns learned across sessions, with how firmly each is held
+#   jarvis dream              learn patterns, resolve conflicts, refresh the profile now
+#   jarvis changes [SINCE]    the memory change log (e.g. jarvis changes 2h)
+#   jarvis history ID         every version of memory ID and why it changed
+#   jarvis forget ID          forget memory ID and never re-learn it (undo: jarvis revert)
+#   jarvis correct ID "text"  replace memory ID's wording with yours
+#   jarvis revert EVENT       undo one change from the change log
+#   jarvis graph [NAME]       people/projects/tools and how they connect
+#   jarvis export             write your memory as Markdown (a git folder; opens in Obsidian)
+#
+#   jarvis block app NAME     never watch an app      (e.g. jarvis block app WhatsApp)
+#   jarvis block site DOMAIN  never watch a website   (e.g. jarvis block site hdfcbank.com)
+#   jarvis unblock app|site X stop blocking it
+#   jarvis blocked            list what is blocked
+#
+#   jarvis setup              check permissions and models
+#   jarvis logs               follow the log
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+DIS="$ROOT"
+BIN="$DIS/.venv/bin/discrete"
+ENV_FILE="$DIS/.env"
+STATE="$HOME/.cache/jarvis-$(basename "$DIS")"
+LOG="$STATE/discrete.log"
+PIDF="$STATE/discrete.pid"
+mkdir -p "$STATE"
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+ok() { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$*"; }
+die() { printf '  \033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
+
+envval() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
+db() {
+  local dir; dir="$(envval DISCRETE_DATA_DIR)"; dir="${dir:-~/.cache/discrete}"
+  echo "${dir/#\~/$HOME}/discrete.db"
+}
+q() { sqlite3 -separator $'\t' "$(db)" "$1"; }
+
+running() {
+  if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; then return 0; fi
+  pgrep -f "$BIN run" >/dev/null
+}
+dis() { (cd "$DIS" && "$BIN" "$@"); }
+
+credit() {
+  local key; key="$(envval CORE_LM_API_KEY)"
+  [ -n "$key" ] || { warn "no CORE_LM_API_KEY in $ENV_FILE"; return; }
+  curl -s https://openrouter.ai/api/v1/credits -H "Authorization: Bearer $key" |
+    python3 -c 'import json,sys; d=json.load(sys.stdin)["data"]; print(f"  OpenRouter credit left: ${d["total_credits"]-d["total_usage"]:.2f}")' 2>/dev/null ||
+    warn "could not read OpenRouter credit"
+}
+
+start() {
+  [ -x "$BIN" ] || die "DIscrete is not installed: cd $DIS && uv venv .venv && VIRTUAL_ENV=.venv uv pip install -e '.[dev]'"
+  if running; then ok "DIscrete is already running"; return; fi
+  if pgrep -f "bin/discrete run" >/dev/null; then
+    warn "another DIscrete checkout is running (same Option+Tab); stopping it"
+    pkill -f "bin/discrete run" || true
+    sleep 1
+  fi
+  if pgrep -f "hindsight-activity run" >/dev/null; then
+    warn "the Hindsight agent is running too (same Option+Tab); stopping it"
+    pkill -f "hindsight-activity run" || true
+  fi
+  (cd "$DIS" && nohup "$BIN" run >>"$LOG" 2>&1 & echo $! >"$PIDF")
+  sleep 5
+  running || die "DIscrete stopped right away; see: jarvis logs   (or: jarvis setup)"
+  ok "DIscrete is watching; Bubble is on Option+Tab"
+}
+
+stop() {
+  if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; then
+    kill "$(cat "$PIDF")"; rm -f "$PIDF"; ok "DIscrete stopped"
+  elif pkill -f "$BIN run"; then ok "DIscrete stopped"
+  else ok "DIscrete was not running"; fi
+}
+
+# Edit DISCRETE_DENIED_APPS / DISCRETE_DENIED_SITES in .env (add or remove one entry).
+edit_list() {
+  python3 - "$ENV_FILE" "$1" "$2" "$3" <<'PY'
+import sys
+path, var, action, value = sys.argv[1:]
+lines = open(path).read().splitlines()
+idx = next((i for i, l in enumerate(lines) if l.startswith(var + "=")), None)
+items = [x.strip() for x in lines[idx].split("=", 1)[1].split(",") if x.strip()] if idx is not None else []
+low = [x.lower() for x in items]
+if action == "add":
+    if value.lower() in low:
+        print(f"  already blocked: {value}"); sys.exit(0)
+    items.append(value)
+else:
+    if value.lower() not in low:
+        print(f"  was not blocked: {value}"); sys.exit(0)
+    items = [x for x in items if x.lower() != value.lower()]
+line = f"{var}={','.join(items)}"
+if idx is None:
+    lines.append(line)
+else:
+    lines[idx] = line
+open(path, "w").write("\n".join(lines) + "\n")
+print(f"  {'blocked' if action == 'add' else 'unblocked'}: {value}")
+PY
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  start) bold "Starting DIscrete"; start; credit ;;
+  stop) stop ;;
+  restart) stop; sleep 1; start ;;
+  status)
+    bold "DIscrete"
+    running && ok "running (Bubble on Option+Tab)" || warn "stopped (jarvis start)"
+    if [ -f "$(db)" ]; then
+      q "select count(*) from observations; select count(*) from episodes; select count(*) from claims where status='live';
+         select coalesce(datetime(max(started_at),'unixepoch','localtime'),'never') from observations;" |
+        { read -r o; read -r e; read -r c; read -r last
+          echo "  stored: $o captures, $e episodes, $c memories (last capture: $last)"; }
+    fi
+    echo "  blocked apps:  $(envval DISCRETE_DENIED_APPS) (+ password managers)"
+    echo "  blocked sites: $(envval DISCRETE_DENIED_SITES)"
+    credit
+    ;;
+  memories)
+    q "select datetime(occurred_from,'unixepoch','localtime'), kind, modality, text from claims
+       where status='live' order by occurred_from desc limit ${1:-20};" |
+      awk -F'\t' '{printf "  %s  %-10s %-8s %s\n", substr($1,6,11), $2, $3, substr($4,1,140)}'
+    echo "  (event = something you did or viewed · fact/preference = lasting · engaged = you acted, passive = you only saw it)"
+    ;;
+  episodes)
+    q "select datetime(started_at,'unixepoch','localtime'), strftime('%H:%M',ended_at,'unixepoch','localtime'), status, title, summary
+       from episodes order by started_at desc limit ${1:-10};" |
+      awk -F'\t' '{printf "\n  %s–%s  [%s]  %s\n    %s\n", substr($1,6,11), $2, $3, $4, substr($5,1,260)}'
+    ;;
+  captured)
+    q "select datetime(started_at,'unixepoch','localtime'), app, window_title, caption from observations
+       order by id desc limit ${1:-20};" |
+      awk -F'\t' '{printf "  %s  %-14s %-30s %s\n", substr($1,6,11), substr($2,1,14), substr($3,1,30), substr($4,1,100)}'
+    ;;
+  ask) [ $# -gt 0 ] || die 'usage: jarvis ask "question"'; dis ask "$*" --records ;;
+  search) [ $# -gt 0 ] || die 'usage: jarvis search "question"'; dis query "$*" ;;
+  process) dis process ;;
+  consolidate) dis consolidate ;;
+  cost) dis stats ;;
+  block | unblock)
+    kind="${1:-}"; value="${2:-}"
+    [ -n "$value" ] && { [ "$kind" = app ] || [ "$kind" = site ]; } || die "usage: jarvis $cmd app NAME | jarvis $cmd site DOMAIN"
+    var=$([ "$kind" = app ] && echo DISCRETE_DENIED_APPS || echo DISCRETE_DENIED_SITES)
+    edit_list "$var" "$([ "$cmd" = block ] && echo add || echo remove)" "$value"
+    if running; then echo "  restarting DIscrete so it takes effect…"; stop; sleep 1; start; fi
+    ;;
+  blocked)
+    echo "  apps:  $(envval DISCRETE_DENIED_APPS)"
+    echo "         + always: 1Password, Bitwarden, Keychain Access, Passwords, LastPass, Dashlane, KeePassXC, Enpass"
+    echo "  sites: $(envval DISCRETE_DENIED_SITES)"
+    ;;
+  profile) dis profile --ids ;;
+  patterns)
+    q "select id, context, round(confidence,2), text from claims where status='live' and kind='pattern' order by confidence desc;" |
+      awk -F'\t' '{printf "  #%-5s %-12s %-5s %s\n", $1, $2, $3, $4}'
+    ;;
+  dream) dis dream --force ;;
+  changes) dis changes --since "${1:-all}" ;;
+  history) [ $# -gt 0 ] || die "usage: jarvis history ID"; dis history "$1" ;;
+  forget) [ $# -gt 0 ] || die "usage: jarvis forget ID"; dis forget "$1" ;;
+  correct) [ $# -gt 1 ] || die 'usage: jarvis correct ID "new wording"'; dis correct "$1" "$2" ;;
+  revert) [ $# -gt 0 ] || die "usage: jarvis revert EVENT"; dis revert "$1" ;;
+  graph) dis graph "${1:-}" ;;
+  export) dis export ;;
+  setup) dis doctor; dis doctor --models ;;
+  logs) tail -f "$LOG" ;;
+  help | -h | --help | *) sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+esac

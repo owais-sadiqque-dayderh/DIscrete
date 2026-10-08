@@ -14,9 +14,11 @@ import time
 from ..aio import spawn
 from ..capture import accessibility as ax
 from ..capture.frames import FrameGrabber
+from ..capture.privacy import denied
+from ..capture.redact import redact
 from ..capture.suppress import hold, note_agent_output, release
 from ..config import T, bubble_vision_endpoint
-from ..llm import EXPECTED_ERRORS, NotConfigured, complete_json, embed, image_part
+from ..llm import EXPECTED_ERRORS, NotConfigured, complete_json, embed, image_part, interactive
 from ..perf import PERF, since_ms
 from ..retrieval.gaps import maybe_record_gap
 from ..store import Store
@@ -56,6 +58,10 @@ class BubbleService:
         self.tap.stop()
         if self._task and not self._task.done():
             self._task.cancel()
+        tasks = [t for t in [self._task, *self._bg] if t is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         self.overlay.close()
         log.info("bubble stats: %s", self.stats)
 
@@ -68,7 +74,8 @@ class BubbleService:
     async def _warm(self) -> None:
         """Open the API connection now so the first trigger skips the TLS handshake."""
         try:
-            await embed(["warm"])
+            with interactive():
+                await embed(["warm"])
         except (NotConfigured, *EXPECTED_ERRORS):
             pass
 
@@ -120,7 +127,7 @@ class BubbleService:
         def shoot() -> bytes:
             g = FrameGrabber()
             try:
-                img = g.grab(snap.window_bounds, max_width=1280)
+                img = g.grab(snap.window_bounds, max_width=1280, window_id=snap.window_id)
             finally:
                 g.close()
             if img is None:
@@ -132,8 +139,9 @@ class BubbleService:
         jpeg = await asyncio.to_thread(shoot)
         if not jpeg:
             return "", ""
-        data = await complete_json(ep, [{"role": "user", "content": [
-            image_part(jpeg, detail="high"), {"type": "text", "text": FIELD_READ_PROMPT}]}], max_tokens=800)
+        with interactive():
+            data = await complete_json(ep, [{"role": "user", "content": [
+                image_part(jpeg, detail="high"), {"type": "text", "text": FIELD_READ_PROMPT}]}], max_tokens=800)
         if not isinstance(data, dict):
             return "", ""
         return str(data.get("current_text") or ""), str(data.get("field_description") or "")
@@ -146,8 +154,14 @@ class BubbleService:
         self.overlay.show(snap.caret)
         typed = ""
         try:
+            if denied(snap.app, url=snap.url):
+                # DENIED_APPS / DENIED_SITES: the field is not read, nor is the screen.
+                self.overlay.message("Bubble is off here", tone="warn")
+                return
             with PERF.timer("bubble.field_read"):
                 text, desc = await self._read_field(snap)
+            if T.REDACT_SECRETS:
+                text = redact(text).text  # the field goes to the planner and the writer
             if not field_query(text):
                 self.overlay.message("No text in this field", tone="warn")
                 return
@@ -166,7 +180,8 @@ class BubbleService:
                 return
             n = len(p.result.hits)
             log.info("bubble: mode=%s intent=%s hits=%d retrieve=%.2fs query=%r", p.mode, p.result.plan.intent,
-                     n, p.timings["retrieve_s"], p.query[:80])
+                     n, p.timings["retrieve_s"], "[encrypted store]" if getattr(
+                         self.store.conn, "_discrete_encrypted", False) else p.query[:80])
             if p.mode == "empty":
                 self.stats["empty"] += 1
                 self.overlay.message("Nothing on file about that", tone="muted")

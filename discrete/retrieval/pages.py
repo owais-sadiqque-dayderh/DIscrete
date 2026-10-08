@@ -14,6 +14,7 @@ import re
 import tldextract
 
 from .. import textkit as tk
+from ..page_identity import canonical_url
 
 # Window chrome that names no page (browser Spaces, blank documents).
 _GENERIC_TITLE = re.compile(r"^(?:space\s+\d+|untitled(?:\s+document)?|new\s+tab|document|window)$", re.I)
@@ -26,7 +27,7 @@ def is_generic_title(title: str) -> bool:
 
 
 def canon_url(url: str) -> str:
-    return url.split("#")[0].rstrip("/") if url else ""
+    return canonical_url(url)
 
 
 def url_label(url: str) -> str:

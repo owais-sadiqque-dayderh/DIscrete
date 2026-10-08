@@ -27,12 +27,20 @@ class FakeBackend:
 
     def __init__(self) -> None:
         self.draft: dict = {"title": "t", "summary": "s", "claims": []}
+        self.verification: dict[int, bool] = {}
+        self.support_indices: list[int] | None = None
         self.relations: dict[int, str] = {}
         self.consolidation: dict = {"claims": []}
         self.writer_reply = ""
         self.caption: dict | None = {"caption": "The user reads a page.", "useful": True}
         self.calls: list[str] = []
         self.embedded: list[str] = []  # every text sent to the embeddings endpoint
+        self.trail: dict = {"links": []}  # the trail model's proposal
+        self.trail_rejects: set[int] = set()  # link indices the trail verifier rejects
+        self.dream: dict = {"patterns": [], "audit": []}
+        self.dream_rejects: set[int] = set()
+        self.profile: dict = {"sections": []}
+        self.conflicts: dict = {"pairs": []}
 
     caption_gate = None  # an asyncio.Event the caption call waits on, when a test sets one
 
@@ -51,6 +59,18 @@ class FakeBackend:
             if self.caption is None:
                 raise llm.LLMError("caption model down")
             return json.dumps(self.caption)
+        if "Independently verify candidate memories" in p:
+            self.calls.append("verify")
+            block = p.split("\n\n", 1)[1].split("\n\nFor each", 1)[0]
+            candidates = json.loads(block)
+            return json.dumps({"decisions": [{"index": c["index"],
+                                "supported": self.verification.get(c["index"], True), "reason": "test decision"}
+                               for c in candidates]})
+        if "Select records that directly support" in p:
+            self.calls.append("support")
+            payload = json.loads(p.split("instructions:\n", 1)[1].split("\nReturn strict JSON", 1)[0])
+            return json.dumps({"supports": self.support_indices if self.support_indices is not None
+                              else [r["index"] for r in payload["records"]]})
         if "Compare NEW claims" in p:
             self.calls.append("relate")
             rels, cur = [], None
@@ -64,6 +84,27 @@ class FakeBackend:
         if "Rewrite them as a clear" in p:
             self.calls.append("consolidate")
             return json.dumps(self.consolidation)
+        if "plausibly led the user to this action" in p:
+            self.calls.append("trail")
+            return json.dumps(self.trail)
+        if "Check proposed links" in p:
+            self.calls.append("trail_verify")
+            n = len(json.loads(p.split("instructions.\n\n", 1)[1].split("\n\nFor each link", 1)[0])["links"])
+            return json.dumps({"decisions": [{"index": i, "supported": i not in self.trail_rejects} for i in range(n)]})
+        if "to find what holds\nacross separate sessions" in p:
+            self.calls.append("dream")
+            return json.dumps(self.dream)
+        if "Independently check proposed patterns" in p:
+            self.calls.append("dream_verify")
+            n = len(json.loads(p.split("instructions.\n\n", 1)[1].split("\n\nsupported=true", 1)[0])["items"])
+            return json.dumps({"decisions": [{"index": i, "supported": i not in self.dream_rejects}
+                                             for i in range(n)]})
+        if "Write a short profile of the user" in p:
+            self.calls.append("profile")
+            return json.dumps(self.profile)
+        if "pairs of memories about the user" in p:
+            self.calls.append("conflicts")
+            return json.dumps(self.conflicts)
         if "Plan a memory search" in p:
             self.calls.append("plan")
             return json.dumps({"intent": "retrieve_reading_history", "queries": [], "needs_store": False})
@@ -116,7 +157,8 @@ def fake(monkeypatch):
     }.items():
         monkeypatch.setenv(k, v)
     for k in ("CAPTION_LM_MODEL_NAME", "INSIGHT_LM_MODEL_NAME", "UTILITY_LM_MODEL_NAME", "CONSOLIDATE_LM_MODEL_NAME",
-              "CAPTION_LM_API_KEY", "INSIGHT_LM_API_KEY", "UTILITY_LM_API_KEY", "EMBED_LM_API_BASE"):
+              "CAPTION_LM_API_KEY", "INSIGHT_LM_API_KEY", "UTILITY_LM_API_KEY", "EMBED_LM_API_BASE",
+              "VERIFY_LM_MODEL_NAME", "VERIFY_LM_API_KEY", "VERIFY_LM_API_BASE"):
         monkeypatch.delenv(k, raising=False)
     backend = FakeBackend()
     prev = llm.get_backend()

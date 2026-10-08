@@ -191,6 +191,17 @@ def consolidate_endpoint() -> Endpoint:
     return _ep("consolidate", "CONSOLIDATE_LM", "INSIGHT_LM")
 
 
+def verifier_endpoint() -> Endpoint:
+    """Independent semantic support verification before committing memories."""
+    return _ep("verifier", "VERIFY_LM", "INSIGHT_LM")
+
+
+def dream_endpoint() -> Endpoint:
+    """Dreaming (process/dream.py): patterns across episodes, conflicts, the profile.
+    Runs rarely and reads a lot: a stronger model pays off here."""
+    return _ep("dream", "DREAM_LM", "CONSOLIDATE_LM", "INSIGHT_LM")
+
+
 def utility_endpoint() -> Endpoint:
     """Query planning, listwise rerank fallback (planS3)."""
     return _ep("utility", "UTILITY_LM")
@@ -220,7 +231,9 @@ def all_endpoints() -> list[Endpoint]:
     return [
         caption_endpoint(),
         insight_endpoint(),
+        verifier_endpoint(),
         consolidate_endpoint(),
+        dream_endpoint(),
         utility_endpoint(),
         embedding_endpoint(),
         rerank_endpoint(),
@@ -246,6 +259,20 @@ def frames_dir() -> Path:
     p = data_dir() / "frames"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def encrypt_at_rest() -> bool:
+    """Opt-in for new stores. Existing encrypted files are always detected on read."""
+    return _typed("ENCRYPT_AT_REST", False)
+
+
+def memory_export_dir() -> Path | None:
+    """Where the Markdown mirror of memory goes (export.py): DISCRETE_MEMORY_EXPORT_DIR,
+    default <data dir>/memory; "off" turns the automatic export after each dream off."""
+    raw = env("DISCRETE_MEMORY_EXPORT_DIR")
+    if raw and raw.lower() in ("off", "none", "false", "0"):
+        return None
+    return Path(os.path.expanduser(raw)) if raw else data_dir() / "memory"
 
 
 def golden_dir() -> Path:
@@ -280,14 +307,33 @@ class T:
     VLM_MAX_WIDTH = _typed("VLM_MAX_WIDTH", 1024)
     VLM_IMAGE_DETAIL = _typed("VLM_IMAGE_DETAIL", "low")
     SELF_APPS = [s.lower() for s in _typed("SELF_APPS", [])]
+    # Chromium web pages: read visible text through AX text markers (one call, line
+    # structured) instead of walking per-word nodes. Experimental until verified live.
+    AX_TEXT_MARKERS = _typed("AX_TEXT_MARKERS", False)
+    # Never watched at all: nothing stored, Bubble off there (capture/privacy.py).
+    DENIED_APPS = _typed("DENIED_APPS", [])
+    DENIED_SITES = _typed("DENIED_SITES", [])
+    # Credentials (API keys, tokens, passwords, JWTs, private keys) are removed from
+    # screen text, titles, URLs, captions and Bubble's field before storage or any model
+    # call; a capture with a secret keeps no frame (capture/redact.py).
+    REDACT_SECRETS = _typed("REDACT_SECRETS", True)
     SELF_WINDOW_PATTERNS = [s.lower() for s in _typed("SELF_WINDOW_PATTERNS", ["bin/discrete", "discrete run"])]
     CANVAS_APPS = [s.lower() for s in _typed(
         "CANVAS_APPS",
         ["figma", "illustrator", "photoshop", "sketch", "screen sharing", "remote desktop", "affinity"],
     )]
     LLM_TIMEOUT_S = _typed("LLM_TIMEOUT_S", 60.0)
+    # One retry policy owns all attempts (SDK retries are disabled). Elapsed requests
+    # and backoff gate retry starts; attempts keep their normal transport timeout.
+    # Bubble uses the shorter retry budget, including retrieval.
+    LLM_PROVIDER_RETRIES = _typed("LLM_PROVIDER_RETRIES", 3)
+    LLM_PROVIDER_RETRY_S = _typed("LLM_PROVIDER_RETRY_S", 1.5)
+    LLM_RETRY_MAX_S = _typed("LLM_RETRY_MAX_S", 90.0)
+    LLM_INTERACTIVE_RETRY_MAX_S = _typed("LLM_INTERACTIVE_RETRY_MAX_S", 8.0)
     # Vision calls in flight at once; captures never wait for them (capture/enrich.py).
     ENRICH_CONCURRENCY = _typed("ENRICH_CONCURRENCY", 2)
+    # Rows holding a caption task (and their images) at once; the rest wait on disk.
+    ENRICH_MAX_PENDING = _typed("ENRICH_MAX_PENDING", 8)
     # Windows remembered for the frame-duplicate check.
     LAST_KEPT_MAX = _typed("LAST_KEPT_MAX", 512)
 
@@ -297,20 +343,98 @@ class T:
     DEDUP_SHORT_SHINGLES = _typed("DEDUP_SHORT_SHINGLES", 30)
     EPISODE_SWITCH_MIN_S = _typed("EPISODE_SWITCH_MIN_S", 90.0)
     EPISODE_SHIFT_SIM = _typed("EPISODE_SHIFT_SIM", 0.55)
+    EPISODE_SHIFT_OBS = _typed("EPISODE_SHIFT_OBS", 2)
+    EPISODE_MERGE_SIM = _typed("EPISODE_MERGE_SIM", 0.90)
+    EPISODE_MERGE_GAP_S = _typed("EPISODE_MERGE_GAP_S", 60.0)
+    TASK_MATCH_SIM = _typed("TASK_MATCH_SIM", 0.80)
+    TASK_ENTITY_OVERLAP = _typed("TASK_ENTITY_OVERLAP", 0.5)
+    TASK_WINDOW_S = _typed("TASK_WINDOW_S", 86400.0)
+    TASK_RETRIEVAL_SIBLINGS = _typed("TASK_RETRIEVAL_SIBLINGS", 4)
     EPISODE_MAX_S = _typed("EPISODE_MAX_S", 1800.0)
+    # An episode closes at this many observations: what the drafter reads in one call.
+    EPISODE_MAX_OBS = _typed("EPISODE_MAX_OBS", 40)
     EPISODE_IDLE_CLOSE_S = _typed("EPISODE_IDLE_CLOSE_S", 300.0)
     CLAIM_MAX_CHARS = _typed("CLAIM_MAX_CHARS", 240)
-    DRAFT_TEXT_CHARS_PER_OBS = _typed("DRAFT_TEXT_CHARS_PER_OBS", 1200)
+    DRAFT_TEXT_CHARS_PER_OBS = _typed("DRAFT_TEXT_CHARS_PER_OBS", 2000)
+    # Lines recurring in more than CHROME_SHARE of the last CHROME_WINDOW captures of the
+    # same app and site (navigation, toolbars) are left out of what the drafter and the
+    # caption model read, never out of what is stored. 0 = off.
+    CHROME_SHARE = _typed("CHROME_SHARE", 0.3)
+    CHROME_WINDOW = _typed("CHROME_WINDOW", 50)
+    CHROME_MIN_CAPTURES = _typed("CHROME_MIN_CAPTURES", 5)
     DRAFT_MAX_EVENTS = _typed("DRAFT_MAX_EVENTS", 5)
+    # Long episodes get room for more events: one more per this many minutes past five,
+    # up to DRAFT_MAX_EVENTS_CAP. Completed actions have their own cap.
+    DRAFT_EVENT_MINUTES = _typed("DRAFT_EVENT_MINUTES", 3.0)
+    DRAFT_MAX_EVENTS_CAP = _typed("DRAFT_MAX_EVENTS_CAP", 10)
+    DRAFT_MAX_ACTIONS = _typed("DRAFT_MAX_ACTIONS", 6)
+    # The same action on the same thing within this window reinforces the earlier memory.
+    ACTION_DEDUP_WINDOW_S = _typed("ACTION_DEDUP_WINDOW_S", 3 * 3600.0)
+    ACTION_DEDUP_JACCARD = _typed("ACTION_DEDUP_JACCARD", 0.5)
     DRAFT_MAX_DURABLE = _typed("DRAFT_MAX_DURABLE", 5)
     DRAFT_MAX_OBS = _typed("DRAFT_MAX_OBS", 40)
     EVIDENCE_MIN_OVERLAP = _typed("EVIDENCE_MIN_OVERLAP", 0.2)
     DRAFT_MAX_ATTEMPTS = _typed("DRAFT_MAX_ATTEMPTS", 3)
+    # Failed drafts/embeddings are retried after this, then with doubling waits (outages).
+    FAILED_WORK_RETRY_S = _typed("FAILED_WORK_RETRY_S", 900.0)
     RELATE_CANDIDATES = _typed("RELATE_CANDIDATES", 5)
     OUTBOX_MAX_ATTEMPTS = _typed("OUTBOX_MAX_ATTEMPTS", 5)
     CANDIDATE_LIMIT = _typed("CANDIDATE_LIMIT", 8)
     RRF_K = _typed("RRF_K", 60.0)
-    CONSOLIDATION_INTERVAL_S = _typed("CONSOLIDATION_INTERVAL_S", 3600.0)
+    # In minutes when CONSOLIDATION_INTERVAL_MIN is set (it wins); the maintenance loop
+    # checks once a minute, so that is the finest step that means anything.
+    CONSOLIDATION_INTERVAL_MIN = _typed("CONSOLIDATION_INTERVAL_MIN", 0.0)
+    CONSOLIDATION_INTERVAL_S = (
+        CONSOLIDATION_INTERVAL_MIN * 60.0
+        if CONSOLIDATION_INTERVAL_MIN > 0
+        else _typed("CONSOLIDATION_INTERVAL_S", 3600.0)
+    )
+    # Dreaming (process/dream.py). Runs when BOTH this many minutes have passed since
+    # the last dream AND at least DREAM_MIN_NEW_EPISODES episodes closed since; 0 = never
+    # (run it by hand: discrete dream). Default: once a day.
+    DREAM_INTERVAL_MIN = _typed("DREAM_INTERVAL_MIN", 1440.0)
+    DREAM_MIN_NEW_EPISODES = _typed("DREAM_MIN_NEW_EPISODES", 5)
+    DREAM_WINDOW_DAYS = _typed("DREAM_WINDOW_DAYS", 30.0)
+    DREAM_MAX_MEMORIES = _typed("DREAM_MAX_MEMORIES", 400)
+    # A pattern rests on memories from at least this many episodes; habits and
+    # preferences also need this many days; "usually"/"daily" wording needs more.
+    DREAM_MIN_EPISODES = _typed("DREAM_MIN_EPISODES", 3)
+    DREAM_MIN_DAYS = _typed("DREAM_MIN_DAYS", 2)
+    DREAM_FREQUENCY_DAYS = _typed("DREAM_FREQUENCY_DAYS", 5)
+    # Episodes of one sitting are not "several sessions": a pattern also needs support
+    # from this many separate occasions (memories at least DREAM_OCCASION_GAP_MIN apart).
+    DREAM_MIN_OCCASIONS = _typed("DREAM_MIN_OCCASIONS", 2)
+    DREAM_OCCASION_GAP_MIN = _typed("DREAM_OCCASION_GAP_MIN", 60.0)
+    DREAM_DUPLICATE_SIM = _typed("DREAM_DUPLICATE_SIM", 0.85)
+    # Contradiction sweep: pairs this similar (but below CONSOLIDATE_SIM) are checked.
+    CONFLICT_SIM = _typed("CONFLICT_SIM", 0.55)
+    CONFLICT_MIN_GAP_S = _typed("CONFLICT_MIN_GAP_S", 3600.0)
+    DREAM_MAX_PAIRS = _typed("DREAM_MAX_PAIRS", 25)
+    # Facts, preferences and patterns not seen again for STALE_DAYS are flagged stale;
+    # a pattern unseen for PATTERN_RETIRE_DAYS is retired. Events never go stale.
+    STALE_DAYS = _typed("STALE_DAYS", 45.0)
+    PATTERN_RETIRE_DAYS = _typed("PATTERN_RETIRE_DAYS", 120.0)
+    # Attention (store/attention.py): a sighting lasts until the next one, at most this long.
+    DWELL_GAP_CAP_S = _typed("DWELL_GAP_CAP_S", 180.0)
+    DWELL_LAST_S = _typed("DWELL_LAST_S", 30.0)
+    PAGES = _typed("PAGES", True)
+    PAGE_VISIT_GAP_S = _typed("PAGE_VISIT_GAP_S", 300.0)
+    PAGE_QUERY_TOP = _typed("PAGE_QUERY_TOP", 10)
+    ATTENTION_MAX_DAYS = _typed("ATTENTION_MAX_DAYS", 90.0)
+    # The Markdown export as a git repo (every export a commit). Off by default: git keeps
+    # every version forever, so a forgotten memory would survive in its history.
+    MEMORY_EXPORT_GIT = _typed("MEMORY_EXPORT_GIT", False)
+    # Belief strength shown to Bubble: "established" once seen on this many days and episodes.
+    ESTABLISHED_DAYS = _typed("ESTABLISHED_DAYS", 3)
+    ESTABLISHED_EPISODES = _typed("ESTABLISHED_EPISODES", 3)
+    # Causal trails (process/trails.py): what led to each completed action.
+    TRAILS = _typed("TRAILS", True)
+    TRAIL_WINDOW_MIN = _typed("TRAIL_WINDOW_MIN", 30.0)
+    TRAIL_MAX_TERMS = _typed("TRAIL_MAX_TERMS", 4)
+    TRAIL_MAX_MOMENTS = _typed("TRAIL_MAX_MOMENTS", 20)
+    TRAIL_RECENT = _typed("TRAIL_RECENT", 5)
+    TRAIL_MAX_AGE_DAYS = _typed("TRAIL_MAX_AGE_DAYS", 7.0)
+    TRAIL_MAX_ATTEMPTS = _typed("TRAIL_MAX_ATTEMPTS", 3)
     CONSOLIDATE_SIM = _typed("CONSOLIDATE_SIM", 0.82)
     CONSOLIDATE_MAX_CLUSTER = _typed("CONSOLIDATE_MAX_CLUSTER", 8)
     LINEAGE_MAX_VERSIONS = _typed("LINEAGE_MAX_VERSIONS", 12)
@@ -320,7 +444,13 @@ class T:
     FACT_HALF_LIFE_DAYS = _typed("FACT_HALF_LIFE_DAYS", 180.0)
     PREF_HALF_LIFE_DAYS = _typed("PREF_HALF_LIFE_DAYS", 90.0)
     EVIDENCE_MAX_SUPPORTS = _typed("EVIDENCE_MAX_SUPPORTS", 12)
+    # A forgotten claim is not re-learned: new drafts this close to it are dropped.
+    SUPPRESS_SIM = _typed("SUPPRESS_SIM", 0.90)
+    SUPPRESS_JACCARD = _typed("SUPPRESS_JACCARD", 0.8)
     ENTITY_MIN_EPISODES = _typed("ENTITY_MIN_EPISODES", 2)
+    # Entity promotion and the entity graph are refreshed this often (minutes), besides
+    # every consolidation.
+    ENTITY_INTERVAL_MIN = _typed("ENTITY_INTERVAL_MIN", 10.0)
     FUZZY_AUTO = _typed("FUZZY_AUTO", 96.0)
     FUZZY_ADJUDICATE = _typed("FUZZY_ADJUDICATE", 88.0)
     ENTITY_EMBED_SIM = _typed("ENTITY_EMBED_SIM", 0.80)
@@ -336,7 +466,11 @@ class T:
     # ---- Stage 3 (planS3 §11)
     DENSE_HIT_THRESHOLD = _typed("DENSE_HIT_THRESHOLD", 0.5)
     CANDIDATE_POOL = _typed("CANDIDATE_POOL", 60)
+    # Entities named in a question add the memories that mention them as one more
+    # ranking list (ENTITY_RECALL); GRAPH_EXPAND also adds their strongest neighbours'.
+    ENTITY_RECALL = _typed("ENTITY_RECALL", True)
     GRAPH_EXPAND = _typed("GRAPH_EXPAND", False)
+    GRAPH_NEIGHBORS = _typed("GRAPH_NEIGHBORS", 3)
     EXHAUSTIVE_MAX_SPAN_S = _typed("EXHAUSTIVE_MAX_SPAN_S", 86400.0)
     ECHO_THRESHOLD = _typed("ECHO_THRESHOLD", 0.55)
     COVERAGE_FLOOR = _typed("COVERAGE_FLOOR", 0.12)
@@ -351,7 +485,28 @@ class T:
     LLM_RERANK = _typed("LLM_RERANK", False)
     LLM_RERANK_POOL = _typed("LLM_RERANK_POOL", 24)
     QUERY_LLM_PLAN = _typed("QUERY_LLM_PLAN", True)
+    # Verifier pass that drops related-but-unsupporting records (retrieval/support.py).
+    SUPPORT_CHECK = _typed("SUPPORT_CHECK", True)
+    SUPPORT_TIMEOUT_S = _typed("SUPPORT_TIMEOUT_S", 8.0)  # slower: results stay unverified
+    SUPPORT_TIMEOUT_WHY_S = _typed("SUPPORT_TIMEOUT_WHY_S", 25.0)
     TOP_K = _typed("TOP_K", 8)
+    # "Why did I …" (retrieval/hybrid.py expand_why): matched actions whose trails are
+    # followed, and, with no trail, how far back and how many moments before the action.
+    WHY_TARGETS = _typed("WHY_TARGETS", 3)
+    WHY_BEFORE_MIN = _typed("WHY_BEFORE_MIN", 10.0)
+    WHY_BEFORE_MAX = _typed("WHY_BEFORE_MAX", 5)
+    WHY_IMMEDIATE = _typed("WHY_IMMEDIATE", 2)
+    # Deterministic attention provenance: no model calls, visit-level evidence.
+    PROVENANCE = _typed("PROVENANCE", True)
+    PROVENANCE_WINDOW_S = _typed("PROVENANCE_WINDOW_S", 600.0)
+    PROVENANCE_BATCH = _typed("PROVENANCE_BATCH", 200)
+    PROVENANCE_MAX_PARENTS = _typed("PROVENANCE_MAX_PARENTS", 6)
+    WHY_CHAIN_DEPTH = _typed("WHY_CHAIN_DEPTH", 8)
+    WHY_CHAIN_WINDOW_S = _typed("WHY_CHAIN_WINDOW_S", 1800.0)
+    WHY_CHAIN_MIN_CONFIDENCE = _typed("WHY_CHAIN_MIN_CONFIDENCE", 0.55)
+    WHY_EFFECT_POOL = _typed("WHY_EFFECT_POOL", 300)
+    WHY_TIME_TOLERANCE_S = _typed("WHY_TIME_TOLERANCE_S", 180.0)
+    WHY_SITTING_GAP_S = _typed("WHY_SITTING_GAP_S", 10800.0)
     # Enumeration ("list all …") bypasses TOP_K/MMR: it returns every distinct page.
     ENUMERATE_MAX = _typed("ENUMERATE_MAX", 200)
     ENUMERATE_POOL = _typed("ENUMERATE_POOL", 400)

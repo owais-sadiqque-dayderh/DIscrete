@@ -326,12 +326,242 @@ def m005_perf_log(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX ix_perf_samples_at ON perf_samples(at)")
 
 
+def m006_unsegmented_index(conn: sqlite3.Connection) -> None:
+    # The runtime segments from the store (oldest unsegmented user row first). Without
+    # this, each lookup would scan every discarded and self-capture row too.
+    conn.execute("CREATE INDEX ix_obs_unsegmented ON observations(id) WHERE origin='user' AND episode_id IS NULL")
+
+
+def m007_memory_evolution(conn: sqlite3.Connection) -> None:
+    """The change log (store/history.py), typed links between memories (causal trails
+    and the graph, store/links.py) and suppressions for forgotten claims."""
+    conn.execute("""CREATE TABLE memory_events(
+      id INTEGER PRIMARY KEY,
+      at REAL NOT NULL,
+      op TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      claim_id INTEGER,
+      created TEXT NOT NULL DEFAULT '[]',
+      changes TEXT NOT NULL DEFAULT '[]',
+      reason TEXT NOT NULL DEFAULT '',
+      run_id TEXT NOT NULL DEFAULT '',
+      data TEXT NOT NULL DEFAULT '{}',
+      undone_by INTEGER)""")
+    conn.execute("CREATE INDEX ix_events_at ON memory_events(at)")
+    conn.execute("""CREATE TABLE memory_event_refs(
+      event_id INTEGER NOT NULL REFERENCES memory_events(id) ON DELETE CASCADE,
+      claim_id INTEGER NOT NULL,
+      PRIMARY KEY (event_id, claim_id))""")
+    conn.execute("CREATE INDEX ix_event_refs_claim ON memory_event_refs(claim_id)")
+    conn.execute("""CREATE TABLE links(
+      id INTEGER PRIMARY KEY,
+      src_kind TEXT NOT NULL,
+      src_id INTEGER NOT NULL,
+      dst_kind TEXT NOT NULL,
+      dst_id INTEGER NOT NULL,
+      relation TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0,
+      reason TEXT NOT NULL DEFAULT '',
+      evidence TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'live',
+      event_id INTEGER,
+      created_at REAL NOT NULL,
+      UNIQUE (src_kind, src_id, dst_kind, dst_id, relation))""")
+    conn.execute("CREATE INDEX ix_links_dst ON links(dst_kind, dst_id, relation)")
+    conn.execute("CREATE INDEX ix_links_src ON links(src_kind, src_id, relation)")
+    conn.execute("""CREATE TABLE suppressions(
+      id INTEGER PRIMARY KEY,
+      kind TEXT NOT NULL,
+      text TEXT NOT NULL,
+      norm_key TEXT NOT NULL,
+      vector BLOB,
+      claim_id INTEGER,
+      event_id INTEGER,
+      created_at REAL NOT NULL)""")
+    conn.execute("CREATE INDEX ix_suppressions_key ON suppressions(norm_key)")
+    _add_column(conn, "claims", "action", "TEXT NOT NULL DEFAULT ''")
+
+
+def m008_sightings(conn: sqlite3.Connection) -> None:
+    """Every time a window was seen, including captures collapsed into an earlier row as
+    duplicates, which used to keep only a widened interval. Attention (time on a site,
+    app or page, and whether the user was acting) is the strongest implicit preference
+    signal, and it needs these (store/attention.py)."""
+    conn.execute("""CREATE TABLE sightings(
+      id INTEGER PRIMARY KEY,
+      obs_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+      started_at REAL NOT NULL,
+      ended_at REAL NOT NULL,
+      keys INTEGER NOT NULL DEFAULT 0,
+      clicks INTEGER NOT NULL DEFAULT 0,
+      scrolls INTEGER NOT NULL DEFAULT 0,
+      clipboard INTEGER NOT NULL DEFAULT 0)""")
+    conn.execute("CREATE INDEX ix_sightings_at ON sightings(started_at)")
+    conn.execute("CREATE INDEX ix_sightings_obs ON sightings(obs_id)")
+    conn.execute("INSERT INTO sightings(obs_id, started_at, ended_at, keys, clicks, scrolls, clipboard) "
+                 "SELECT id, started_at, ended_at, keys, clicks, scrolls, clipboard FROM observations "
+                 "WHERE origin='user'")
+
+
+def m009_evidence_field(conn: sqlite3.Connection) -> None:
+    """Which field of the observation a quote was found in (screen_text, caption, title,
+    url): screen text is what the user saw verbatim; a caption is a model's description."""
+    _add_column(conn, "evidence", "field", "TEXT NOT NULL DEFAULT ''")
+
+
+def m010_episode_draft_chunks(conn: sqlite3.Connection) -> None:
+    """Checkpoint successful draft calls independently of the final claims transaction."""
+    conn.execute("""CREATE TABLE episode_draft_chunks(
+      episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+      chunk_index INTEGER NOT NULL,
+      input_hash TEXT NOT NULL,
+      result TEXT NOT NULL,
+      PRIMARY KEY (episode_id, chunk_index))""")
+    # Both normal drafting and the no-model path close episodes. Clear checkpoints
+    # atomically with closure, so a failed final transaction keeps them for retry.
+    conn.execute("""CREATE TRIGGER episodes_clear_draft_chunks AFTER UPDATE OF status ON episodes
+      WHEN new.status='closed' BEGIN
+        DELETE FROM episode_draft_chunks WHERE episode_id=new.id;
+      END""")
+
+
+def m011_tasks(conn: sqlite3.Connection) -> None:
+    """Tasks span drafted episodes; each episode belongs to at most one task."""
+    conn.execute("""CREATE TABLE tasks(
+      id INTEGER PRIMARY KEY,
+      title TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      first_seen REAL NOT NULL,
+      last_seen REAL NOT NULL)""")
+    conn.execute("CREATE INDEX ix_tasks_time ON tasks(last_seen)")
+    conn.execute("""CREATE TABLE episode_tasks(
+      episode_id INTEGER PRIMARY KEY REFERENCES episodes(id) ON DELETE CASCADE,
+      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      entities TEXT NOT NULL DEFAULT '[]')""")
+    conn.execute("CREATE INDEX ix_episode_tasks_task ON episode_tasks(task_id)")
+
+
+def m012_episode_draft_state(conn: sqlite3.Connection) -> None:
+    """Keep per-episode grace timers and boundary locks with their owning rows."""
+    _add_column(conn, "episodes", "ready_since", "REAL")
+    _add_column(conn, "episodes", "boundary_locked", "INTEGER NOT NULL DEFAULT 0")
+    conn.execute("UPDATE episodes SET ready_since=(SELECT CAST(value AS REAL) FROM meta "
+                 "WHERE key='episode_ready_since:' || episodes.id), "
+                 "boundary_locked=EXISTS(SELECT 1 FROM meta WHERE key='episode_boundary_locked:' || episodes.id)")
+    # Locks previously depended on key presence, even with a NULL or '0' value.
+    # Drop orphaned state too; deleting an episode now deletes its state with it.
+    conn.execute("DELETE FROM meta WHERE key GLOB 'episode_ready_since:*' "
+                 "OR key GLOB 'episode_boundary_locked:*'")
+    conn.execute("CREATE INDEX ix_ep_status_time ON episodes(status, started_at, id)")
+    conn.execute("CREATE INDEX ix_ep_unmerged ON episodes(started_at, id) WHERE status!='merged'")
+
+
+def m013_attention_provenance(conn: sqlite3.Connection) -> None:
+    """Quoted, deterministic visit-to-visit connections; cascade with raw evidence."""
+    conn.execute("""CREATE TABLE attention_provenance(
+      source INTEGER NOT NULL REFERENCES sightings(id) ON DELETE CASCADE,
+      target INTEGER NOT NULL REFERENCES sightings(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL,
+      confidence REAL NOT NULL CHECK(confidence BETWEEN 0 AND 1),
+      source_field TEXT NOT NULL, source_quote TEXT NOT NULL,
+      target_field TEXT NOT NULL, target_quote TEXT NOT NULL,
+      gap_s REAL NOT NULL CHECK(gap_s >= 0),
+      CHECK(source != target), PRIMARY KEY(source, target, kind))""")
+    conn.execute("CREATE INDEX ix_provenance_target ON attention_provenance(target, confidence DESC)")
+    conn.execute("""CREATE TABLE provenance_inputs(
+      sighting_id INTEGER PRIMARY KEY REFERENCES sightings(id) ON DELETE CASCADE,
+      updated_at REAL NOT NULL, rules_key TEXT NOT NULL)""")
+    # Enrichment/redaction changes can invalidate either end. Rebuild destinations
+    # in their bounded neighborhood, including out-of-order capture imports.
+    conn.execute("""CREATE TRIGGER provenance_observation_changed AFTER UPDATE OF
+      screen_text, caption, window_title, page_title, url, navigated_from, origin ON observations BEGIN
+        DELETE FROM provenance_inputs WHERE sighting_id IN
+          (SELECT target FROM attention_provenance WHERE source IN (SELECT id FROM sightings WHERE obs_id=new.id));
+        DELETE FROM attention_provenance WHERE source IN (SELECT id FROM sightings WHERE obs_id=new.id)
+          OR target IN (SELECT id FROM sightings WHERE obs_id=new.id);
+        DELETE FROM provenance_inputs WHERE sighting_id IN (SELECT id FROM sightings WHERE obs_id=new.id);
+      END""")
+
+
+def m014_pages(conn: sqlite3.Connection) -> None:
+    """Materialized page totals, with transactional invalidation of raw inputs."""
+    conn.execute("""CREATE TABLE pages(
+      id INTEGER PRIMARY KEY, canonical_url TEXT NOT NULL UNIQUE,
+      site TEXT NOT NULL, title TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('article','repo','video','product','chat','file','listing','search','doc','other')),
+      first_seen REAL NOT NULL DEFAULT 0, last_seen REAL NOT NULL DEFAULT 0,
+      visits INTEGER NOT NULL DEFAULT 0, dwell_s REAL NOT NULL DEFAULT 0,
+      active_dwell_s REAL NOT NULL DEFAULT 0, engaged INTEGER NOT NULL DEFAULT 0)""")
+    _add_column(conn, "observations", "page_id", "INTEGER REFERENCES pages(id) ON DELETE SET NULL")
+    conn.execute("CREATE INDEX ix_obs_page ON observations(page_id)")
+    conn.execute("CREATE INDEX ix_pages_kind ON pages(kind, active_dwell_s DESC)")
+    conn.execute("CREATE INDEX ix_sightings_order ON sightings(started_at, id)")
+    conn.execute("CREATE TABLE page_dirty_observations(obs_id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TABLE page_dirty_totals(page_id INTEGER PRIMARY KEY)")
+    conn.execute("""CREATE TRIGGER page_claim_forgotten AFTER UPDATE OF status ON claims
+      WHEN old.status='forgotten' OR new.status='forgotten' BEGIN
+        INSERT OR IGNORE INTO page_dirty_observations
+          SELECT e.observation_id FROM evidence e JOIN claims c ON c.id=e.claim_id
+          WHERE c.lineage_id=new.lineage_id;
+      END""")
+    # A new/removed sighting changes the preceding dwell and the following visit.
+    for event, ref in (("INSERT", "new"), ("DELETE", "old"), ("UPDATE", "old"), ("UPDATE", "new")):
+        timing = "AFTER" if ref == "new" else "BEFORE"
+        conn.execute(f"""CREATE TRIGGER page_sighting_{event.lower()}_{ref} {timing} {event} ON sightings BEGIN
+          INSERT OR IGNORE INTO page_dirty_observations VALUES ({ref}.obs_id);
+          INSERT OR IGNORE INTO page_dirty_observations
+            SELECT obs_id FROM sightings s JOIN observations o ON o.id=s.obs_id
+            WHERE o.origin='user' AND (s.started_at,s.id)<({ref}.started_at,{ref}.id)
+            ORDER BY s.started_at DESC,s.id DESC LIMIT 1;
+          INSERT OR IGNORE INTO page_dirty_observations
+            SELECT obs_id FROM sightings s JOIN observations o ON o.id=s.obs_id
+            WHERE o.origin='user' AND (s.started_at,s.id)>({ref}.started_at,{ref}.id)
+            ORDER BY s.started_at,s.id LIMIT 1;
+        END""")
+    conn.execute("""CREATE TRIGGER page_observation_insert AFTER INSERT ON observations BEGIN
+      INSERT OR IGNORE INTO page_dirty_observations VALUES (new.id);
+    END""")
+    conn.execute("""CREATE TRIGGER page_observation_change AFTER UPDATE OF
+      url,site,app,bundle_id,window_title,page_title,is_listing,origin ON observations BEGIN
+      INSERT OR IGNORE INTO page_dirty_observations VALUES (new.id);
+      INSERT OR IGNORE INTO page_dirty_totals SELECT old.page_id WHERE old.page_id IS NOT NULL;
+      INSERT OR IGNORE INTO page_dirty_observations
+        SELECT neighbor FROM (SELECT (SELECT s.obs_id FROM sightings s JOIN observations o ON o.id=s.obs_id
+          WHERE o.origin='user' AND (s.started_at,s.id)<(v.started_at,v.id)
+          ORDER BY s.started_at DESC,s.id DESC LIMIT 1) AS neighbor
+          FROM sightings v WHERE v.obs_id=new.id) WHERE neighbor IS NOT NULL;
+      INSERT OR IGNORE INTO page_dirty_observations
+        SELECT neighbor FROM (SELECT (SELECT s.obs_id FROM sightings s JOIN observations o ON o.id=s.obs_id
+          WHERE o.origin='user' AND (s.started_at,s.id)>(v.started_at,v.id)
+          ORDER BY s.started_at,s.id LIMIT 1) AS neighbor
+          FROM sightings v WHERE v.obs_id=new.id) WHERE neighbor IS NOT NULL;
+    END""")
+    conn.execute("""CREATE TRIGGER page_observation_delete BEFORE DELETE ON observations BEGIN
+      INSERT OR IGNORE INTO page_dirty_totals SELECT old.page_id WHERE old.page_id IS NOT NULL;
+    END""")
+
+
+def m015_provenance_term(conn: sqlite3.Connection) -> None:
+    """The visible term or value that links two attention moments."""
+    _add_column(conn, "attention_provenance", "term", "TEXT")
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_base,
     m002_draft_attempts_and_digest_counts,
     m003_structured_page_fields,
     m004_minhash_raw_bytes,
     m005_perf_log,
+    m006_unsegmented_index,
+    m007_memory_evolution,
+    m008_sightings,
+    m009_evidence_field,
+    m010_episode_draft_chunks,
+    m011_tasks,
+    m012_episode_draft_state,
+    m013_attention_provenance,
+    m014_pages,
+    m015_provenance_term,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)
@@ -370,14 +600,19 @@ def migrate(conn: sqlite3.Connection) -> int:
 
 
 def connect(path: str, *, read_only: bool = False) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False, timeout=30)
-    conn.row_factory = sqlite3.Row
-    if read_only:
-        # A second connection for retrieval: WAL lets it read while the writer writes.
-        conn.execute("PRAGMA query_only=ON")
+    from ..encryption import open_database
+
+    conn = open_database(path, read_only=read_only)
+    try:
+        if read_only:
+            # A second connection for retrieval: WAL lets it read while the writer writes.
+            conn.execute("PRAGMA query_only=ON")
+            return conn
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        migrate(conn)
         return conn
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    migrate(conn)
-    return conn
+    except BaseException:
+        conn.close()
+        raise

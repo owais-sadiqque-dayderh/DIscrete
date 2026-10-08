@@ -1,19 +1,22 @@
 """Runtime orchestration: capture → store → enrich → embed + segment → drafting → consolidation.
 
-    observer ──queue──▶ ingest ──▶ store row (basic caption) ──▶ enricher (vision, pooled)
+    observer ──queue──▶ ingest ──▶ store row (basic caption) ──▶ enricher (vision, bounded pool)
                                          │                               │
-                                         └──── segment queue (FIFO) ◀────┘ awaits its row's enrichment
+                                         └──── segmenter (oldest row) ◀──┘ waits for its row's caption
                                                      │
                                                      ▼
                                    embed once (vector stored) → episode tracker
 
-Ingest never waits on a model call. Segmentation consumes rows in capture order
-and waits for each row's caption, so episodes see final captions and vectors.
+Ingest never waits on a model call. The database is the segmentation queue: the
+segmenter always takes the oldest unsegmented row and waits while its caption is
+pending, so episodes see final captions in capture order. A caption backlog stays
+on disk (row + saved frame), never in memory, and resumes after a restart.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import signal
 import time
@@ -28,9 +31,14 @@ from .config import T
 from .llm import flush_usage
 from .perf import PERF, since_ms
 from .process.consolidate import run_consolidation
+from .process.dream import due as dream_due
+from .process.dream import run_dream
 from .process.embed_worker import drain_outbox, embed_row, observation_text
+from .process.entities import promote_recurring
 from .process.episodes import EpisodeTracker
 from .process.pipeline import ProcessPipeline
+from .process.provenance import build_provenance
+from .process.trails import build_trails
 from .store import Store
 from .timeutil import now
 
@@ -46,11 +54,11 @@ class Runtime:
 
             self.bubble = BubbleService(store)
         self.queue: asyncio.Queue[Capture] = asyncio.Queue()
-        # (row id, session, its enrichment task, perf_counter when stored)
-        self._segq: asyncio.Queue[tuple[int, str, asyncio.Task | None, float | None]] = asyncio.Queue()
+        # Set when a row is stored or a caption finishes: segmentation may advance.
+        self._wake = asyncio.Event()
         self.session = SessionTracker()
-        self.observer = ScreenObserver(queue=self.queue, session=self.session)
-        self.enricher = Enricher(store)
+        self.observer = ScreenObserver(queue=self.queue, session=self.session, store=store)
+        self.enricher = Enricher(store, on_done=self._wake.set)
         self.episodes = EpisodeTracker(store)
         self.pipeline = ProcessPipeline(store)
         self.events = EventTriggers(on_trigger=self.observer.trigger, on_idle=self._on_idle)
@@ -58,13 +66,11 @@ class Runtime:
         self._bg: set[asyncio.Task] = set()
         self._ep_lock = asyncio.Lock()
         self._counted: dict[str, int] = {}
+        self._seg_failures: dict[int, int] = {}
         self._started = 0.0
 
     async def start(self) -> None:
         await self.store.reset_stuck_drafting()
-        stale = await self.store.fail_stale_enrichment()
-        if stale:
-            log.info("%d captures from a previous run keep their basic caption", stale)
         recovered = await self.store.recover_open_episodes()
         if recovered:
             log.info("recovered %d open episodes from a previous run", len(recovered))
@@ -91,13 +97,21 @@ class Runtime:
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
-        # Captions still in flight are abandoned (their rows keep the basic caption);
-        # the rows are still segmented so no capture is left without an episode. No
-        # model calls on the way out: their vectors come from the outbox next run.
+        # Captions in flight stop; their rows stay pending with a saved frame and are
+        # captioned next run. Queued captures are stored (no model calls), and rows up
+        # to the first pending caption are segmented, keeping capture order. Vectors
+        # come from the outbox next run.
         await self.enricher.cancel_all()
-        while not self._segq.empty():
+        while not self.queue.empty():
             try:
-                await self._segment(*self._segq.get_nowait(), embed=False)
+                await self._ingest(self.queue.get_nowait())
+            except Exception:
+                log.exception("final ingest failed")
+        for row in await self.store.unsegmented_observations(limit=100_000):
+            if row["enrich_state"] == "pending":
+                break
+            try:
+                await self._segment(row["id"], row["session_id"], embed=False)
             except Exception:
                 log.exception("final segmentation failed")
         for t in list(self._bg):
@@ -123,34 +137,51 @@ class Runtime:
         async with self._ep_lock:
             await self.episodes.close_current()
 
+    async def _ingest(self, cap: Capture) -> None:
+        oid, is_new = await self.store.add_observation(cap.draft)
+        if not (is_new and oid) or cap.draft.origin != "user":
+            return  # a duplicate costs no vision call
+        PERF.sample("ingest.stored", since_ms(cap.queued_at), ref_id=oid)  # queued → row written
+        if cap.job is not None:
+            self.enricher.submit(oid, cap.job)  # over the pool limit: resumed from its saved frame
+        self._wake.set()
+
     async def _ingest_loop(self) -> None:
         while True:
             cap = await self.queue.get()
             try:
-                oid, is_new = await self.store.add_observation(cap.draft)
-                if not (is_new and oid) or cap.draft.origin != "user":
-                    continue  # a duplicate costs no vision call
-                stored = time.perf_counter()
-                PERF.sample("ingest.stored", since_ms(cap.queued_at), ref_id=oid)  # queued → row written
-                task = self.enricher.submit(oid, cap.job) if cap.job is not None else None
-                await self._segq.put((oid, cap.draft.session_id, task, stored))
+                await self._ingest(cap)
             except Exception:
                 log.exception("ingest failed")
                 await self.store.bump_metric("ingest_errors")
 
     async def _segment_loop(self) -> None:
         while True:
-            item = await self._segq.get()
+            self._wake.clear()
+            rows = []
             try:
-                await self._segment(*item)
+                skip = {oid for oid, n in self._seg_failures.items() if n >= 3}
+                rows = [r for r in await self.store.unsegmented_observations(limit=len(skip) + 1)
+                        if r["id"] not in skip]
+                if rows and rows[0]["enrich_state"] != "pending":
+                    await self._segment(rows[0]["id"], rows[0]["session_id"])
+                    continue
+                if rows:
+                    await self.enricher.fill_pending()  # the oldest row waits; keep the pool busy
             except Exception:
                 log.exception("segmentation failed")
                 await self.store.bump_metric("segment_errors")
+                if rows:
+                    # A row that keeps failing is left unassigned for this run instead of
+                    # blocking every later capture.
+                    self._seg_failures[rows[0]["id"]] = self._seg_failures.get(rows[0]["id"], 0) + 1
+                await asyncio.sleep(1.0)
+                continue
+            # Woken by ingest or a finished caption; the timeout is only a safety net.
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._wake.wait(), timeout=30.0)
 
-    async def _segment(self, oid: int, session_id: str, task: asyncio.Task | None, stored: float | None = None, *,
-                       embed: bool = True) -> None:
-        if task is not None:
-            await asyncio.gather(task, return_exceptions=True)  # the enricher records its own outcome
+    async def _segment(self, oid: int, session_id: str, *, embed: bool = True) -> None:
         row = await self.store.get_observation(oid)
         if row is None or row["origin"] != "user":
             return  # discarded as useless by the vision call
@@ -160,8 +191,7 @@ class Runtime:
                 vec = await embed_row(self.store, "observation", oid, observation_text(row))
         async with self._ep_lock:
             await self.episodes.on_observation(oid, row, session_id=session_id, vec=vec)
-        if stored is not None:
-            PERF.sample("segment.lag", since_ms(stored), ref_id=oid)  # stored → in an episode
+        PERF.sample("segment.lag", max(0.0, (now() - row["created_at"]) * 1000), ref_id=oid)  # stored → in an episode
 
     def _flush_counters(self) -> None:
         """Observer and enricher counters as perf events (deltas since the last flush),
@@ -186,21 +216,56 @@ class Runtime:
             await asyncio.sleep(5.0)
 
     async def _maint_loop(self) -> None:
-        last_retention = 0.0
+        last = {"retention": 0.0, "entities": 0.0}
+
+        async def consolidation() -> None:
+            if now() - float(await self.store.get_meta("last_consolidation", "0") or 0) >= T.CONSOLIDATION_INTERVAL_S:
+                log.info("consolidation: %s", await run_consolidation(self.store))
+
+        async def trails() -> None:
+            if made := await build_trails(self.store):
+                log.info("causal trails: %d links", made)
+
+        async def entities() -> None:
+            # Entities and their links between full consolidations, so a session shorter
+            # than the merge interval still gets a graph.
+            if time.time() - last["entities"] >= T.ENTITY_INTERVAL_MIN * 60:
+                last["entities"] = time.time()
+                if promoted := await promote_recurring(self.store):
+                    log.info("entities: +%d, %d links", promoted, await self.store.rebuild_edges())
+
+        async def dream() -> None:
+            if await dream_due(self.store):
+                log.info("dream: %s", await run_dream(self.store))
+
+        async def retention() -> None:
+            if time.time() - last["retention"] >= 3600:
+                last["retention"] = time.time()
+                log.info("retention: %s", await run_retention(self.store))
+
+        async def housekeeping() -> None:
+            await self.store.retry_failed_drafts(older_than_s=T.FAILED_WORK_RETRY_S)
+            await self.store.retry_failed_outbox(older_than_s=T.FAILED_WORK_RETRY_S)
+            await drain_outbox(self.store)
+
+        async def provenance() -> None:
+            await build_provenance(self.store)
+
+        steps = (provenance, housekeeping, trails, entities, consolidation, dream, retention)
         while True:
+            # Each step on its own: one failing (a model outage, a bad reply) must not
+            # starve the others, as a single shared try did.
+            for step in steps:
+                try:
+                    await step()
+                except Exception:
+                    log.exception("maintenance step %s failed", step.__name__)
+                    await self.store.bump_metric(f"maint_errors_{step.__name__}")
             try:
-                await drain_outbox(self.store)
-                last = float(await self.store.get_meta("last_consolidation", "0") or 0)
-                if now() - last >= T.CONSOLIDATION_INTERVAL_S:
-                    log.info("consolidation: %s", await run_consolidation(self.store))
-                if time.time() - last_retention >= 3600:
-                    log.info("retention: %s", await run_retention(self.store))
-                    last_retention = time.time()
                 self._flush_counters()
                 await flush_usage(self.store)
             except Exception:
-                log.exception("maintenance failed")
-                await self.store.bump_metric("maint_errors")
+                log.exception("usage flush failed")
             await asyncio.sleep(60.0)
 
     async def _heartbeat_loop(self) -> None:
@@ -218,12 +283,12 @@ async def run(*, bubble: bool = True) -> None:
     PERF.source = "live"
     store = await Store.open()
     rt = Runtime(store, bubble=bubble)
-    await rt.start()
     # SIGTERM (kill, launchd) stops as cleanly as Ctrl-C: work in flight is closed and
     # the last minute of measurements is written.
     stop = asyncio.Event()
     asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop.set)
     try:
+        await rt.start()
         await stop.wait()
     finally:
         await rt.stop()

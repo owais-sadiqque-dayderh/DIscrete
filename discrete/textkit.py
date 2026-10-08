@@ -16,6 +16,8 @@ import numpy as np
 import tldextract
 from datasketch import MinHash
 
+from .perf import PERF
+
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.@/\-'’]*")
 _EDGE = "._-/'’@"
 _POSSESSIVE = re.compile(r"['’]s$", re.IGNORECASE)
@@ -140,6 +142,10 @@ def best_window(text: str, terms: set[str], width: int = 40) -> tuple[str, float
 
 def truncate(text: str, n: int) -> str:
     text = text or ""
+    if len(text) > n:
+        # Count actual cuts by their limit. In particular, the caption's 4000
+        # character cut is observable without coupling utilities to enrichment.
+        PERF.count(f"health.text_truncated.{n}")
     return text if len(text) <= n else text[: max(0, n - 1)].rstrip() + "…"
 
 
@@ -268,3 +274,24 @@ def site_from_url(url: str) -> str:
     except Exception:
         pass
     return ""
+
+
+def chrome_lines(texts: list[str], *, share: float, min_texts: int) -> set[str]:
+    """Normalized lines recurring in more than `share` of `texts` (captures of one app and
+    site): navigation, toolbars, trending lists. Fewer than `min_texts` captures say
+    nothing reliable, so then nothing is chrome. Recurrence also catches content that
+    stays on screen (a chat transcript); callers drop chrome only where a repeat adds
+    nothing (the drafter and the caption prompt), never from what is stored."""
+    if len(texts) < min_texts:
+        return set()
+    counts: dict[str, int] = {}
+    for text in texts:
+        for key in {norm_key(line) for line in (text or "").splitlines() if line.strip()}:
+            counts[key] = counts.get(key, 0) + 1
+    return {k for k, n in counts.items() if n / len(texts) > share}
+
+
+def without_lines(text: str, drop: set[str]) -> str:
+    if not drop:
+        return text
+    return "\n".join(line for line in (text or "").splitlines() if norm_key(line) not in drop)

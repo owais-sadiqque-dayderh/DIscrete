@@ -16,11 +16,13 @@ def ocr_image(img) -> str:
     if img is None:
         return ""
     buf = io.BytesIO()
-    img.convert("RGB").save(buf, "JPEG", quality=90)
+    # Lossless input matters for small glyphs in videos and images.
+    img.convert("RGB").save(buf, "PNG")
     return ocr_jpeg(buf.getvalue())
 
 
 def ocr_jpeg(jpeg: bytes) -> str:
+    """Recognize encoded image bytes (JPEG or PNG)."""
     if not jpeg:
         return ""
     try:
