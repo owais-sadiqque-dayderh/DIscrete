@@ -219,6 +219,13 @@ def _ep(name: str, *prefixes: str, model_fallback: bool = True) -> Endpoint:
     return Endpoint(name, first(*bases), first(*keys), first(*models), prefix=prefixes[0], **opts)
 
 
+def component_endpoint(name: str, *prefixes: str) -> Endpoint:
+    """An endpoint for a component outside DIscrete (e.g. the jarvis bridge): the first of
+    `<prefix>_MODEL_NAME`/`_API_BASE`/`_API_KEY` that is set, then CORE_LM, with the same
+    request-setting cascade as DIscrete's own chat components."""
+    return _ep(name, *prefixes)
+
+
 def caption_endpoint() -> Endpoint:
     """Vision model for Stage 1 enrichment (planS1 §6.2)."""
     return _ep("caption", "CAPTION_LM")

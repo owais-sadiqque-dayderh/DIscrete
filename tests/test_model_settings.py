@@ -93,3 +93,18 @@ async def test_a_model_that_thinks_past_its_limit_raises_a_fix_it_error(env):
 def test_every_component_is_listed_for_doctor_and_bench(env):
     names = [ep.name for ep in config.all_endpoints()]
     assert "bubble_vision" in names and len(names) == len(set(names))
+
+
+def test_component_endpoint_cascades_like_own_components(monkeypatch):
+    from discrete.config import component_endpoint
+
+    monkeypatch.setenv("CORE_LM_MODEL_NAME", "core-model")
+    monkeypatch.setenv("CORE_LM_API_KEY", "k")
+    monkeypatch.setenv("VERIFY_LM_MODEL_NAME", "verify-model")
+    monkeypatch.delenv("X_LM_MODEL_NAME", raising=False)
+    assert component_endpoint("x", "X_LM", "VERIFY_LM").model == "verify-model"
+    monkeypatch.setenv("X_LM_MODEL_NAME", "own-model")
+    monkeypatch.setenv("X_LM_REASONING_EFFORT", "none")
+    monkeypatch.setenv("CORE_LM_REASONING_EFFORT", "minimal")
+    ep = component_endpoint("x", "X_LM", "VERIFY_LM")
+    assert (ep.name, ep.model, ep.reasoning_effort) == ("x", "own-model", None)
