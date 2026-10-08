@@ -114,4 +114,4 @@ FIELD_READ_PROMPT = """This screenshot shows one app window. Find the text input
 
 Return JSON only: {"field_description": "...", "current_text": "..."}
 
-current_text is the EXACT text in that field up to the caret, verbatim, never summarised. If no focused text field is visible, return "" for it."""
+current_text is the EXACT text in that field up to the caret, verbatim, never summarised; leave out the caret itself and any greyed-out placeholder text. If no focused text field is visible, return "" for it."""

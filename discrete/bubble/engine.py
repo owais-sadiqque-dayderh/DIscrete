@@ -200,6 +200,10 @@ def render_records(result: RetrievalResult, *, max_chars: int | None = None) -> 
 #: put an unrelated line in the field (seen live: "From xa11y: xa11y" for a salary question).
 EMPTY_WRITER_ANSWER = "(nothing on file about that)"
 
+#: Said before an answer whose support check timed out. The CLI and benchmarks print it;
+#: the hotkey Bubble shows it on the pill instead of typing it into the user's field.
+UNVERIFIED_NOTE = "Support check timed out; this answer is not verified."
+
 
 class BubbleEngine:
     def __init__(self, store: Store, user_name: str = USER_NAME):
@@ -273,7 +277,7 @@ class BubbleEngine:
             return True
 
         if p.mode == "unverified":
-            if not push("Support check timed out; this answer is not verified. "):
+            if not push(UNVERIFIED_NOTE + " "):
                 return out
 
         max_tokens = T.ENUMERATE_WRITER_MAX_TOKENS if p.mode == "enumerate" else T.BUBBLE_WRITER_MAX_TOKENS

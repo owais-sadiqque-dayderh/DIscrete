@@ -7,22 +7,26 @@ registered as agent output, so DIscrete never models its own answers.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import time
 
 from ..aio import spawn
 from ..capture import accessibility as ax
+from ..capture import ocr
+from ..capture.frames import FrameGrabber
 from ..capture.privacy import denied
-from ..capture.redact import redact
+from ..capture.redact import redact, redact_capture
 from ..capture.suppress import hold, note_agent_output, release
-from ..config import T
-from ..llm import EXPECTED_ERRORS, NotConfigured, embed, interactive
+from ..config import T, bubble_vision_endpoint
+from ..llm import EXPECTED_ERRORS, NotConfigured, complete_json, embed, image_part, interactive
 from ..perf import PERF, since_ms
 from ..retrieval.gaps import maybe_record_gap
 from ..store import Store
-from .engine import BubbleEngine, EmptyField, field_query
+from .engine import EMPTY_WRITER_ANSWER, UNVERIFIED_NOTE, BubbleEngine, EmptyField, field_query, needs_space
 from .keys import HotkeyTap, type_text
 from .overlay_client import Overlay
+from .prompts import FIELD_READ_PROMPT
 
 log = logging.getLogger("discrete.bubble")
 
@@ -120,24 +124,70 @@ class BubbleService:
         """Is the destination still the window, page and field the hotkey fired in?
 
         Same-app focus changes (another field, tab or page) keep the PID, so each
-        chunk rechecks window, URL (without fragment), the focused AX element and the
-        deny policy, failing closed when any of them cannot be read."""
+        chunk rechecks the app, window, URL (without fragment), the focused AX element
+        and the deny policy. A different app, window, page or field stops typing. A
+        value that cannot be read right now (Chromium's URL or focused element under a
+        0.25 s AX timeout, or a field AX never exposed) is not evidence of a move: the
+        app and window still have to match, and the PID watcher still runs. Failing
+        closed on those stopped every answer in Arc and other Chromium/Electron apps."""
         ctx = ax.window_context()
-        if (not ctx.pid or ctx.pid != snap.pid or ctx.window_id != snap.window_id
-                or ctx.url.split("#")[0] != snap.url.split("#")[0]
-                or denied(ctx.app, bundle_id=ctx.bundle_id, url=ctx.url)):
+        if not ctx.pid or ctx.pid != snap.pid or denied(ctx.app, bundle_id=ctx.bundle_id, url=ctx.url):
+            return False
+        if ctx.window_id and snap.window_id and ctx.window_id != snap.window_id:
+            return False
+        if ctx.url and snap.url and ctx.url.split("#")[0] != snap.url.split("#")[0]:
             return False
         create = getattr(ax, "AXUIElementCreateApplication", None)
         if snap.element is None or create is None:
-            return False
-        return ax._ax_get(create(snap.pid), "AXFocusedUIElement") == snap.element
+            return True
+        now = ax._ax_get(create(snap.pid), "AXFocusedUIElement")
+        return now is None or now == snap.element
 
     async def _read_field(self, snap: ax.FocusSnapshot) -> tuple[str, str]:
-        """(text up to the caret, field description): AX only; unapproved pixels never leave the device."""
+        """(text up to the caret, field description): AX first, vision second.
+
+        Chromium and Electron fields (Arc, Chrome, Slack, Discord, ChatGPT …) usually
+        expose no text to AX, so without the screenshot Bubble saw an empty field there.
+        The window image gets the same local approval as a capture frame before it
+        leaves the device: it is OCR'd on device and dropped if the text holds a secret."""
         if snap.has_text:
             return snap.text_to_caret, snap.description or snap.role or "text field"
-        # Vision is disabled until each outgoing image has local privacy approval.
-        return "", ""
+        ep = bubble_vision_endpoint()
+        if not ep.configured or not snap.window_bounds:
+            return "", ""
+        self.overlay.status("Reading the screen")
+        jpeg = await asyncio.to_thread(self._approved_window_jpeg, snap)
+        if not jpeg:
+            return "", ""
+        with interactive():
+            data = await complete_json(ep, [{"role": "user", "content": [
+                image_part(jpeg, detail="high"), {"type": "text", "text": FIELD_READ_PROMPT}]}], max_tokens=800)
+        if not isinstance(data, dict):
+            return "", ""
+        return str(data.get("current_text") or ""), str(data.get("field_description") or "")
+
+    @staticmethod
+    def _approved_window_jpeg(snap: ax.FocusSnapshot) -> bytes:
+        """The focused window as JPEG, or b"" when it may not leave the device."""
+        g = FrameGrabber()
+        try:
+            img = g.grab(snap.window_bounds, max_width=1280, window_id=snap.window_id)
+        finally:
+            g.close()
+        if img is None:
+            return b""
+        if T.REDACT_SECRETS:
+            try:
+                text = ocr.ocr_image(img)
+            except Exception as exc:  # unread pixels cannot be approved for egress
+                log.info("bubble: screen not read on device (%s); not sent", type(exc).__name__)
+                return b""
+            if redact_capture("", snap.url, text, "ocr").drop_frame:
+                log.info("bubble: a secret is on screen; screenshot not sent")
+                return b""
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, "JPEG", quality=75)
+        return buf.getvalue()
 
     async def _run(self, snap: ax.FocusSnapshot) -> None:
         self.stats["triggers"] += 1
@@ -190,8 +240,22 @@ class BubbleService:
                 self.overlay.status(f"Writing from {n} source{'s' if n != 1 else ''}" if n else "Writing")
                 snap.restore()
 
+                notes: list[str] = []
+
                 def emit(chunk: str) -> bool:
                     nonlocal moved
+                    # Notes about the answer go on the pill, never into the user's field.
+                    if chunk.strip() in (UNVERIFIED_NOTE, EMPTY_WRITER_ANSWER):
+                        notes.append(chunk.strip())
+                        if chunk.strip() == UNVERIFIED_NOTE:
+                            self.overlay.status("Not verified — writing a hedged answer")
+                        return True
+                    if notes and not emitted:  # the engine spaced the note, not these first words
+                        chunk = chunk.lstrip()
+                        if not chunk:
+                            return True
+                        if needs_space(text, chunk):
+                            chunk = " " + chunk
                     if not self._focus_matches(snap):
                         moved = True
                         return False
@@ -200,14 +264,19 @@ class BubbleService:
                     emitted.append(chunk)
                     return True
 
-                typed = await self.engine.write(p, emit=emit, should_continue=lambda: not watcher.done())
+                await self.engine.write(p, emit=emit, should_continue=lambda: not watcher.done())
+                typed = "".join(emitted)
                 if moved and not typed:
                     self.overlay.message("Focus moved — stopped", tone="muted")
                     self.stats["cancelled"] += 1
+                elif not typed and EMPTY_WRITER_ANSWER in notes:
+                    self.stats["empty"] += 1
+                    self.overlay.message("Nothing on file about that", tone="muted")
                 elif typed:
                     self.stats["completed"] += 1
                     PERF.sample("bubble.total", since_ms(t0), n=len(typed))  # hotkey → last word typed
-                    self.overlay.done(f"Done · {time.perf_counter() - t0:.1f}s")
+                    self.overlay.done(f"Done · {time.perf_counter() - t0:.1f}s"
+                                      + (" · not verified" if UNVERIFIED_NOTE in notes else ""))
                     log.info("bubble: typed %d chars; first chunk %.2fs after retrieval, total %.2fs", len(typed),
                              p.timings.get("first_chunk_s", 0.0), time.perf_counter() - t0)
                 else:
