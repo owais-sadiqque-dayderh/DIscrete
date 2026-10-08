@@ -9,15 +9,26 @@ All model calls go to an OpenAI-compatible API (OpenRouter by default); nothing
 runs a local model. Design notes live in [`docs/`](docs/) (plans S1–S3, audit,
 insights, and the change log for each revision, e.g. [`docs/C6.md`](docs/C6.md)).
 
+## Status
+
+Final version (2026-10-08): `main` = the Oct 7 memory evolution + Oct 8 production hardening + the Bubble
+restore. Earlier versions are tagged `2026-09-18-first-iteration`, `2026-10-01-second-iteration`,
+`2026-10-07-memory-evolution` and `2026-10-08-production-hardening`; the full history is in
+[`Worklog.md`](Worklog.md).
+
 ## Quickstart
 
 Requires macOS and Python 3.11+.
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+uv venv --python 3.13 .venv                  # or: python3 -m venv .venv
+uv pip install --python .venv/bin/python -e ".[dev,encryption]"
 cp .env.example .env          # then put your API key(s) in .env
+ln -sfn "$PWD/jarvis" ~/.local/bin/jarvis    # optional one-word launcher (see `jarvis help`)
 ```
+
+Day to day: `jarvis start | stop | restart | status | logs`, `jarvis ask "…"`. `jarvis` runs this
+checkout with its `.env` and keeps its log in the data dir.
 
 Grant permissions to the app you run it from (Terminal, iTerm, VS Code…) in
 **System Settings → Privacy & Security**:

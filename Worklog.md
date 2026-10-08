@@ -1361,3 +1361,17 @@ spend and are lower bounds: fix unpriced-call counts a/b are live **3/1**, g46 *
   the Oct 7 runs happened to be one day after the session), so the earlier "final" numbers were not hurt by it.
 - Known UX trade-off: on a verifier timeout the Bubble types "Support check timed out; this answer is not verified." first.
 - Live daemon restarted on the fixed code; `COMP_001/Discrete` branch `feat/production-hardening` refreshed.
+
+### 2026-10-08 — Bubble restore, retrieval re-check, project closed (final = `main`)
+- Bubble (a97f6ca): Oct 8 hardening had removed the screenshot field read (Chromium/Electron fields read as empty), stopped
+  typing whenever the URL or focused element could not be read in 0.25 s, and typed "(nothing on file about that)" /
+  "Support check timed out…" into the user's field. Restored the screenshot read behind capture's own egress rule
+  (on-device OCR + redaction; secret on screen or OCR failure = nothing sent); typing stops only on a definite app/window/
+  page/field change; notes go to the pill. Field-read prompt drops caret and placeholder text. Engine output unchanged.
+- Bubble models: `BUBBLE_LM_MODEL_NAME` / `BUBBLE_VISION_LM_MODEL_NAME` = openai/gpt-4o-mini (now the .env.example default):
+  muse-spark streamed zero content on 2 of 2 Bubble writes in the Oct 1 copy. Captions, memory and the support check stay on muse.
+- Retrieval re-check: main's retrieval code == the benchmarked 471b44f (live1006 83.3% vs Oct 7 76.7%, g46 91.3% vs 90.2%,
+  ~2x faster). Fresh retrieval-only eval: hit@k g46 0.976, live 0.84; contamination 0. Known weak spot: the muse support
+  check hits its 8 s cap on ~25% of questions, so those answers are hedged ("not verified"); `SUPPORT_TIMEOUT_S` trades this for latency.
+- Setup: `.venv` rebuilt with uv (Python 3.13, `.[dev,encryption]`), 945 passed, ruff clean. `jarvis` now runs this checkout;
+  the live data dir is `~/.cache/exp_discrete` (Oct 6 onwards); `~/.cache/discrete` keeps the Sep 30 – Oct 1 store untouched.
