@@ -239,10 +239,11 @@ class HistoryMixin(StoreBase):
                     original = data["reverts"]
                     for r in data.get("suppressions", []):
                         conn.execute("INSERT OR REPLACE INTO suppressions(id, kind, text, norm_key, vector, claim_id, "
-                                     "event_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                                     "event_id, created_at, scope, retired_after) VALUES (?,?,?,?,?,?,?,?,?,?)",
                                      (r["id"], r["kind"], r["text"], r["norm_key"],
                                       bytes.fromhex(r["vector"]) if r["vector"] else None, r["claim_id"],
-                                      r["event_id"], r["created_at"]))
+                                      r["event_id"], r["created_at"], r.get("scope", "kind"),
+                                      r.get("retired_after")))
                     if data.get("links"):
                         conn.execute(f"UPDATE links SET status='live' WHERE id IN ({_ph(data['links'])})",
                                      data["links"])

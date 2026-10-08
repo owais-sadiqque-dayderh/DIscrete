@@ -75,7 +75,9 @@ class ClaimsMixin(HistoryMixin):
                       derived_from: list[int] | None = None, vector: Vector | None = None,
                       allow_suppressed: bool = False) -> int:
         text = tk.truncate(draft.text, T.CLAIM_MAX_CHARS)
-        if not allow_suppressed and self._suppressed(conn, draft.kind, text, vector[0] if vector else None):
+        if not allow_suppressed and self._suppressed(conn, draft.kind, text, vector[0] if vector else None,
+                                                      claim_ids=derived_from or (), observation_ids=[
+                                                          int(e["observation_id"]) for e in draft.evidence if e.get("quote")]):
             raise ValueError("claim is suppressed")
         ts = now()
         cur = conn.execute(
@@ -156,7 +158,9 @@ class ClaimsMixin(HistoryMixin):
         """REINFORCE: add verified evidence, extend occurred_to; text untouched (planS2 §6.2).
         Returns the change for the event log: evidence added and evicted by the cap, in full."""
         current = conn.execute("SELECT kind, text, status FROM claims WHERE id=?", (claim_id,)).fetchone()
-        if current is None or current["status"] != "live" or self._suppressed(conn, current["kind"], current["text"]):
+        if current is None or current["status"] != "live" or self._suppressed(
+                conn, current["kind"], current["text"],
+                observation_ids=[int(e["observation_id"]) for e in draft.evidence if e.get("quote")]):
             raise ValueError("reinforcement target is withdrawn or suppressed")
         before = self._evidence_rows(conn, claim_id)
         old_to = conn.execute("SELECT occurred_to FROM claims WHERE id=?", (claim_id,)).fetchone()[0]

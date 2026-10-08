@@ -268,7 +268,8 @@ class ProcessPipeline:
         drafts = await self._verify(drafts, by_id, outcome)
         kept = []
         for cd in drafts:
-            if await self.store.suppressed(cd.kind, cd.text):
+            if await self.store.suppressed(cd.kind, cd.text, observation_ids=[
+                    int(e["observation_id"]) for e in cd.evidence if e.get("quote")]):
                 outcome.reject("forgotten")  # the user told us to forget this one
             else:
                 kept.append(cd)
@@ -462,7 +463,8 @@ class ProcessPipeline:
         kept = []
         for d, v in zip(durables, vecs, strict=True):
             d.vec = v
-            if v is not None and await self.store.suppressed(d.cd.kind, d.cd.text, v):
+            if v is not None and await self.store.suppressed(d.cd.kind, d.cd.text, v, observation_ids=[
+                    int(e["observation_id"]) for e in d.cd.evidence if e.get("quote")]):
                 continue  # close to a forgotten claim: not re-learned
             d.candidates = await self._candidates(d)
             kept.append(d)
