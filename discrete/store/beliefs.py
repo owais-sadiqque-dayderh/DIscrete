@@ -174,7 +174,7 @@ class BeliefsMixin(LinksMixin):
 
         return await self._call(_run)
 
-    async def retire_claim(self, claim_id: int, *, op: str, actor: str, reason: str, run_id: str = "",
+    async def retire_dream_claim(self, claim_id: int, *, op: str, actor: str, reason: str, run_id: str = "",
                            by_id: int | None = None) -> bool:
         def _run() -> bool:
             with self._tx() as conn:

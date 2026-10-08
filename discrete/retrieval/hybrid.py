@@ -158,19 +158,22 @@ def _noop(*_a) -> None:
     pass
 
 
-async def retrieve(store: Store, query: str, *, field_text: str = "", progress=None) -> RetrievalResult:
-    """`progress(stage, detail)` is an optional UI hook (Bubble's overlay)."""
+async def retrieve(store: Store, query: str, *, field_text: str = "", progress=None,
+                   verify: bool = True) -> RetrievalResult:
+    """`progress(stage, detail)` is an optional UI hook; `verify=False` skips support checks."""
     with PERF.timer("retrieve.total") as t:
         result = await _retrieve(store, query, field_text=field_text, progress=progress or _noop)
-        with PERF.timer("retrieve.support", n=len(result.hits)):
-            await verify_support(result)
+        if verify:
+            with PERF.timer("retrieve.support", n=len(result.hits)):
+                await verify_support(result)
         if result.plan.intent == "enumerate" and not result.plan.page_operation and not result.hits:
             # A list that found no pages must never answer worse than an ordinary
             # search on the same subject: the items may be inside pages, not pages.
             PERF.count("retrieve.enumerate_fallback")
             plan = dataclasses.replace(result.plan, intent="recall")
             result = await _retrieve(store, query, field_text=field_text, progress=progress or _noop, plan=plan)
-            await verify_support(result)
+            if verify:
+                await verify_support(result)
         temporal_answer(result)
         t.n = len(result.hits)
     return result

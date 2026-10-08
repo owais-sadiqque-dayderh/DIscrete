@@ -13,6 +13,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Sequence
+from uuid import uuid4
 
 import numpy as np
 
@@ -24,6 +26,88 @@ from .claims import ClaimsMixin, _ph
 
 
 class CorrectionsMixin(ClaimsMixin):
+    def _feedback_claims(self, conn, claim_ids: Sequence[int], *, live_only: bool = False) -> list[int]:
+        ids = sorted(set(claim_ids))
+        for cid in ids:
+            row = conn.execute("SELECT status FROM claims WHERE id=?", (cid,)).fetchone()
+            if row is None or (live_only and row[0] != "live"):
+                raise KeyError(f"no {'live ' if live_only else ''}claim {cid}")
+        return ids
+
+    async def state_claim(self, kind: str, text: str, *, context: str = "",
+                          derived_from: Sequence[int] = (), reason: str = "") -> tuple[int, int]:
+        """A new lineage in the user's words, with copied supporting provenance."""
+        def _run() -> tuple[int, int]:
+            with self._tx() as conn:
+                ids = self._feedback_claims(conn, derived_from)
+                cid = self._insert_claim(conn, ClaimDraft(kind=kind, text=text.strip(), context=context,
+                    modality="stated", reasoning="stated by the user"), lineage_id=str(uuid4()), version=1,
+                    derived_from=ids, allow_suppressed=True)
+                if ids:
+                    for ev in conn.execute(f"SELECT * FROM evidence WHERE relation='supports' "
+                                           f"AND claim_id IN ({_ph(ids)}) ORDER BY created_at", ids).fetchall():
+                        self._link(conn, cid, ev["observation_id"], "supports", ev["quote"], ev["field"])
+                    self._cap_evidence(conn, cid)
+                    self._recompute_confidence(conn, cid)
+                    self._carry_mentions(conn, ids, cid)
+                eid = self._log_event(conn, "state", "user", claim_id=cid, created=[cid],
+                                      reason=reason or "the user stated this", data={"derived_from": ids})
+                return cid, eid
+
+        return await self._call(_run)
+
+    async def confirm_claims(self, claim_ids: Sequence[int], *, context: str = "", reason: str = "") -> int:
+        """Record applicability; observation-based belief strength stays unchanged."""
+        def _run() -> int:
+            with self._tx() as conn:
+                ids = self._feedback_claims(conn, claim_ids, live_only=True)
+                eid = self._log_event(conn, "confirm", "user", reason=reason or "the user confirmed these memories",
+                                      data={"claim_ids": ids, "context": context})
+                conn.executemany("INSERT INTO memory_event_refs(event_id, claim_id) VALUES (?,?)",
+                                 [(eid, cid) for cid in ids])
+                return eid
+
+        return await self._call(_run)
+
+    async def retire_claim(self, claim_id: int, *, reason: str = "") -> int:
+        """Retire every live version of a lineage without suppressing future learning."""
+        def _run() -> int:
+            with self._tx() as conn:
+                self._feedback_claims(conn, [claim_id])
+                live = conn.execute("SELECT id FROM claims WHERE lineage_id="
+                                    "(SELECT lineage_id FROM claims WHERE id=?) AND status='live'",
+                                    (claim_id,)).fetchall()
+                if not live:
+                    raise KeyError(f"claim {claim_id} has no live version to retire")
+                ts = now()
+                changes = [self._set_state(conn, r[0], status="retired", valid_to=ts) for r in live]
+                return self._log_event(conn, "retire", "user", claim_id=claim_id, changes=changes,
+                                       reason=reason or "the user said this is no longer true")
+
+        return await self._call(_run)
+
+    async def reject_inference(self, text: str, *, kind: str = "preference",
+                               claim_ids: Sequence[int] = (), reason: str = "") -> int:
+        """Suppress an inference's wording, leaving its source memories untouched."""
+        def _run() -> int:
+            with self._tx() as conn:
+                ids = self._feedback_claims(conn, claim_ids)
+                wording = text.strip()
+                # Only reuse an embedding of this exact wording, never of a different premise.
+                vec = conn.execute("SELECT e.vector FROM embeddings e JOIN claims c ON c.id=e.ref_id "
+                                   "WHERE e.ref_kind='claim' AND c.kind=? AND c.text=? LIMIT 1",
+                                   (kind, wording)).fetchone()
+                eid = self._log_event(conn, "reject", "user", reason=reason or "the user rejected this inference",
+                                      data={"claim_ids": ids, "kind": kind, "text": wording})
+                conn.executemany("INSERT INTO memory_event_refs(event_id, claim_id) VALUES (?,?)",
+                                 [(eid, cid) for cid in ids])
+                conn.execute("INSERT INTO suppressions(kind, text, norm_key, vector, claim_id, event_id, created_at) "
+                             "VALUES (?,?,?,?,NULL,?,?)", (kind, wording, tk.norm_key(wording),
+                                                          vec[0] if vec else None, eid, now()))
+                return eid
+
+        return await self._call(_run)
+
     async def forget_claim(self, claim_id: int, *, reason: str = "") -> int:
         """Retire a claim (and every live version of its lineage) and suppress its text."""
 
@@ -112,8 +196,10 @@ class CorrectionsMixin(ClaimsMixin):
             sec["points"] = [p for p in sec["points"] if not ids & set(p.get("claims", []))]
         profile["sections"] = [sec for sec in profile.get("sections", []) if sec["points"]]
 
-    async def correct_claim(self, claim_id: int, text: str, *, reason: str = "") -> tuple[int, int]:
-        """A new `stated` version with the user's wording; the old one is superseded.
+    async def correct_claim(self, claim_id: int, text: str, *, reason: str = "",
+                            context: str | None = None) -> tuple[int, int]:
+        """A new `stated` version with the user's wording and optional replacement context.
+        The old one is superseded.
         Returns (new claim id, event id)."""
 
         def _run() -> tuple[int, int]:
@@ -131,7 +217,8 @@ class CorrectionsMixin(ClaimsMixin):
                                        (row["lineage_id"],)).fetchone()[0] or 1
                 ev = conn.execute("SELECT observation_id, quote FROM evidence WHERE claim_id=? AND relation='supports'",
                                   (target,)).fetchall()
-                draft = ClaimDraft(kind=row["kind"], text=text.strip(), context=row["context"],
+                draft = ClaimDraft(kind=row["kind"], text=text.strip(),
+                                   context=row["context"] if context is None else context,
                                    reasoning="corrected by the user", modality="stated",
                                    episode_id=row["episode_id"], occurred_from=row["occurred_from"],
                                    occurred_to=row["occurred_to"], action=row["action"],
