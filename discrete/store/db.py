@@ -7,6 +7,7 @@ appended to MIGRATIONS, never an edit to an old one.
 
 from __future__ import annotations
 
+import json
 import logging
 import pickle
 import sqlite3
@@ -546,6 +547,25 @@ def m015_provenance_term(conn: sqlite3.Connection) -> None:
     _add_column(conn, "attention_provenance", "term", "TEXT")
 
 
+def m016_inference_suppression(conn: sqlite3.Connection) -> None:
+    """Distinguish rejection of an idea from forgetting a single memory kind.
+
+    Upgrade existing rejection rows and serialized undo payloads as well: otherwise
+    redoing feedback recorded before this migration would lose its inference scope.
+    """
+    _add_column(conn, "suppressions", "scope", "TEXT NOT NULL DEFAULT 'kind'")
+    _add_column(conn, "suppressions", "retired_after", "REAL")
+    conn.execute("UPDATE suppressions SET scope='inference' WHERE event_id IN "
+                 "(SELECT id FROM memory_events WHERE op='reject')")
+    for eid, raw in conn.execute("SELECT id, data FROM memory_events WHERE op='revert'").fetchall():
+        data = json.loads(raw)
+        for row in data.get("suppressions", []):
+            event = conn.execute("SELECT op FROM memory_events WHERE id=?", (row["event_id"],)).fetchone()
+            row.setdefault("scope", "inference" if event and event[0] == "reject" else "kind")
+            row.setdefault("retired_after", None)
+        conn.execute("UPDATE memory_events SET data=? WHERE id=?", (json.dumps(data), eid))
+
+
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m001_base,
     m002_draft_attempts_and_digest_counts,
@@ -562,6 +582,7 @@ MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     m013_attention_provenance,
     m014_pages,
     m015_provenance_term,
+    m016_inference_suppression,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)

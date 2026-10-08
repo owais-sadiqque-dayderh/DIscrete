@@ -571,7 +571,7 @@ async def test_m015_upgrades_m014_and_reads_legacy_terms(tmp_path):
 
     upgraded = await Store.open(path)
     try:
-        assert (await upgraded.q1("PRAGMA user_version"))[0] == 15
+        assert (await upgraded.q1("PRAGMA user_version"))[0] == db.SCHEMA_VERSION
         column = next(r for r in await upgraded.q("PRAGMA table_info(attention_provenance)") if r["name"] == "term")
         assert column["notnull"] == 0
         assert (await upgraded.q1("SELECT term FROM attention_provenance"))[0] is None

@@ -175,7 +175,7 @@ async def test_reject_suppresses_drafting_without_changing_premises_and_redoes(s
     assert not await store.suppressed("event", "The user prefers tea")
     with pytest.raises(ValueError, match="suppressed"):
         await _claim(store, "The user prefers tea")  # Same transaction-time gate as drafting/dreaming.
-    assert not fake.embedded and not fake.calls
+    assert fake.embedded == ["The user prefers tea"] and not fake.calls
     undo = await store.revert_event(eid)
     assert not await store.suppressed("preference", "The user prefers tea")
     await store.revert_event(undo)

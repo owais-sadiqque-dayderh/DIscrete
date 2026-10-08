@@ -105,6 +105,9 @@ class BeliefsMixin(LinksMixin):
         """A dreamed pattern: a new claim pointing down at the claims it rests on, with
         their evidence, so its confidence comes from the same episode/day count."""
 
+        if await self.suppressed("pattern", text, claim_ids=support):
+            raise ValueError("claim is suppressed")
+
         def _run() -> int:
             with self._tx() as conn:
                 rows = conn.execute(f"SELECT * FROM claims WHERE id IN ({_ph(support)}) AND status='live' "
@@ -138,10 +141,14 @@ class BeliefsMixin(LinksMixin):
     async def confirm_pattern(self, pattern_id: int, support: Sequence[int], *, reason: str, run_id: str) -> bool:
         """New memories back an existing pattern: add them to its support and evidence."""
 
+        pattern = await self.get_claim(pattern_id)
+        if pattern is not None and await self.suppressed("pattern", pattern["text"], claim_ids=support):
+            return False
+
         def _run() -> bool:
             with self._tx() as conn:
                 p = conn.execute("SELECT * FROM claims WHERE id=? AND status='live'", (pattern_id,)).fetchone()
-                if p is None or self._suppressed(conn, p["kind"], p["text"]):
+                if p is None or self._suppressed(conn, p["kind"], p["text"], claim_ids=support):
                     return False
                 eligible = conn.execute(f"SELECT id FROM claims WHERE id IN ({_ph(support)}) "
                                         "AND status='live' AND flag!='contested' AND kind!='pattern'", list(support)).fetchall()
@@ -218,6 +225,11 @@ class BeliefsMixin(LinksMixin):
     # ------------------------------------------------------------------ profile
 
     async def save_profile(self, profile: dict, *, run_id: str) -> int:
+        profile = json.loads(json.dumps(profile))
+        for sec in profile.get("sections", []):
+            sec["points"] = [p for p in sec.get("points", []) if not await self.suppressed(
+                "pattern", p["text"], claim_ids=p.get("claims", []))]
+
         def _run() -> int:
             with self._tx() as conn:
                 clean = json.loads(json.dumps(profile))
@@ -227,7 +239,7 @@ class BeliefsMixin(LinksMixin):
                         ids = point.get("claims", [])
                         live = conn.execute(f"SELECT id FROM claims WHERE id IN ({_ph(ids)}) AND status='live' "
                                             "AND flag NOT IN ('stale','contested')", ids).fetchall() if ids else []
-                        if ids and len(live) == len(set(ids)) and not self._suppressed(conn, "pattern", point["text"]):
+                        if ids and len(live) == len(set(ids)) and not self._suppressed(conn, "pattern", point["text"], claim_ids=ids):
                             points.append(point)
                     sec["points"] = points
                 clean["sections"] = [s for s in clean.get("sections", []) if s["points"]]
@@ -248,6 +260,7 @@ class BeliefsMixin(LinksMixin):
             return profile
         cited = sorted({c for sec in profile["sections"] for p in sec["points"] for c in p["claims"]})
         live = {r["id"] for r in await self.get_claims(cited, live_only=True) if r["flag"] not in {"contested", "stale"}}
-        sections = [{**sec, "points": [p for p in sec["points"] if set(p["claims"]) <= live]}
+        sections = [{**sec, "points": [p for p in sec["points"] if set(p["claims"]) <= live
+                                  and not await self.suppressed("pattern", p["text"], claim_ids=p["claims"])]}
                     for sec in profile["sections"]]
         return {**profile, "sections": [sec for sec in sections if sec["points"]]}

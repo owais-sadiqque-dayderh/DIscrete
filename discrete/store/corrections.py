@@ -17,12 +17,24 @@ from collections.abc import Sequence
 from uuid import uuid4
 
 import numpy as np
+from rapidfuzz.fuzz import token_set_ratio
 
+from .. import llm
 from .. import textkit as tk
 from ..config import T
 from ..models import ClaimDraft
 from ..timeutil import now
 from .claims import ClaimsMixin, _ph
+
+LASTING_KINDS = frozenset({"preference", "pattern", "fact"})
+# Conservative defaults selected against the paraphrases and near-misses in
+# test_inference_suppression.py. Set ratio catches reordered/inflected wording;
+# overlap prevents a shared entity or a tiny subset from erasing a different idea.
+INFERENCE_TOKEN_SET_RATIO = 92.0
+INFERENCE_TOKEN_OVERLAP = 0.5
+# Same high semantic threshold as forget; prefer false negatives to suppressing
+# merely related shopping/product preferences. Tests cover both sides of 0.90.
+INFERENCE_COSINE = 0.90
 
 
 class CorrectionsMixin(ClaimsMixin):
@@ -88,22 +100,45 @@ class CorrectionsMixin(ClaimsMixin):
 
     async def reject_inference(self, text: str, *, kind: str = "preference",
                                claim_ids: Sequence[int] = (), reason: str = "") -> int:
-        """Suppress an inference's wording, leaving its source memories untouched."""
+        """Permanently suppress this idea across lasting kinds; sources stay untouched."""
+        return await self._inference_feedback(text, kind=kind, claim_ids=claim_ids, reason=reason, retire=False)
+
+    async def retire_inference(self, text: str, *, kind: str = "preference",
+                               claim_ids: Sequence[int] = (), reason: str = "") -> int:
+        """Suppress until a candidate cites supporting user observations newer than
+        this feedback. Processing old observations again does not revive the idea.
+        Source claims are unchanged. Reverting the returned event removes the gate.
+        """
+        return await self._inference_feedback(text, kind=kind, claim_ids=claim_ids, reason=reason, retire=True)
+
+    async def _inference_feedback(self, text: str, *, kind: str, claim_ids: Sequence[int],
+                                  reason: str, retire: bool) -> int:
+        if kind not in LASTING_KINDS:
+            raise ValueError("inference feedback requires a lasting kind")
+        wording = text.strip()
+        if not wording:
+            raise ValueError("inference wording must not be empty")
+        # Validate before any network call; recheck under the write lock below.
+        await self._call(lambda: self._feedback_claims(self.conn, claim_ids))
+        vec = await self.q1("SELECT e.vector FROM embeddings e JOIN claims c ON c.id=e.ref_id "
+                            "WHERE e.ref_kind='claim' AND c.text=? AND c.context='' LIMIT 1", (wording,))
+        embedded = None if vec else await llm.try_embed(wording)
+        blob = vec[0] if vec else (np.asarray(embedded, dtype=np.float32).tobytes()
+                                   if embedded is not None else None)
+
         def _run() -> int:
             with self._tx() as conn:
                 ids = self._feedback_claims(conn, claim_ids)
-                wording = text.strip()
-                # Only reuse an embedding of this exact wording, never of a different premise.
-                vec = conn.execute("SELECT e.vector FROM embeddings e JOIN claims c ON c.id=e.ref_id "
-                                   "WHERE e.ref_kind='claim' AND c.kind=? AND c.text=? LIMIT 1",
-                                   (kind, wording)).fetchone()
-                eid = self._log_event(conn, "reject", "user", reason=reason or "the user rejected this inference",
-                                      data={"claim_ids": ids, "kind": kind, "text": wording})
+                ts = now()
+                op = "retire_inference" if retire else "reject"
+                eid = self._log_event(conn, op, "user", reason=reason or (
+                    "the user said this inference is no longer true" if retire else "the user rejected this inference"),
+                    data={"claim_ids": ids, "kind": kind, "text": wording})
                 conn.executemany("INSERT INTO memory_event_refs(event_id, claim_id) VALUES (?,?)",
                                  [(eid, cid) for cid in ids])
-                conn.execute("INSERT INTO suppressions(kind, text, norm_key, vector, claim_id, event_id, created_at) "
-                             "VALUES (?,?,?,?,NULL,?,?)", (kind, wording, tk.norm_key(wording),
-                                                          vec[0] if vec else None, eid, now()))
+                conn.execute("INSERT INTO suppressions(kind, text, norm_key, vector, claim_id, event_id, created_at, "
+                             "scope, retired_after) VALUES (?,?,?,?,NULL,?,?,'inference',?)",
+                             (kind, wording, tk.norm_key(wording), blob, eid, ts, ts if retire else None))
                 return eid
 
         return await self._call(_run)
@@ -240,29 +275,75 @@ class CorrectionsMixin(ClaimsMixin):
 
         return await self._call(_run)
 
-    async def suppressed(self, kind: str, text: str, vector=None) -> bool:
-        """Would this new claim re-learn something the user told us to forget?"""
-        return await self._call(lambda: self._suppressed(self.conn, kind, text, vector))
-
-    def _suppressed(self, conn, kind: str, text: str, vector=None) -> bool:
-        """Transaction-time gate shared by every claim writer."""
-        key = tk.norm_key(text)
-        digest = "h:" + hashlib.sha256(key.encode()).hexdigest()  # erased suppressions keep only this
-        rows: list[sqlite3.Row] = conn.execute(
-            "SELECT norm_key, text, vector FROM suppressions WHERE kind=?", (kind,)).fetchall()
-        if not rows:
+    async def suppressed(self, kind: str, text: str, vector=None, *,
+                         claim_ids: Sequence[int] = (), observation_ids: Sequence[int] = ()) -> bool:
+        """Read gate for bridge drafts. Pass cited source ids so retirement can revive
+        with fresh supporting observations. Without ids retirement stays suppressed.
+        If vector is omitted, embed only when lexical matching misses and a stored
+        suppression vector exists. Endpoint failure falls back to lexical matching.
+        """
+        if await self._call(lambda: self._suppressed(self.conn, kind, text, vector,
+                                                   claim_ids=claim_ids, observation_ids=observation_ids)):
+            return True
+        if vector is not None or kind not in LASTING_KINDS:
             return False
+        if not await self.q1("SELECT 1 FROM suppressions WHERE vector IS NOT NULL "
+                             "AND (kind=? OR scope='inference') LIMIT 1", (kind,)):
+            return False
+        vector = await llm.try_embed(text)
+        return await self._call(lambda: self._suppressed(self.conn, kind, text, vector,
+                                                       claim_ids=claim_ids, observation_ids=observation_ids))
+
+    def _support_after(self, conn, claim_ids: Sequence[int] = (), observation_ids: Sequence[int] = ()) -> float:
+        times = [0.0]
+        if claim_ids:
+            row = conn.execute(f"SELECT MAX(o.started_at) FROM evidence e JOIN observations o "
+                               f"ON o.id=e.observation_id JOIN claims c ON c.id=e.claim_id "
+                               f"WHERE e.relation='supports' AND o.origin='user' AND c.status='live' "
+                               f"AND e.claim_id IN ({_ph(claim_ids)})", list(claim_ids)).fetchone()
+            times.append(row[0] or 0.0)
+        if observation_ids:
+            row = conn.execute(f"SELECT MAX(started_at) FROM observations WHERE origin='user' "
+                               f"AND id IN ({_ph(observation_ids)})", list(observation_ids)).fetchone()
+            times.append(row[0] or 0.0)
+        return max(times)
+
+    def _suppressed(self, conn, kind: str, text: str, vector=None, *,
+                    claim_ids: Sequence[int] = (), observation_ids: Sequence[int] = ()) -> bool:
+        """Transaction-time gate. Inference scope never applies to events."""
+        key = tk.norm_key(text)
+        digest = "h:" + hashlib.sha256(key.encode()).hexdigest()
+        rows: list[sqlite3.Row] = conn.execute(
+            "SELECT * FROM suppressions WHERE kind=? OR (scope='inference' AND ?)",
+            (kind, kind in LASTING_KINDS)).fetchall()
         toks = set(tk.content_tokens(text))
         v = np.asarray(vector, dtype=np.float32) if vector is not None else None
+        fresh = self._support_after(conn, claim_ids, observation_ids) if any(
+            r["retired_after"] is not None for r in rows) else 0.0
         for r in rows:
+            if r["scope"] == "inference" and kind not in LASTING_KINDS:
+                continue
+            if r["retired_after"] is not None and fresh > r["retired_after"]:
+                continue
             if r["norm_key"] in (key, digest):
                 return True
+            # Negation is removed by content_tokens. Retain it as a polarity guard
+            # so a high overlap/vector score does not conflate opposite assertions.
+            if r["scope"] == "inference":
+                negations = {"not", "no", "never", "without", "dont", "don't", "doesn't", "cannot", "can't"}
+                if bool(set(tk.tokens(text)) & negations) != bool(set(tk.tokens(r["text"])) & negations):
+                    continue
             other = set(tk.content_tokens(r["text"]))
-            if toks and other and len(toks & other) / len(toks | other) >= T.SUPPRESS_JACCARD:
+            overlap = len(toks & other) / len(toks | other) if toks and other else 0.0
+            if overlap >= T.SUPPRESS_JACCARD:
+                return True
+            if r["scope"] == "inference" and overlap >= INFERENCE_TOKEN_OVERLAP and token_set_ratio(
+                    " ".join(sorted(toks)), " ".join(sorted(other))) >= INFERENCE_TOKEN_SET_RATIO:
                 return True
             if v is not None and r["vector"] is not None:
                 sv = np.frombuffer(r["vector"], dtype=np.float32)
+                threshold = INFERENCE_COSINE if r["scope"] == "inference" else T.SUPPRESS_SIM
                 if sv.shape == v.shape and float(sv @ v) / (float(np.linalg.norm(sv) * np.linalg.norm(v)) or 1.0) \
-                        >= T.SUPPRESS_SIM:
+                        >= threshold:
                     return True
         return False
