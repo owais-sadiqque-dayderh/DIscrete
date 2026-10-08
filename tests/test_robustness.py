@@ -465,6 +465,8 @@ async def test_a_provider_glitch_is_retried_but_a_wrong_model_is_not(fake, monke
 def test_discretes_own_output_is_not_the_users_activity():
     from discrete.capture.suppress import classify_origin
 
+    assert classify_origin("Terminal", 'discrete ask "which browser did I use?" — zsh', "Helium") == "agent"
+    # Captures from before the launcher was renamed still show the old `jarvis` command.
     assert classify_origin("Terminal", 'jarvis ask "which browser did I use?" — zsh', "Helium") == "agent"
     assert classify_origin("DB Browser for SQLite", "DB Browser for SQLite - /Users/x/.cache/discrete/discrete.db",
                            "claims") == "agent"

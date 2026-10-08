@@ -24,11 +24,12 @@ Requires macOS and Python 3.11+.
 uv venv --python 3.13 .venv                  # or: python3 -m venv .venv
 uv pip install --python .venv/bin/python -e ".[dev,encryption]"
 cp .env.example .env          # then put your API key(s) in .env
-ln -sfn "$PWD/jarvis" ~/.local/bin/jarvis    # optional one-word launcher (see `jarvis help`)
+ln -sfn "$PWD/bin/discrete" ~/.local/bin/discrete   # the launcher (see `discrete help`)
 ```
 
-Day to day: `jarvis start | stop | restart | status | logs`, `jarvis ask "…"`. `jarvis` runs this
-checkout with its `.env` and keeps its log in the data dir.
+Day to day: `discrete start | stop | restart | status | logs`, `discrete ask "…"`. The launcher
+(`bin/discrete`) runs this checkout with its `.env`, keeps the daemon's log in the data dir, and hands every
+other command (`run`, `why`, `eval`, …) to the Python CLI, so `discrete X` and `.venv/bin/discrete X` agree.
 
 Grant permissions to the app you run it from (Terminal, iTerm, VS Code…) in
 **System Settings → Privacy & Security**:
@@ -168,6 +169,7 @@ discrete/
   evaluation/      golden-case harness, bench.py (the measurement report)
   bubble/          hotkey, overlay pill, writer
   app.py cli.py
+bin/discrete             the launcher: daemon start/stop/status, shortcuts, then the Python CLI
 tools/replay_workaa.py   one-off: rebuild a store from the WorkAA prototype
 docs/                    plans, audit, insights, change logs
 bench/                   saved `discrete bench` snapshots, one per optimization step

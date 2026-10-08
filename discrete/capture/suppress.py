@@ -12,9 +12,10 @@ _suppressed_until = 0.0
 _holds = 0
 _recent_agent_text: list[str] = []
 
-# DIscrete's own output read back off the screen: a terminal running `jarvis ask`/`discrete
+# DIscrete's own output read back off the screen: a terminal running `discrete ask`/`discrete
 # query`, the records it prints, or its database open in a viewer. Memories drafted from
 # these are about DIscrete, not the user (claims built from a printed answer, seen live).
+# `jarvis` was the launcher's earlier name; older captures and stores still show it.
 _SELF_COMMAND = re.compile(
     r"\b(?:jarvis(?:-exp)?|discrete) (?:ask|search|why|query|memories|episodes|captured|profile|patterns|"
     r"changes|history|logs|status|graph|cost|stats|dream|export)\b", re.I)
