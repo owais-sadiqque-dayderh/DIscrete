@@ -285,7 +285,7 @@ async def _patterns(store: Store, run_id: str) -> dict:
     for p in (r for r in rows if r["kind"] == "pattern"):
         support = json.loads(p["derived_from"] or "[]")
         if support and not await store.get_claims(support, live_only=True):
-            if await store.retire_claim(p["id"], op="dream_retire", actor="dream", run_id=run_id,
+            if await store.retire_dream_claim(p["id"], op="dream_retire", actor="dream", run_id=run_id,
                                         reason="every memory it rested on was withdrawn"):
                 report["retired"] += 1
         else:
@@ -352,7 +352,7 @@ async def _patterns(store: Store, run_id: str) -> dict:
         if a["verdict"] == "confirm" and await store.confirm_pattern(a["id"], a["support"], run_id=run_id,
                                                                      reason=a["reason"] or "new memories back it"):
             report["confirmed"] += 1
-        elif a["verdict"] == "retire" and await store.retire_claim(
+        elif a["verdict"] == "retire" and await store.retire_dream_claim(
                 a["id"], op="dream_retire", actor="dream", run_id=run_id,
                 reason=f"contradicted by {a['support']}: {a['reason']}"):
             report["retired"] += 1
@@ -424,7 +424,7 @@ async def _conflicts(store: Store, run_id: str) -> dict:
         why = ("stated by the user" if keep["modality"] == "stated" and lose["modality"] != "stated"
                else "acted on, not only viewed" if _MOD_RANK[keep["modality"]] > _MOD_RANK[lose["modality"]]
                else "more recent")
-        if await store.retire_claim(lose["id"], op="resolve", actor="dream", run_id=run_id, by_id=keep["id"],
+        if await store.retire_dream_claim(lose["id"], op="resolve", actor="dream", run_id=run_id, by_id=keep["id"],
                                     reason=f"conflicts with #{keep['id']} ({why}): {d.get('reason') or ''}"[:300]):
             report["resolved"] += 1
     return report
@@ -443,7 +443,7 @@ async def _stale(store: Store, run_id: str) -> dict:
         reason=f"not seen again in {T.STALE_DAYS:g} days") if old else 0
     for r in await store.q("SELECT id FROM claims WHERE status='live' AND kind='pattern' AND occurred_to < ?",
                            (now() - T.PATTERN_RETIRE_DAYS * 86400,)):
-        if await store.retire_claim(r[0], op="dream_retire", actor="cleanup", run_id=run_id,
+        if await store.retire_dream_claim(r[0], op="dream_retire", actor="cleanup", run_id=run_id,
                                     reason=f"no backing memory in {T.PATTERN_RETIRE_DAYS:g} days"):
             report["retired"] += 1
     return report

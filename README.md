@@ -155,6 +155,16 @@ it manual only. Export git history is opt-in via `DISCRETE_MEMORY_EXPORT_GIT=tru
 or `discrete export --git`: its history retains earlier versions, including
 forgotten memories. See `.env.example` and `discrete/config.py` for settings.
 
+### Feedback from other apps
+
+The async public `Store` API used by the jarvis bridge records user feedback with
+an actor and reason; write events can be undone with `discrete revert EVENT`.
+
+| API | What it does |
+|-----|--------------|
+| `state_claim`, `confirm_claims`, `correct_claim(..., context=...)` | state a new memory with optional source evidence, confirm applicability, or replace wording and scope |
+| `retire_claim`, `reject_inference`, `evidence_summary` | retire a lineage without suppression, suppress an inference without changing its premises, or read supporting screen moments |
+
 ## Layout
 
 ```

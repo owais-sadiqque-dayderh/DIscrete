@@ -133,6 +133,25 @@ class ClaimsMixin(HistoryMixin):
             out.setdefault(r[0], r[1])
         return out
 
+    async def evidence_summary(self, claim_ids: Sequence[int], *, per_claim: int = 1) -> dict[int, list[dict]]:
+        """Supporting screen moments: quoted, engaged observations first, then recent ones."""
+        out: dict[int, list[dict]] = {cid: [] for cid in claim_ids}
+        if not claim_ids or per_claim <= 0:
+            return out
+        rows = await self.q(
+            f"SELECT e.claim_id, o.id AS observation_id, o.app, o.window_title, o.site, o.url, "
+            f"o.started_at, e.quote, c.context FROM evidence e JOIN observations o ON o.id=e.observation_id "
+            f"JOIN claims c ON c.id=e.claim_id WHERE e.claim_id IN ({_ph(claim_ids)}) AND e.relation='supports' "
+            f"ORDER BY e.quote!='' DESC, (o.keys>0 OR o.clicks>0 OR o.clipboard>0) DESC, "
+            f"o.started_at DESC, o.id DESC", list(claim_ids))
+        for r in rows:
+            items = out[r["claim_id"]]
+            if len(items) < per_claim:
+                items.append({"observation_id": r["observation_id"], "app": r["app"],
+                              "window_title": r["window_title"], "site": tk.site_from_url(r["url"]) or r["site"],
+                              "started_at": float(r["started_at"]), "quote": r["quote"], "context": r["context"]})
+        return out
+
     def _reinforce_claim(self, conn, claim_id: int, draft: ClaimDraft) -> dict:
         """REINFORCE: add verified evidence, extend occurred_to; text untouched (planS2 §6.2).
         Returns the change for the event log: evidence added and evicted by the cap, in full."""
