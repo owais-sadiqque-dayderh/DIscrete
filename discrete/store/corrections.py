@@ -279,6 +279,8 @@ class CorrectionsMixin(ClaimsMixin):
                          claim_ids: Sequence[int] = (), observation_ids: Sequence[int] = ()) -> bool:
         """Read gate for bridge drafts. Pass cited source ids so retirement can revive
         with fresh supporting observations. Without ids retirement stays suppressed.
+        Live stated lasting claims (matching wording or cited ids) are exempt from
+        inference scope only; forgetting their wording still suppresses it.
         If vector is omitted, embed only when lexical matching misses and a stored
         suppression vector exists. Endpoint failure falls back to lexical matching.
         """
@@ -316,12 +318,19 @@ class CorrectionsMixin(ClaimsMixin):
         rows: list[sqlite3.Row] = conn.execute(
             "SELECT * FROM suppressions WHERE kind=? OR (scope='inference' AND ?)",
             (kind, kind in LASTING_KINDS)).fetchall()
+        stated = False
+        if kind in LASTING_KINDS and any(r["scope"] == "inference" for r in rows):
+            # User testimony outranks rejected inductions, including scoped corrections.
+            # Check liveness here so forget/retire/revert immediately remove the exemption.
+            stated = any(r["id"] in claim_ids or tk.norm_key(r["text"]) == key for r in conn.execute(
+                "SELECT id, text FROM claims WHERE status='live' AND modality='stated' "
+                "AND kind IN ('preference','pattern','fact')"))
         toks = set(tk.content_tokens(text))
         v = np.asarray(vector, dtype=np.float32) if vector is not None else None
         fresh = self._support_after(conn, claim_ids, observation_ids) if any(
             r["retired_after"] is not None for r in rows) else 0.0
         for r in rows:
-            if r["scope"] == "inference" and kind not in LASTING_KINDS:
+            if r["scope"] == "inference" and (kind not in LASTING_KINDS or stated):
                 continue
             if r["retired_after"] is not None and fresh > r["retired_after"]:
                 continue

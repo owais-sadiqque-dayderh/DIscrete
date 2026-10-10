@@ -225,3 +225,81 @@ async def test_semantic_profile_and_pattern_filter(store, monkeypatch):
         await store.add_pattern(point["text"], "interest", [source], reason="test", run_id="test")
     await store.save_profile({"sections": [{"heading": "Interests", "points": [point]}]}, run_id="new")
     assert not (await store.get_profile(live_only=False))["sections"]
+
+
+@pytest.mark.parametrize("kind", ["preference", "pattern", "fact"])
+@pytest.mark.parametrize("op", ["state", "correct"])
+async def test_scoped_stated_wording_exempt_from_inference_only(store, monkeypatch, kind, op):
+    monkeypatch.setattr(llm, "try_embed", AsyncMock(return_value=[1., 0.]))
+    general = "You prefer Flipkart for laptops"
+    scoped = "You prefer Flipkart for laptops only when helping someone else buy"
+    source = await store.create_claim(ClaimDraft(kind="preference", text=general))
+    await store.reject_inference(general, claim_ids=[source])
+    # Both lexical and semantic rewordings remain suppressed without testimony.
+    assert await store.suppressed(kind, scoped)
+    if op == "state":
+        cid, _ = await store.state_claim("preference", scoped, context="helping someone else buy")
+    else:
+        cid, _ = await store.correct_claim(source, scoped, context="helping someone else buy")
+    assert not await store.suppressed(kind, "  " + scoped.upper() + "  ")
+    assert not await store.suppressed(kind, scoped, vector=[1., 0.])
+    reworded = "When assisting another buyer, choose Flipkart for a laptop"
+    assert await store.suppressed(kind, reworded, vector=[1., 0.])
+    assert not await store.suppressed(kind, reworded, vector=[1., 0.], claim_ids=[cid])
+    assert await store.suppressed(kind, general)
+    assert not await store.suppressed("event", general, vector=[1., 0.])
+    # Even a live stated match cannot override an ordinary kind-scope suppression.
+    duplicate, _ = await store.state_claim(kind, scoped)
+    await store.forget_claim(duplicate)
+    assert (await store.get_claim(cid))["status"] == "live"
+    assert await store.suppressed(kind, scoped, claim_ids=[cid])
+
+
+@pytest.mark.parametrize("op", ["forget", "retire", "erase", "revert", "correct"])
+async def test_withdrawn_stated_claim_loses_exemption(store, op):
+    scoped = "You prefer Flipkart for laptops only when helping someone else buy"
+    await store.reject_inference("You prefer Flipkart for laptops")
+    cid, eid = await store.state_claim("preference", scoped)
+    assert not await store.suppressed("preference", scoped, claim_ids=[cid])
+    if op == "revert":
+        await store.revert_event(eid)
+    elif op == "correct":
+        await store.correct_claim(cid, "You enjoy hiking")
+    else:
+        await getattr(store, f"{op}_claim")(cid)
+    assert await store.suppressed("preference", scoped)
+    assert await store.suppressed("preference", scoped, claim_ids=[cid])
+
+
+async def test_scoped_stated_profile_save_and_read(store):
+    scoped = "You prefer Flipkart for laptops only when helping someone else buy"
+    cid, _ = await store.state_claim("preference", scoped)
+    point = {"text": "When helping another buyer, choose Flipkart for a laptop", "claims": [cid]}
+    profile = {"sections": [{"heading": "Preferences", "points": [point]}]}
+    await store.save_profile(profile, run_id="before")
+    await store.reject_inference(point["text"])
+    assert (await store.get_profile())["sections"] == profile["sections"]
+    await store.save_profile(profile, run_id="after")
+    assert (await store.get_profile(live_only=False))["sections"] == profile["sections"]
+    await store.forget_claim(cid)
+    assert not (await store.get_profile())["sections"]
+    assert await store.suppressed("preference", scoped, claim_ids=[cid])
+
+
+async def test_actual_dream_preserves_scoped_stated_correction(store, fake):
+    from discrete.process.dream import run_dream
+    from tests.test_dream import _football, _pattern
+
+    sources = await _football(store)
+    general = "The user follows football scores on FotMob"
+    scoped = "The user follows football scores on FotMob only when helping someone else"
+    reworded = "The user follows scores for football on FotMob only when helping someone else"
+    cid, _ = await store.state_claim("preference", scoped, derived_from=sources)
+    await store.reject_inference(general, claim_ids=sources)
+    fake.dream = {"patterns": [_pattern([cid], reworded)], "audit": []}
+    assert (await run_dream(store))["patterns"]["added"] == 1
+    pattern = (await store.live_claims(kind="pattern"))[0]
+    assert pattern["text"] == reworded
+    assert await store.confirm_pattern(pattern["id"], [cid, *sources], reason="new support", run_id="test")
+    # Ordinary rewordings backed only by observed events remain suppressed.
+    assert not await store.confirm_pattern(pattern["id"], sources, reason="observed only", run_id="test")
