@@ -279,8 +279,9 @@ class CorrectionsMixin(ClaimsMixin):
                          claim_ids: Sequence[int] = (), observation_ids: Sequence[int] = ()) -> bool:
         """Read gate for bridge drafts. Pass cited source ids so retirement can revive
         with fresh supporting observations. Without ids retirement stays suppressed.
-        Live stated lasting claims (matching wording or cited ids) are exempt from
-        inference scope only; forgetting their wording still suppresses it.
+        Only wording matching a live stated lasting claim after normalization is exempt
+        from inference scope; citations alone grant no exemption. Forgetting the
+        stated wording still suppresses it.
         If vector is omitted, embed only when lexical matching misses and a stored
         suppression vector exists. Endpoint failure falls back to lexical matching.
         """
@@ -312,47 +313,52 @@ class CorrectionsMixin(ClaimsMixin):
 
     def _suppressed(self, conn, kind: str, text: str, vector=None, *,
                     claim_ids: Sequence[int] = (), observation_ids: Sequence[int] = ()) -> bool:
-        """Transaction-time gate. Inference scope never applies to events."""
+        """Transaction-time gate. Events and exact normalized live stated wording
+        are exempt from inference scope; cited stated claims alone are insufficient.
+        """
         key = tk.norm_key(text)
         digest = "h:" + hashlib.sha256(key.encode()).hexdigest()
         rows: list[sqlite3.Row] = conn.execute(
             "SELECT * FROM suppressions WHERE kind=? OR (scope='inference' AND ?)",
             (kind, kind in LASTING_KINDS)).fetchall()
-        stated = False
-        if kind in LASTING_KINDS and any(r["scope"] == "inference" for r in rows):
-            # User testimony outranks rejected inductions, including scoped corrections.
-            # Check liveness here so forget/retire/revert immediately remove the exemption.
-            stated = any(r["id"] in claim_ids or tk.norm_key(r["text"]) == key for r in conn.execute(
-                "SELECT id, text FROM claims WHERE status='live' AND modality='stated' "
-                "AND kind IN ('preference','pattern','fact')"))
+        stated = None
         toks = set(tk.content_tokens(text))
         v = np.asarray(vector, dtype=np.float32) if vector is not None else None
         fresh = self._support_after(conn, claim_ids, observation_ids) if any(
             r["retired_after"] is not None for r in rows) else 0.0
         for r in rows:
-            if r["scope"] == "inference" and (kind not in LASTING_KINDS or stated):
+            if r["scope"] == "inference" and kind not in LASTING_KINDS:
                 continue
             if r["retired_after"] is not None and fresh > r["retired_after"]:
                 continue
-            if r["norm_key"] in (key, digest):
-                return True
-            # Negation is removed by content_tokens. Retain it as a polarity guard
-            # so a high overlap/vector score does not conflate opposite assertions.
+            matches = r["norm_key"] in (key, digest)
+            if not matches:
+                # Negation is removed by content_tokens. Retain it as a polarity guard
+                # so a high overlap/vector score does not conflate opposite assertions.
+                if r["scope"] == "inference":
+                    negations = {"not", "no", "never", "without", "dont", "don't", "doesn't", "cannot", "can't"}
+                    if bool(set(tk.tokens(text)) & negations) != bool(set(tk.tokens(r["text"])) & negations):
+                        continue
+                other = set(tk.content_tokens(r["text"]))
+                overlap = len(toks & other) / len(toks | other) if toks and other else 0.0
+                matches = overlap >= T.SUPPRESS_JACCARD
+                if not matches and r["scope"] == "inference" and overlap >= INFERENCE_TOKEN_OVERLAP:
+                    matches = token_set_ratio(" ".join(sorted(toks)), " ".join(sorted(other))) >= INFERENCE_TOKEN_SET_RATIO
+                if not matches and v is not None and r["vector"] is not None:
+                    sv = np.frombuffer(r["vector"], dtype=np.float32)
+                    threshold = INFERENCE_COSINE if r["scope"] == "inference" else T.SUPPRESS_SIM
+                    matches = sv.shape == v.shape and float(sv @ v) / (float(np.linalg.norm(sv) * np.linalg.norm(v)) or 1.0) \
+                        >= threshold
+            if not matches:
+                continue
             if r["scope"] == "inference":
-                negations = {"not", "no", "never", "without", "dont", "don't", "doesn't", "cannot", "can't"}
-                if bool(set(tk.tokens(text)) & negations) != bool(set(tk.tokens(r["text"])) & negations):
+                # Only the user's own wording outranks rejected inductions. Look up
+                # live testimony once, and only when an inference would suppress it.
+                if stated is None:
+                    stated = any(tk.norm_key(c["text"]) == key for c in conn.execute(
+                        "SELECT text FROM claims WHERE status='live' AND modality='stated' "
+                        "AND kind IN ('preference','pattern','fact')"))
+                if stated:
                     continue
-            other = set(tk.content_tokens(r["text"]))
-            overlap = len(toks & other) / len(toks | other) if toks and other else 0.0
-            if overlap >= T.SUPPRESS_JACCARD:
-                return True
-            if r["scope"] == "inference" and overlap >= INFERENCE_TOKEN_OVERLAP and token_set_ratio(
-                    " ".join(sorted(toks)), " ".join(sorted(other))) >= INFERENCE_TOKEN_SET_RATIO:
-                return True
-            if v is not None and r["vector"] is not None:
-                sv = np.frombuffer(r["vector"], dtype=np.float32)
-                threshold = INFERENCE_COSINE if r["scope"] == "inference" else T.SUPPRESS_SIM
-                if sv.shape == v.shape and float(sv @ v) / (float(np.linalg.norm(sv) * np.linalg.norm(v)) or 1.0) \
-                        >= threshold:
-                    return True
+            return True
         return False
