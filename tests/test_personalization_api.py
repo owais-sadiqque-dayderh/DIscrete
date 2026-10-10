@@ -89,7 +89,7 @@ async def test_user_wording_wins_over_suppression(store, op):
     else:
         cid, _ = await store.correct_claim(original, "I like tea")
     assert (await store.get_claim(cid))["status"] == "live"
-    assert await store.suppressed("preference", "I like tea")
+    assert not await store.suppressed("preference", "I like tea")
 
 
 async def test_confirm_is_one_event_with_all_refs_and_no_belief_mutation(store):
